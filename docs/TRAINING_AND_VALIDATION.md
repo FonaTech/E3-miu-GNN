@@ -1,0 +1,241 @@
+# Training, Auto Research, and Validation
+
+This document expands Sections 4.3-5 of the [paper](PAPER.md). Reported values
+are reproducible functional checks of the current source tree. They are not a
+claim of a converged universal interatomic potential.
+
+## Training contract
+
+The trainer consumes either one canonical `e3mu-hdf5-v1` file or the retained
+legacy static/response extXYZ pair. Canonical HDF5 is preferred because it
+preserves target masks, source identity, physical groups, units, and fixed
+splits explicitly.
+
+```mermaid
+flowchart LR
+    D[Canonical data and masks] --> B[Neighbor graphs and batches]
+    B --> M[MixedGranularityE3GNN]
+    M --> H[Total Hamiltonian]
+    H --> O[Predictions and derivatives]
+    O --> L[Mask-aware multi-task loss]
+    L --> G[Finite-gradient check and clipping]
+    G --> U[Optimizer update]
+    U --> V[Fixed-split validation]
+    V --> C[Safe checkpoint and artifacts]
+```
+
+## Mask-aware objective
+
+For target family $t$, prediction $\widehat{\mathbf y}_{t,k}$, reference
+$\mathbf y_{t,k}$, mask or sample weight $m_{t,k}$, and component count $d_t$,
+the implemented multi-task objective is
+
+$$
+\mathcal L(\theta)=
+\sum_{t\in\mathcal T}w_t
+\frac{\sum_k m_{t,k}
+\left\|\widehat{\mathbf y}_{t,k}-\mathbf y_{t,k}\right\|_2^2}
+{\sum_k m_{t,k}d_t}.
+$$
+
+Active targets can include energy, forces, dipole, molecular and atomic
+polarizability, charges, atomic dipoles, C6, Born effective charge, magnetic
+moments, effective spin field, $J$, $D_i$, and DMI. A target contributes only
+when all three conditions hold:
+
+1. its loss weight is positive;
+2. the dataset mask is active for at least one item in the batch; and
+3. the selected architecture produces the required output.
+
+Energy errors are normalized per atom before aggregation so that large cells
+do not dominate solely through atom count. Expensive derivative outputs are
+constructed only when their active mask and loss weight require them.
+
+## Training modes
+
+| Mode | Trainable scope | Intended use |
+| --- | --- | --- |
+| `base` | ground-state Layer-1 branch | establish local energy and force representation |
+| `response` | response branch above a base checkpoint | train electric response while retaining a frozen ground model |
+| `joint` | active Layer-1, Layer-2, Layer-3, and FiLM parameters | coupled fine-tuning under a shared objective |
+
+The full-chain GUI workflow can freeze the ground branch during response
+warmup, assign separate ground and response learning rates, ramp response
+weights, and finish with one or more joint stages. The command-line interface
+exposes the same `TrainConfig` through JSON presets.
+
+## Architecture and data compatibility
+
+The GUI scans canonical masks and periodicity before enabling switches or loss
+fields. The enforced dependency graph is:
+
+```mermaid
+flowchart TD
+    PME[PME / Ewald] --> Q[QEq]
+    D4[D4] --> Q
+    DMI[DMI] --> S[Spin]
+    DMI --> P[O(3) parity]
+    L3[L=3 tensor] --> P
+    FILM[FiLM] --> P
+    FILM --> DOMAIN[At least one active domain]
+    MASKS[Dataset labels and periodicity] --> PME
+    MASKS --> D4
+    MASKS --> S
+```
+
+The current D4 backend is molecular, so periodic datasets disable D4. PME is
+meaningful only for periodic records and requires QEq. Direct $J$, $D_i$, or
+DMI losses remain unavailable for the current portable Neo tiers because their
+masks are false.
+
+## Stable optimization safeguards
+
+The trainer refuses to save an unvalidated epoch-0 checkpoint. Each optimizer
+step checks model outputs, loss, and every parameter gradient for finite values.
+The global gradient norm is evaluated after scale normalization so a float32
+sum of squares cannot overflow merely because individual gradients are large.
+A failed step reports structure IDs, atom and edge counts, and affected
+parameter names before stopping.
+
+QEq and induced-polarization solvers expose both residuals and stability
+shifts. A finite solve with a large curvature shift is retained as a diagnostic
+rather than presented as a calibrated physical result.
+
+## Validation score and checkpoint selection
+
+Loss weights are optimization choices and must not control model ranking.
+Checkpoint selection and Auto Research therefore use
+
+$$
+S_{\mathrm{val}}=
+\frac{1}{|\mathcal T_{\mathrm{active}}|}
+\sum_{t\in\mathcal T_{\mathrm{active}}}
+\frac{\operatorname{MAE}_t}{s_t},
+$$
+
+where $s_t$ is a fixed characteristic scale. Current scales are 1 for energy,
+force, dipole, polarizability, and magnetic moment; 0.1 for charge, atomic
+dipole, atomic polarizability, and BEC; 10 for C6; and 0.01 eV for effective
+spin field and Hamiltonian parameters. A candidate cannot appear better by
+reducing its own loss coefficient.
+
+## Auto Research
+
+Auto Research first evaluates the current GUI configuration as a baseline. It
+then combines random exploration with a small Gaussian-process surrogate. The
+same deterministic subset and split are reused across candidates.
+
+```mermaid
+sequenceDiagram
+    participant U as User architecture
+    participant D as Dataset capability scan
+    participant A as Auto Research
+    participant T as Short training trial
+    participant G as GUI
+    U->>D: lock selected switches
+    D->>A: remove unsupported targets and solver dimensions
+    A->>T: run baseline
+    loop exploration and surrogate proposals
+        A->>T: candidate parameters
+        T-->>A: normalized validation score
+    end
+    A-->>G: retained best parameter set
+    G->>G: Apply Best only on explicit click
+```
+
+Search levels progressively add active loss weights, optimizer/backbone
+parameters, staged fine-tuning parameters, and solver parameters that remain
+meaningful for the selected architecture. The selected architecture itself is
+locked by default. A dataset change invalidates the retained result so values
+from an earlier capability scan cannot be applied to a different corpus.
+
+## Live artifacts
+
+With epoch artifacts enabled, training writes under
+`<checkpoint parent>/train/<checkpoint stem>/`:
+
+- safe per-epoch checkpoints;
+- full and clipped energy/force parity plots;
+- force-norm plots;
+- loss and MAE histories;
+- active auxiliary-task MAEs;
+- QEq, polarization, and FiLM residual histories;
+- memory histories and machine-readable JSON; and
+- the best validated checkpoint at the requested output path.
+
+The PyQt6 GUI displays the latest regression, MAE, solver-residual, and memory
+views after every validation epoch.
+
+![PyQt6 live research interface](assets/gui/qt-research-studio.png)
+
+## Deterministic physical validation
+
+The float64 self-test evaluates complete transformed forward passes and finite
+differences. With the documented seed 7, the current maximum errors are:
+
+| Check | Maximum error |
+| --- | ---: |
+| Rotation: energy | 0 |
+| Rotation: force | $3.47\times10^{-18}$ |
+| Rotation: dipole | $2.61\times10^{-15}$ |
+| Rotation: polarizability | $2.22\times10^{-16}$ |
+| Reflection: energy, force, dipole, polarizability | 0 |
+| Time reversal: spin energy and effective field | 0 |
+| Charge conservation | 0 e |
+| QEq stationarity residual | $9.39\times10^{-12}$ |
+| Conservative-force finite difference | $8.15\times10^{-12}$ eV/angstrom |
+
+![Deterministic validation margins](assets/generated/physics-self-tests.png)
+
+The current regression suite contains 44 passing tests. It covers O(3)
+channels, QEq on Apple MPS, PME and D4 reference behavior, polarization
+gradients, spin losses, checkpoint safety, HDF5 masks and splits, dataset-aware
+GUI state, and VASP magnetic mapping.
+
+## Short held-out benchmarks
+
+These experiments validate data flow and trainability over small budgets.
+
+| Dataset and held-out split | Training scope | Held-out result |
+| --- | --- | --- |
+| QM7-X, 8 test molecules | 12 epochs; energy, dipole, polarizability, charge, atomic polarizability | energy 1.907 eV/system; dipole 0.1313 e angstrom/component; polarizability 0.7217 angstrom3/component; charge 0.0949 e/atom; atomic polarizability 0.3089 angstrom3/component |
+| BEC, 4 validation cells / 768 atoms | 2 epochs | BEC MAE 0.2156 e/component |
+| SCFNN, 4 validation cells / 768 atoms | 20 epochs | dipole MAE 2.435 e angstrom/component; zero baseline 2.972 e angstrom/component |
+
+The QM7-X force and C6 loss weights were zero, so their evaluator outputs are
+not trained-accuracy results. The short QEq run required a mean test stability
+shift of 14.39 eV, which indicates that its learned raw hardness was not yet
+physically calibrated.
+
+## Memory behavior
+
+Force and BEC losses require higher-order autograd graphs. On Apple MPS,
+batches are packed by edge count rather than structure count; graph references,
+optimizer gradients, plotting figures, and reclaimable allocator blocks are
+released after their useful lifetime. Every epoch reports process RSS, active
+MPS tensors, driver allocation, and reclaimable cache.
+
+A measured five-epoch MPS run with energy, force, dipole, and polarizability
+losses increased RSS by 16.3 MiB between epochs 1 and 5. Post-cleanup active
+MPS allocation stayed near 30.8 MiB and driver allocation settled near
+116.2 MiB. No sustained-growth warning was triggered.
+
+![Measured memory profile](assets/generated/memory-profile.png)
+
+This short bounded result is evidence against an epoch-to-epoch retained-graph
+leak in that workflow. It is not a universal peak-memory bound; peak memory
+still depends on edge count, active derivative targets, feature width, and
+solver configuration.
+
+## Interpretation limits
+
+- Symmetry and derivative tests establish structural correctness, not
+  predictive coverage across all elements.
+- The portable corpus has no direct active $J$, $D_i$, or DMI labels.
+- The current D4 implementation does not provide periodic lattice dispersion.
+- No converged phonon spectrum or production molecular-dynamics stability
+  study is reported.
+- Neo's source composition and current BEC rights blocker are described in
+  [Datasets](DATASETS.md).
+
+Use [Reproducibility](REPRODUCIBILITY.md) for exact setup and command examples.

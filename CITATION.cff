@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the software and the accompanying manuscript."
+title: "Mixed-Granularity E(3)-mu-GNN"
+type: software
+authors:
+  - family-names: "Zhan"
+    given-names: "Yufeng"
+    alias: "Fona"
+year: 2026
+license: MIT
+keywords:
+  - equivariant graph neural network
+  - machine-learning interatomic potential
+  - charge equilibration
+  - long-range electrostatics
+  - polarizability
+  - spin Hamiltonian
+  - materials science
+abstract: >-
+  A three-layer E(3)-equivariant atomistic graph neural network coupling a
+  local parity-aware potential, differentiable electrostatic and polarization
+  solvers, and a time-reversal-aware spin Hamiltonian through FiLM feedback.

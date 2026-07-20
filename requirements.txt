@@ -1,0 +1,15 @@
+numpy>=1.26
+torch>=2.3,<3
+torch-geometric>=2.5,<3
+ase>=3.22
+h5py>=3.10
+ijson>=3.3,<4
+pyarrow>=16
+scipy>=1.11
+matplotlib>=3.8
+psutil>=5.9
+PyQt6>=6.7,<7
+torch-pme==0.5.0
+tad-dftd4==0.8.0
+dftd4==4.2.0
+pytest>=8
