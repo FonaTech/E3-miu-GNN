@@ -642,7 +642,7 @@ derivatives. With the documented seed 7, the current maximum errors are:
 
 ![Physics validation](assets/generated/physics-self-tests.png)
 
-The repository regression suite currently contains 44 passing tests. It also
+The repository regression suite currently contains 54 passing tests. It also
 checks MPS-specific QEq solves, differentiable PME and D4 references, DEQ
 gradients, Layer-3 supervised gradients, checkpoint safety, HDF5 invariants,
 dataset-aware GUI state, and magnetic VASP mapping.

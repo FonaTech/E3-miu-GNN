@@ -187,7 +187,7 @@ differences. With the documented seed 7, the current maximum errors are:
 
 ![Deterministic validation margins](assets/generated/physics-self-tests.png)
 
-The current regression suite contains 44 passing tests. It covers O(3)
+The current regression suite contains 67 passing tests. It covers O(3)
 channels, QEq on Apple MPS, PME and D4 reference behavior, polarization
 gradients, spin losses, checkpoint safety, HDF5 masks and splits, dataset-aware
 GUI state, and VASP magnetic mapping.
@@ -214,6 +214,57 @@ batches are packed by edge count rather than structure count; graph references,
 optimizer gradients, plotting figures, and reclaimable allocator blocks are
 released after their useful lifetime. Every epoch reports process RSS, active
 MPS tensors, driver allocation, and reclaimable cache.
+
+Canonical HDF5 training and checkpoint evaluation stream by default. The
+in-memory state contains the structure/atom index, group split, label masks,
+and element table. Exact neighbor indices and periodic shift vectors are kept
+in a source-, cutoff-, and backend-keyed disk cache. The cache is written once,
+then opened read-only as contiguous memory-mapped arrays; it is never rewritten
+between epochs. Coordinates and labels are read only when a batch is requested,
+and a bounded two-batch CPU thread prefetch overlaps HDF5 assembly with device
+execution. `stream_hdf5=False` (or the CLI option
+`--no-stream-hdf5`) retains the former whole-corpus materialization path for
+debugging. Legacy extXYZ input is still materialized during parsing.
+
+The following isolated-process measurement uses Neo Tiny at a 5 angstrom
+cutoff and batch size 8. The selected train/validation corpus contains 4,971
+structures, 332,336 atoms, and 13,495,436 directed edges. Incremental RSS is
+measured relative to the same imported-runtime baseline in each fresh ARM64
+process.
+
+| Data path | Preparation | Data-only epoch | Peak incremental RSS | Total peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| Materialized configurations and graphs | 36.55 s | 0.592 s | 918.4 MiB | 1,352.1 MiB |
+| Streamed, cold topology cache | 30.44 s | 3.707 s | 372.3 MiB | 807.0 MiB |
+| Streamed, reused topology cache | 0.0246 s | 3.733 s | 120.3 MiB | 552.0 MiB |
+
+The reusable exact topology cache is 43.62 MiB. Local atom indices use the
+smallest safe unsigned integer width and are restored to `int64` before model
+execution. Periodic shifts use a per-structure, bitwise-exact dictionary: the
+5,542,544 nonzero Tiny shift rows contain 78,758 unique `float64[3]` bit
+patterns, with at most 80 patterns in one structure. The dictionary values and
+`uint8` codes occupy about 7.09 MiB; exact local nonzero-row indices use
+`uint16`. Compared with the preceding 173.92 MiB sparse cache, the complete
+cache is 130.30 MiB smaller. Reconstruction performs only integer lookup and
+copying, with no floating-point recomputation.
+
+The file-backed memory-map pages are reclaimable by the operating system; the
+reported RSS includes pages touched during the complete digest and epoch scans.
+The warm data-only epoch remains about 3.7 seconds, without repeated cache
+writes. Materialized and streamed graph digests are identical across all
+`AtomicData` labels and weights, atom types, coordinates, edge indices,
+metadata, and periodic shifts. Transferring the same measured batch to MPS also
+produced identical allocations in both modes: 2.460 MiB active and 40.453 MiB
+driver memory. Streaming therefore changes host storage and I/O behavior, not
+the graph, numerical precision, cutoff, batch tensor, or accelerator-resident
+model calculation. Coordinate and label HDF5 arrays remain streamed, while the
+largest repeated topology payload is memory-mapped and batch assembly is
+prefetched. For production force training, the remaining data-only overhead is
+also overlapped with model forward/backward time.
+
+The machine-readable report and reproducer are
+`Validation/StreamingBenchmark/tiny_streaming_comparison.json` and
+`Validation/StreamingBenchmark/benchmark_hdf5_memory.py`.
 
 A measured five-epoch MPS run with energy, force, dipole, and polarizability
 losses increased RSS by 16.3 MiB between epochs 1 and 5. Post-cleanup active

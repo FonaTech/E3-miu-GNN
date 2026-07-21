@@ -134,6 +134,14 @@ python E3_miu_GNN.py evaluate \
   --output test_metrics.json
 ```
 
+Canonical HDF5 training and evaluation stream structures and labels by
+default. Exact neighbor topology is cached once in a read-only, memory-mapped
+layout, CPU assembly is bounded to a two-batch prefetch window, and only the
+current batch is transferred to the accelerator. Use `--no-stream-hdf5` only for materialized
+debug comparisons; legacy extXYZ input is still parsed into memory. Measured
+Tiny RAM and I/O trade-offs are reported in
+[Training and validation](docs/TRAINING_AND_VALIDATION.md#memory-behavior).
+
 Convert an extXYZ file into the canonical schema:
 
 ```bash
@@ -187,7 +195,7 @@ the archive-level redistribution terms for the transformed `BEC/H2O`,
 
 ## Verified behavior
 
-The current source tree passes 54 regression tests and the deterministic
+The current source tree passes 67 regression tests and the deterministic
 physics self-test. The checked invariants include:
 
 - rotation and reflection behavior of energy, force, dipole, and

@@ -131,6 +131,7 @@ except Exception:
         QAbstractButton = _UnavailableQtBase
         QFrame = _UnavailableQtBase
         QMainWindow = _UnavailableQtBase
+        QStyledItemDelegate = _UnavailableQtBase
 
     QtCore = _UnavailableQtCore()  # type: ignore[assignment]
     QtGui = object()  # type: ignore[assignment]
@@ -903,32 +904,26 @@ class AtomicData(_TGData):
     """
 
     @staticmethod
-    def from_config(cfg: Configuration, *, z_table: AtomicNumberTable, cutoff: float) -> "AtomicData":
+    def from_config(
+        cfg: Configuration,
+        *,
+        z_table: AtomicNumberTable,
+        cutoff: float,
+        topology: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    ) -> "AtomicData":
         cell_np = np.asarray(cfg.cell if cfg.cell is not None else np.eye(3) * 100.0, dtype=float).reshape(3, 3).copy()
-        if not any(bool(value) for value in cfg.pbc):
-            edge_index_np, shifts_np = _fast_nonperiodic_neighborhood(
-                np.asarray(cfg.positions, dtype=float), float(cutoff)
+        if topology is None:
+            edge_index_np, shifts_np = _configuration_neighbor_topology(
+                cfg, cutoff=float(cutoff), cell=cell_np
             )
-            edge_index = torch.tensor(edge_index_np, dtype=torch.long)
-            shifts = torch.tensor(shifts_np, dtype=torch.get_default_dtype())
-        elif HAS_MACE_NEIGHBORHOOD and _mace_get_neighborhood is not None:
-            edge_index_np, shifts_np, _unit_shifts, _cell_used = _mace_get_neighborhood(
-                positions=np.asarray(cfg.positions, dtype=float),
-                cutoff=float(cutoff),
-                pbc=cfg.pbc,
-                cell=cell_np,
-                true_self_interaction=False,
-            )
-            edge_index = torch.tensor(np.asarray(edge_index_np, dtype=np.int64), dtype=torch.long)
-            shifts = torch.tensor(np.asarray(shifts_np, dtype=float), dtype=torch.get_default_dtype())
         else:
-            atoms = Atoms(numbers=cfg.atomic_numbers, positions=cfg.positions, cell=cell_np, pbc=cfg.pbc)
-            i, j, S = neighbor_list("ijS", atoms, cutoff=float(cutoff))
-            edge_index = torch.tensor(np.stack([i, j], axis=0), dtype=torch.long)
-            shift_vectors = np.einsum(
-                "ni,ij->nj", np.asarray(S, dtype=float), np.asarray(atoms.cell.array, dtype=float)
-            )
-            shifts = torch.tensor(shift_vectors, dtype=torch.get_default_dtype())
+            edge_index_np, shifts_np = topology
+        edge_index = torch.tensor(
+            np.asarray(edge_index_np, dtype=np.int64), dtype=torch.long
+        )
+        shifts = torch.tensor(
+            np.asarray(shifts_np, dtype=float), dtype=torch.get_default_dtype()
+        )
         atom_types = torch.tensor([z_table.z_to_index[int(z)] for z in cfg.atomic_numbers], dtype=torch.long)
         
         cell = cell_np
@@ -1032,6 +1027,50 @@ class AtomicData(_TGData):
         data.system_id = str(props.get("system_id", "unknown"))
         data.group_id = str(props.get("group_id", "unknown"))
         return data
+
+
+def _configuration_neighbor_topology(
+    cfg: Configuration,
+    *,
+    cutoff: float,
+    cell: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build the exact topology used by both materialized and streamed graphs."""
+    cell_np = np.asarray(
+        cell if cell is not None else (
+            cfg.cell if cfg.cell is not None else np.eye(3) * 100.0
+        ),
+        dtype=float,
+    ).reshape(3, 3)
+    if not any(bool(value) for value in cfg.pbc):
+        return _fast_nonperiodic_neighborhood(
+            np.asarray(cfg.positions, dtype=float), float(cutoff)
+        )
+    if HAS_MACE_NEIGHBORHOOD and _mace_get_neighborhood is not None:
+        edge_index, shifts, _unit_shifts, _cell_used = _mace_get_neighborhood(
+            positions=np.asarray(cfg.positions, dtype=float),
+            cutoff=float(cutoff),
+            pbc=cfg.pbc,
+            cell=cell_np,
+            true_self_interaction=False,
+        )
+        return (
+            np.asarray(edge_index, dtype=np.int64),
+            np.asarray(shifts, dtype=np.float64),
+        )
+    atoms = Atoms(
+        numbers=cfg.atomic_numbers,
+        positions=cfg.positions,
+        cell=cell_np,
+        pbc=cfg.pbc,
+    )
+    i, j, unit_shifts = neighbor_list("ijS", atoms, cutoff=float(cutoff))
+    shift_vectors = np.einsum(
+        "ni,ij->nj",
+        np.asarray(unit_shifts, dtype=float),
+        np.asarray(atoms.cell.array, dtype=float),
+    )
+    return np.stack([i, j], axis=0).astype(np.int64), shift_vectors
 
 
 def load_extxyz_configurations(
@@ -1837,6 +1876,1207 @@ def load_hdf5_configurations(
             selected_indices=selected_indices,
         )
     )
+
+
+HDF5_TOPOLOGY_CACHE_VERSION = "e3mu-topology-cache-v5-shift-dictionary"
+
+
+def _compact_unsigned_dtype_for_count(count: int) -> np.dtype:
+    """Return the smallest unsigned dtype that can index ``count`` values."""
+    value_count = max(0, int(count))
+    if value_count <= np.iinfo(np.uint8).max:
+        return np.dtype(np.uint8)
+    if value_count <= np.iinfo(np.uint16).max:
+        return np.dtype(np.uint16)
+    if value_count <= np.iinfo(np.uint32).max:
+        return np.dtype(np.uint32)
+    if value_count <= np.iinfo(np.uint64).max:
+        return np.dtype(np.uint64)
+    raise OverflowError(f"Cannot represent {value_count} values with uint64 indices")
+
+
+def _encode_bitwise_shift_dictionary(
+    shifts: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Encode nonzero float64 shift rows without changing their bit patterns."""
+    exact = np.ascontiguousarray(shifts, dtype=np.float64).reshape(-1, 3)
+    bits = exact.view(np.uint64).reshape(-1, 3)
+    # An all-positive-zero row needs no stored value. Any other bit pattern,
+    # including signed zero or a non-canonical NaN payload, is retained.
+    local_indices = np.flatnonzero(np.any(bits != 0, axis=1))
+    if local_indices.size == 0:
+        return (
+            np.empty((0,), dtype=np.uint64),
+            np.empty((0,), dtype=np.uint64),
+            np.empty((0, 3), dtype=np.float64),
+        )
+    unique_bits, codes = np.unique(
+        bits[local_indices], axis=0, return_inverse=True
+    )
+    dictionary = (
+        np.ascontiguousarray(unique_bits)
+        .view(np.float64)
+        .reshape(-1, 3)
+    )
+    return (
+        local_indices.astype(np.uint64, copy=False),
+        np.asarray(codes, dtype=np.uint64),
+        dictionary,
+    )
+
+
+@dataclass
+class HDF5StreamPlan:
+    """Small in-memory index for an otherwise disk-resident canonical corpus."""
+
+    path: str
+    atom_ptr: np.ndarray
+    group_ids: Tuple[str, ...]
+    split_values: Tuple[str, ...]
+    metadata_values: Dict[str, Tuple[str, ...]]
+    label_masks: Dict[str, np.ndarray]
+    train_indices: np.ndarray
+    val_indices: np.ndarray
+    elements: Tuple[int, ...]
+    split_info: Dict[str, Any]
+    source_size: int
+    source_mtime_ns: int
+
+    @property
+    def selected_indices(self) -> np.ndarray:
+        return np.sort(
+            np.concatenate([self.train_indices, self.val_indices]).astype(
+                np.int64, copy=False
+            )
+        )
+
+
+def _group_stratified_hdf5_sample_indices(
+    group_ids: Sequence[str], *, fraction: float, seed: int
+) -> np.ndarray:
+    """Match canonical group-aware subsetting without materializing structures."""
+    count = len(group_ids)
+    if not (0.0 < float(fraction) <= 1.0):
+        raise ValueError("sample_fraction must be in (0, 1]")
+    if float(fraction) >= 1.0 or count <= 2:
+        return np.arange(count, dtype=np.int64)
+    target = max(2, int(round(count * float(fraction))))
+    group_indices: Dict[str, List[int]] = {}
+    for index, group_id in enumerate(group_ids):
+        group_indices.setdefault(str(group_id), []).append(index)
+    ranked_groups = sorted(
+        group_indices,
+        key=lambda group: hashlib.sha256(
+            f"{int(seed)}|{group}".encode("utf-8")
+        ).hexdigest(),
+    )
+    for group, indices in group_indices.items():
+        indices.sort(
+            key=lambda index: hashlib.sha256(
+                f"{int(seed)}|{group}|{index}".encode("utf-8")
+            ).hexdigest()
+        )
+    selected: List[int] = []
+    depth = 0
+    while len(selected) < target:
+        made_progress = False
+        for group in ranked_groups:
+            indices = group_indices[group]
+            if depth >= len(indices):
+                continue
+            selected.append(int(indices[depth]))
+            made_progress = True
+            if len(selected) >= target:
+                break
+        if not made_progress:
+            break
+        depth += 1
+    return np.asarray(sorted(selected), dtype=np.int64)
+
+
+def prepare_hdf5_stream_plan(
+    path: str,
+    *,
+    val_fraction: float,
+    seed: int,
+    sample_fraction: float = 1.0,
+    sample_seed: int = 0,
+    require_train_val: bool = True,
+) -> HDF5StreamPlan:
+    """Read only canonical indices, masks, and split metadata into memory."""
+    if not HAS_H5PY:
+        raise RuntimeError("HDF5 streaming requires h5py")
+    resolved = str(Path(path).expanduser().resolve())
+    source_stat = Path(resolved).stat()
+    with h5py.File(resolved, "r") as handle:
+        schema = str(handle.attrs.get("schema_version", ""))
+        if schema != HDF5_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported HDF5 schema: {schema!r}")
+        structures = handle["structures"]
+        metadata = handle["metadata"]
+        masks = handle["masks"]
+        atom_ptr = np.asarray(structures["atom_ptr"][:], dtype=np.int64)
+        n_structures = len(atom_ptr) - 1
+        group_ids = tuple(
+            str(value) for value in metadata["group_id"].asstr()[:]
+        )
+        split_values = tuple(
+            str(value).strip().lower() for value in metadata["split"].asstr()[:]
+        )
+        metadata_values = {
+            name: tuple(str(value) for value in metadata[name].asstr()[:])
+            for name in ("source", "method_id", "system_id")
+            if name in metadata
+        }
+        if len(group_ids) != n_structures or len(split_values) != n_structures:
+            raise ValueError("Canonical metadata length does not match atom_ptr")
+        selected = _group_stratified_hdf5_sample_indices(
+            group_ids, fraction=float(sample_fraction), seed=int(sample_seed)
+        )
+
+        group_indices: Dict[str, List[int]] = {}
+        group_split: Dict[str, str] = {}
+        for raw_index in selected:
+            index = int(raw_index)
+            group_id = group_ids[index]
+            group_indices.setdefault(group_id, []).append(index)
+            split_name = split_values[index]
+            if split_name in ("train", "val", "test"):
+                previous = group_split.setdefault(group_id, split_name)
+                if previous != split_name:
+                    raise ValueError(
+                        f"group_id {group_id!r} appears in both {previous!r} "
+                        f"and {split_name!r}"
+                    )
+
+        explicit_train = [group for group, name in group_split.items() if name == "train"]
+        explicit_val = [group for group, name in group_split.items() if name == "val"]
+        test_groups = {group for group, name in group_split.items() if name == "test"}
+        used_explicit = bool(explicit_train and explicit_val)
+        if used_explicit:
+            train_groups = set(explicit_train)
+            val_groups = set(explicit_val)
+            train_groups.update(
+                set(group_indices) - train_groups - val_groups - test_groups
+            )
+        else:
+            eligible = sorted(
+                set(group_indices) - test_groups,
+                key=lambda value: hashlib.sha256(
+                    f"{int(seed)}|{value}".encode("utf-8")
+                ).hexdigest(),
+            )
+            if len(eligible) <= 1:
+                train_groups = set(eligible)
+                val_groups = set(eligible)
+            else:
+                n_val_groups = max(
+                    1,
+                    min(
+                        len(eligible) - 1,
+                        int(round(len(eligible) * float(val_fraction))),
+                    ),
+                )
+                val_groups = set(eligible[:n_val_groups])
+                train_groups = set(eligible[n_val_groups:])
+        train_indices = np.asarray(
+            [
+                index
+                for group in sorted(train_groups)
+                for index in group_indices[group]
+            ],
+            dtype=np.int64,
+        )
+        val_indices = np.asarray(
+            [
+                index
+                for group in sorted(val_groups)
+                for index in group_indices[group]
+            ],
+            dtype=np.int64,
+        )
+        if require_train_val and (train_indices.size == 0 or val_indices.size == 0):
+            raise ValueError("Grouped split produced an empty training or validation set")
+
+        label_masks = {
+            name: np.asarray(masks[name][:], dtype=np.bool_)
+            for name in itertools.chain(HDF5_STRUCTURE_LABELS, HDF5_ATOM_LABELS)
+            if name in masks
+        }
+        elements: set = set()
+        atomic_numbers_dataset = structures["atomic_numbers"]
+        # Match the materialized path's checkpoint element table, including
+        # types present only in the held-out test split. Read atomic numbers in
+        # bounded contiguous chunks; geometry and labels remain disk-resident.
+        element_chunk_atoms = 1_000_000
+        for start in range(0, int(atomic_numbers_dataset.shape[0]), element_chunk_atoms):
+            end = min(int(atomic_numbers_dataset.shape[0]), start + element_chunk_atoms)
+            values = np.asarray(
+                atomic_numbers_dataset[start:end], dtype=np.int16
+            )
+            elements.update(int(value) for value in np.unique(values))
+
+    split_info = {
+        "strategy": "metadata" if used_explicit else "stable_group_hash",
+        "train_structures": int(train_indices.size),
+        "val_structures": int(val_indices.size),
+        "test_structures_excluded": int(
+            sum(len(group_indices[group]) for group in test_groups)
+        ),
+        "train_groups": len(train_groups),
+        "val_groups": len(val_groups),
+        "group_overlap": sorted(train_groups & val_groups),
+        "streaming": True,
+    }
+    return HDF5StreamPlan(
+        path=resolved,
+        atom_ptr=atom_ptr,
+        group_ids=group_ids,
+        split_values=split_values,
+        metadata_values=metadata_values,
+        label_masks=label_masks,
+        train_indices=train_indices,
+        val_indices=val_indices,
+        elements=tuple(sorted(elements)),
+        split_info=split_info,
+        source_size=int(source_stat.st_size),
+        source_mtime_ns=int(source_stat.st_mtime_ns),
+    )
+
+
+def _hdf5_elements_for_indices(
+    plan: HDF5StreamPlan, indices: Sequence[int]
+) -> Tuple[int, ...]:
+    """Read the element set for selected structures with bounded memory."""
+    selected = np.unique(np.asarray(indices, dtype=np.int64))
+    if selected.size == 0:
+        return ()
+    spans: List[Tuple[int, int]] = []
+    for raw_index in selected:
+        index = int(raw_index)
+        start = int(plan.atom_ptr[index])
+        end = int(plan.atom_ptr[index + 1])
+        if spans and spans[-1][1] == start:
+            spans[-1] = (spans[-1][0], end)
+        else:
+            spans.append((start, end))
+    elements: set[int] = set()
+    chunk_atoms = 1_000_000
+    with h5py.File(plan.path, "r") as handle:
+        numbers = handle["structures/atomic_numbers"]
+        for span_start, span_end in spans:
+            for start in range(span_start, span_end, chunk_atoms):
+                end = min(span_end, start + chunk_atoms)
+                elements.update(
+                    int(value)
+                    for value in np.unique(
+                        np.asarray(numbers[start:end], dtype=np.int16)
+                    )
+                )
+    return tuple(sorted(elements))
+
+
+def _read_hdf5_configuration_at(
+    handle: Any,
+    plan: HDF5StreamPlan,
+    index: int,
+    *,
+    include_labels: bool = True,
+) -> Configuration:
+    """Read one indexed canonical structure without retaining corpus arrays."""
+    structure_index = int(index)
+    start = int(plan.atom_ptr[structure_index])
+    end = int(plan.atom_ptr[structure_index + 1])
+    structures = handle["structures"]
+    props: Dict[str, Any] = {"group_id": plan.group_ids[structure_index]}
+    weights: Dict[str, float] = {}
+    if include_labels:
+        labels = handle["labels"]
+        for name in HDF5_STRUCTURE_LABELS:
+            mask = plan.label_masks.get(name)
+            if mask is None or not bool(mask[structure_index]) or name not in labels:
+                continue
+            value = np.asarray(labels[name][structure_index])
+            props[name] = float(value) if value.shape == () else value
+            weights[name] = 1.0
+        for name in HDF5_ATOM_LABELS:
+            mask = plan.label_masks.get(name)
+            if mask is None or not bool(mask[structure_index]) or name not in labels:
+                continue
+            props[name] = np.asarray(labels[name][start:end])
+            weights[name] = 1.0
+        for name, values in plan.metadata_values.items():
+            props[name] = values[structure_index]
+    return Configuration(
+        atomic_numbers=np.asarray(
+            structures["atomic_numbers"][start:end], dtype=int
+        ),
+        positions=np.asarray(structures["positions"][start:end], dtype=float),
+        properties=props,
+        property_weights=weights,
+        cell=np.asarray(structures["cell"][structure_index], dtype=float),
+        pbc=tuple(bool(value) for value in structures["pbc"][structure_index]),
+        config_type="Default",
+        head="Default",
+    )
+
+
+def fit_atomic_energies_from_hdf5_plan(
+    plan: HDF5StreamPlan, zs: Sequence[int]
+) -> np.ndarray:
+    """Fit a bounded-memory ridge reference model from canonical HDF5."""
+    z_to_col = {int(z): index for index, z in enumerate(zs)}
+    energy_mask = plan.label_masks.get("energy")
+    if energy_mask is None:
+        raise ValueError("Cannot fit atomic energies: dataset has no energy mask")
+    normal = np.zeros((len(zs), len(zs)), dtype=np.float64)
+    rhs = np.zeros((len(zs),), dtype=np.float64)
+    ratio_chunks: List[np.ndarray] = []
+    ratio_buffer: List[float] = []
+    with h5py.File(plan.path, "r") as handle:
+        structures = handle["structures"]
+        energies = handle["labels/energy"]
+        for raw_index in plan.train_indices:
+            index = int(raw_index)
+            if not bool(energy_mask[index]):
+                continue
+            energy = float(energies[index])
+            if not math.isfinite(energy):
+                continue
+            start, end = int(plan.atom_ptr[index]), int(plan.atom_ptr[index + 1])
+            numbers = np.asarray(
+                structures["atomic_numbers"][start:end], dtype=int
+            )
+            counts = np.zeros((len(zs),), dtype=np.float64)
+            for number in numbers:
+                counts[z_to_col[int(number)]] += 1.0
+            normal += np.outer(counts, counts)
+            rhs += counts * energy
+            ratio_buffer.append(energy / max(1, len(numbers)))
+            if len(ratio_buffer) >= 65536:
+                ratio_chunks.append(np.asarray(ratio_buffer, dtype=np.float64))
+                ratio_buffer.clear()
+    if ratio_buffer:
+        ratio_chunks.append(np.asarray(ratio_buffer, dtype=np.float64))
+    if not ratio_chunks:
+        raise ValueError("Cannot fit atomic energies: empty dataset")
+    largest_singular = math.sqrt(
+        max(0.0, float(np.linalg.eigvalsh(normal)[-1]))
+    )
+    ridge_root = max(1e-12, 1e-3 * largest_singular)
+    ridge = ridge_root * ridge_root
+    prior = float(np.median(np.concatenate(ratio_chunks)))
+    system = normal + ridge * np.eye(len(zs), dtype=np.float64)
+    target = rhs + ridge * np.full(len(zs), prior, dtype=np.float64)
+    solution = np.linalg.solve(system, target)
+    if not np.isfinite(solution).all():
+        raise FloatingPointError("Atomic reference-energy fit produced non-finite values")
+    return np.asarray(solution, dtype=float).reshape(-1)
+
+
+def _topology_cache_spec(
+    plan: HDF5StreamPlan, cutoff: float
+) -> Tuple[Dict[str, Any], np.ndarray]:
+    source = Path(plan.path)
+    selected = plan.selected_indices
+    backend = (
+        "mace-periodic" if HAS_MACE_NEIGHBORHOOD else "ase-periodic"
+    ) + "+exact-nonperiodic-v2"
+    spec = {
+        "version": HDF5_TOPOLOGY_CACHE_VERSION,
+        "source": str(source.resolve()),
+        "source_size": int(plan.source_size),
+        "source_mtime_ns": int(plan.source_mtime_ns),
+        "selected_sha256": hashlib.sha256(selected.tobytes()).hexdigest(),
+        "selected_count": int(selected.size),
+        "cutoff": format(float(cutoff), ".17g"),
+        "backend": backend,
+    }
+    return spec, selected
+
+
+def _default_topology_cache_directory() -> Path:
+    configured = os.environ.get("E3MU_GRAPH_CACHE_DIR", "").strip()
+    return (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".cache" / "e3mu" / "graph_topology"
+    )
+
+
+def build_hdf5_topology_cache(
+    plan: HDF5StreamPlan,
+    *,
+    cutoff: float,
+    cache_directory: str = "",
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stop_flag: Optional[Callable[[], bool]] = None,
+) -> Optional[str]:
+    """Build or reuse an exact disk topology cache with bounded working memory."""
+    spec, selected = _topology_cache_spec(plan, cutoff)
+    cache_root = (
+        Path(cache_directory).expanduser()
+        if str(cache_directory).strip()
+        else _default_topology_cache_directory()
+    ).resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(
+        json.dumps(spec, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:24]
+    cache_path = cache_root / f"{Path(plan.path).stem}.{key}.h5"
+    spec_json = json.dumps(spec, sort_keys=True)
+
+    def valid_cache(candidate: Path) -> bool:
+        try:
+            with h5py.File(candidate, "r") as handle:
+                return bool(
+                    str(handle.attrs.get("spec_json", "")) == spec_json
+                    and str(handle.attrs.get("storage_layout", ""))
+                    == "contiguous-mmap-v1"
+                    and int(handle["global_indices"].shape[0]) == int(selected.size)
+                    and int(handle["edge_ptr"].shape[0]) == int(selected.size) + 1
+                    and int(handle["edge_ptr"][-1]) == int(handle["edge_index"].shape[0])
+                    and str(handle.attrs.get("shift_storage", ""))
+                    == "per-structure-bitwise-dictionary-v1"
+                    and "shift_nonzero_local_indices" in handle
+                    and "shift_codes" in handle
+                    and "shift_unique_values" in handle
+                    and int(handle["shift_nonzero_local_indices"].shape[0])
+                    == int(handle["shift_codes"].shape[0])
+                    and "shift_ptr" in handle
+                    and int(handle["shift_ptr"].shape[0]) == int(selected.size) + 1
+                    and int(handle["shift_ptr"][-1])
+                    == int(handle["shift_nonzero_local_indices"].shape[0])
+                    and "shift_value_ptr" in handle
+                    and int(handle["shift_value_ptr"].shape[0])
+                    == int(selected.size) + 1
+                    and int(handle["shift_value_ptr"][-1])
+                    == int(handle["shift_unique_values"].shape[0])
+                    and int(handle.attrs.get("max_edges_per_structure", -1)) >= 0
+                    and int(handle.attrs.get("max_unique_shifts_per_structure", -1)) >= 0
+                    and (
+                        int(handle["edge_index"].shape[0]) == 0
+                        or handle["edge_index"].chunks is None
+                    )
+                    and (
+                        int(handle["shift_nonzero_local_indices"].shape[0]) == 0
+                        or (
+                            handle["shift_nonzero_local_indices"].chunks is None
+                            and handle["shift_codes"].chunks is None
+                        )
+                    )
+                    and (
+                        int(handle["shift_unique_values"].shape[0]) == 0
+                        or handle["shift_unique_values"].chunks is None
+                    )
+                )
+        except Exception:
+            return False
+
+    if cache_path.exists() and valid_cache(cache_path):
+        size_mib = cache_path.stat().st_size / (1024.0 * 1024.0)
+        log(
+            f"[{_now()}] Reusing disk topology cache: {cache_path} "
+            f"({size_mib:.1f} MiB)."
+        )
+        return str(cache_path)
+    if cache_path.exists():
+        cache_path.unlink()
+
+    temporary = cache_path.with_name(
+        f"{cache_path.name}.building-{os.getpid()}"
+    )
+    optimized = cache_path.with_name(
+        f"{cache_path.name}.contiguous-{os.getpid()}"
+    )
+    temporary.unlink(missing_ok=True)
+    optimized.unlink(missing_ok=True)
+    total = int(selected.size)
+    log(
+        f"[{_now()}] Building streamed topology cache for {total} structures "
+        f"(cutoff={float(cutoff):g}) ..."
+    )
+    if progress is not None:
+        progress(
+            {
+                "type": "prep",
+                "task": "Build disk topology cache",
+                "overall_frac": 0.05,
+                "current": 0,
+                "total": total,
+                "stage": "neighbor_list",
+            }
+        )
+    started = time.perf_counter()
+    try:
+        with h5py.File(plan.path, "r") as source, h5py.File(temporary, "w") as output:
+            output.attrs["spec_json"] = spec_json
+            output.attrs["created_at"] = _now()
+            output.create_dataset("global_indices", data=selected, compression="gzip")
+            edge_ptr = np.zeros((total + 1,), dtype=np.int64)
+            atom_counts = np.empty((total,), dtype=np.int32)
+            edge_counts = np.empty((total,), dtype=np.int64)
+            shift_nonzero_counts = np.empty((total,), dtype=np.int64)
+            shift_unique_counts = np.empty((total,), dtype=np.int64)
+            edge_dataset = output.create_dataset(
+                "edge_index",
+                shape=(0, 2),
+                maxshape=(None, 2),
+                dtype=np.int32,
+                chunks=(65536, 2),
+                compression="lzf",
+                shuffle=True,
+            )
+            shift_index_dataset = output.create_dataset(
+                "shift_nonzero_local_indices",
+                shape=(0,),
+                maxshape=(None,),
+                dtype=np.uint64,
+                chunks=(65536,),
+                compression="lzf",
+                shuffle=True,
+            )
+            shift_code_dataset = output.create_dataset(
+                "shift_codes",
+                shape=(0,),
+                maxshape=(None,),
+                dtype=np.uint64,
+                chunks=(65536,),
+                compression="lzf",
+                shuffle=True,
+            )
+            shift_value_dataset = output.create_dataset(
+                "shift_unique_values",
+                shape=(0, 3),
+                maxshape=(None, 3),
+                dtype=np.float64,
+                chunks=(65536, 3),
+                compression="lzf",
+                shuffle=True,
+            )
+            edge_buffer: List[np.ndarray] = []
+            shift_index_buffer: List[np.ndarray] = []
+            shift_code_buffer: List[np.ndarray] = []
+            shift_value_buffer: List[np.ndarray] = []
+            buffered_edges = 0
+            written_edges = 0
+            written_nonzero_shifts = 0
+            written_unique_shifts = 0
+
+            def flush() -> None:
+                nonlocal buffered_edges, written_edges
+                nonlocal written_nonzero_shifts, written_unique_shifts
+                if buffered_edges <= 0:
+                    return
+                edges = np.concatenate(edge_buffer, axis=0)
+                new_end = written_edges + int(edges.shape[0])
+                edge_dataset.resize((new_end, 2))
+                edge_dataset[written_edges:new_end] = edges
+                if shift_index_buffer:
+                    local_indices = np.concatenate(shift_index_buffer)
+                    codes = np.concatenate(shift_code_buffer)
+                    new_shift_end = written_nonzero_shifts + int(local_indices.size)
+                    shift_index_dataset.resize((new_shift_end,))
+                    shift_code_dataset.resize((new_shift_end,))
+                    shift_index_dataset[written_nonzero_shifts:new_shift_end] = local_indices
+                    shift_code_dataset[written_nonzero_shifts:new_shift_end] = codes
+                    written_nonzero_shifts = new_shift_end
+                if shift_value_buffer:
+                    unique_values = np.concatenate(shift_value_buffer, axis=0)
+                    new_value_end = written_unique_shifts + int(unique_values.shape[0])
+                    shift_value_dataset.resize((new_value_end, 3))
+                    shift_value_dataset[written_unique_shifts:new_value_end] = unique_values
+                    written_unique_shifts = new_value_end
+                written_edges = new_end
+                edge_buffer.clear()
+                shift_index_buffer.clear()
+                shift_code_buffer.clear()
+                shift_value_buffer.clear()
+                buffered_edges = 0
+
+            emit_every = max(1, min(100, total // 20 or 1))
+            for row, raw_index in enumerate(selected):
+                if stop_flag is not None and stop_flag():
+                    return None
+                cfg = _read_hdf5_configuration_at(
+                    source, plan, int(raw_index), include_labels=False
+                )
+                edge_index, shifts = _configuration_neighbor_topology(
+                    cfg, cutoff=float(cutoff)
+                )
+                count = int(edge_index.shape[1])
+                atom_counts[row] = int(len(cfg.atomic_numbers))
+                edge_counts[row] = count
+                local_indices, shift_codes, unique_shifts = (
+                    _encode_bitwise_shift_dictionary(shifts)
+                )
+                shift_nonzero_counts[row] = int(local_indices.size)
+                shift_unique_counts[row] = int(unique_shifts.shape[0])
+                edge_ptr[row + 1] = edge_ptr[row] + count
+                if count:
+                    edge_buffer.append(
+                        np.asarray(edge_index.T, dtype=np.int32)
+                    )
+                    if local_indices.size:
+                        shift_index_buffer.append(local_indices)
+                        shift_code_buffer.append(shift_codes)
+                        shift_value_buffer.append(unique_shifts)
+                    buffered_edges += count
+                if buffered_edges >= 250000:
+                    flush()
+                current = row + 1
+                if progress is not None and (
+                    current == total or current % emit_every == 0
+                ):
+                    progress(
+                        {
+                            "type": "prep",
+                            "task": "Build disk topology cache",
+                            "overall_frac": 0.05
+                            + 0.15 * current / max(1, total),
+                            "current": current,
+                            "total": total,
+                            "stage": "neighbor_list",
+                        }
+                    )
+            flush()
+            output.create_dataset("edge_ptr", data=edge_ptr, compression="gzip")
+            output.create_dataset("atom_counts", data=atom_counts, compression="gzip")
+            output.create_dataset("edge_counts", data=edge_counts, compression="gzip")
+            shift_ptr = np.zeros((total + 1,), dtype=np.int64)
+            np.cumsum(shift_nonzero_counts, out=shift_ptr[1:])
+            if int(shift_ptr[-1]) != int(written_nonzero_shifts):
+                raise RuntimeError("Sparse shift pointer construction is inconsistent")
+            output.create_dataset("shift_ptr", data=shift_ptr, compression="gzip")
+            shift_value_ptr = np.zeros((total + 1,), dtype=np.int64)
+            np.cumsum(shift_unique_counts, out=shift_value_ptr[1:])
+            if int(shift_value_ptr[-1]) != int(written_unique_shifts):
+                raise RuntimeError("Shift dictionary pointer construction is inconsistent")
+            output.create_dataset(
+                "shift_value_ptr", data=shift_value_ptr, compression="gzip"
+            )
+        if stop_flag is not None and stop_flag():
+            return None
+        if progress is not None:
+            progress(
+                {
+                    "type": "prep",
+                    "task": "Finalize read-optimized topology cache",
+                    "overall_frac": 0.20,
+                    "current": 0,
+                    "total": 1,
+                    "stage": "cache_finalize",
+                }
+            )
+        # Resizable HDF5 datasets must be chunked. Rewrite them once into
+        # contiguous arrays so training can memory-map exact topology bytes
+        # without repeated HDF5 chunk decompression or per-epoch cache writes.
+        with h5py.File(temporary, "r") as source, h5py.File(
+            optimized, "w", libver="latest"
+        ) as output:
+            for name, value in source.attrs.items():
+                output.attrs[name] = value
+            output.attrs["storage_layout"] = "contiguous-mmap-v1"
+            output.attrs["shift_storage"] = "per-structure-bitwise-dictionary-v1"
+            for name in (
+                "global_indices",
+                "edge_ptr",
+                "atom_counts",
+                "edge_counts",
+                "shift_ptr",
+                "shift_value_ptr",
+            ):
+                output.create_dataset(name, data=source[name][:])
+            copy_edges = 1_000_000
+            max_atoms = int(np.max(source["atom_counts"][:], initial=0))
+            compact_edge_dtype = _compact_unsigned_dtype_for_count(max_atoms)
+            output.attrs["edge_index_storage_dtype"] = compact_edge_dtype.name
+            input_edges = source["edge_index"]
+            output_edges = output.create_dataset(
+                "edge_index", shape=input_edges.shape, dtype=compact_edge_dtype
+            )
+            for start in range(0, int(input_edges.shape[0]), copy_edges):
+                end = min(int(input_edges.shape[0]), start + copy_edges)
+                output_edges[start:end] = input_edges[start:end]
+            edge_counts = source["edge_counts"][:]
+            max_edges = int(np.max(edge_counts, initial=0))
+            output.attrs["max_edges_per_structure"] = max_edges
+            compact_index_dtype = _compact_unsigned_dtype_for_count(max_edges)
+            output.attrs["shift_index_storage_dtype"] = compact_index_dtype.name
+            input_indices = source["shift_nonzero_local_indices"]
+            output_indices = output.create_dataset(
+                "shift_nonzero_local_indices",
+                shape=input_indices.shape,
+                dtype=compact_index_dtype,
+            )
+            for start in range(0, int(input_indices.shape[0]), copy_edges):
+                end = min(int(input_indices.shape[0]), start + copy_edges)
+                output_indices[start:end] = input_indices[start:end]
+            shift_value_ptr = source["shift_value_ptr"][:]
+            max_unique_shifts = int(
+                np.max(np.diff(shift_value_ptr), initial=0)
+            )
+            output.attrs["max_unique_shifts_per_structure"] = max_unique_shifts
+            compact_code_dtype = _compact_unsigned_dtype_for_count(max_unique_shifts)
+            output.attrs["shift_code_storage_dtype"] = compact_code_dtype.name
+            input_codes = source["shift_codes"]
+            output_codes = output.create_dataset(
+                "shift_codes", shape=input_codes.shape, dtype=compact_code_dtype
+            )
+            for start in range(0, int(input_codes.shape[0]), copy_edges):
+                end = min(int(input_codes.shape[0]), start + copy_edges)
+                output_codes[start:end] = input_codes[start:end]
+            input_shift_values = source["shift_unique_values"]
+            output_shift_values = output.create_dataset(
+                "shift_unique_values",
+                shape=input_shift_values.shape,
+                dtype=input_shift_values.dtype,
+            )
+            for start in range(0, int(input_shift_values.shape[0]), copy_edges):
+                end = min(int(input_shift_values.shape[0]), start + copy_edges)
+                output_shift_values[start:end] = input_shift_values[start:end]
+        optimized.replace(cache_path)
+        if progress is not None:
+            progress(
+                {
+                    "type": "prep",
+                    "task": "Finalize read-optimized topology cache",
+                    "overall_frac": 0.20,
+                    "current": 1,
+                    "total": 1,
+                    "stage": "done",
+                }
+            )
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+        if optimized.exists():
+            optimized.unlink()
+    size_mib = cache_path.stat().st_size / (1024.0 * 1024.0)
+    log(
+        f"[{_now()}] Built disk topology cache in "
+        f"{time.perf_counter() - started:.2f} s: {cache_path} ({size_mib:.1f} MiB)."
+    )
+    return str(cache_path)
+
+
+class HDF5AtomicDataDataset(Dataset):
+    """Map-style graph dataset whose structures and topology remain on disk."""
+
+    def __init__(
+        self,
+        plan: HDF5StreamPlan,
+        indices: Sequence[int],
+        *,
+        z_table: AtomicNumberTable,
+        cutoff: float,
+        topology_cache: Optional[str],
+    ) -> None:
+        self.plan = plan
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.z_table = z_table
+        self.cutoff = float(cutoff)
+        self.topology_cache = str(topology_cache or "")
+        self._source_handle = None
+        self._topology_handle = None
+        self._edge_memmap: Optional[np.memmap] = None
+        self._shift_memmap: Optional[np.memmap] = None
+        self._shift_index_memmap: Optional[np.memmap] = None
+        self._shift_code_memmap: Optional[np.memmap] = None
+        self._shift_value_memmap: Optional[np.memmap] = None
+        self._topology_mmap_specs: Optional[Dict[str, Tuple[int, np.dtype, Tuple[int, ...]]]] = None
+        self._fallback_shift_indices: Optional[np.ndarray] = None
+        self._handle_pid: Optional[int] = None
+        self.cache_rows: Optional[np.ndarray] = None
+        self.edge_ptr: Optional[np.ndarray] = None
+        self.shift_ptr: Optional[np.ndarray] = None
+        self.shift_value_ptr: Optional[np.ndarray] = None
+        self.edge_counts: Optional[np.ndarray] = None
+        self.atom_counts = (
+            plan.atom_ptr[self.indices + 1] - plan.atom_ptr[self.indices]
+        ).astype(np.int64, copy=False)
+        if self.topology_cache:
+            with h5py.File(self.topology_cache, "r") as cache:
+                cache_indices = np.asarray(cache["global_indices"][:], dtype=np.int64)
+                rows = np.searchsorted(cache_indices, self.indices)
+                if np.any(rows >= len(cache_indices)) or not np.array_equal(
+                    cache_indices[rows], self.indices
+                ):
+                    raise ValueError("Topology cache does not cover dataset indices")
+                self.cache_rows = rows.astype(np.int64, copy=False)
+                self.edge_ptr = np.asarray(cache["edge_ptr"][:], dtype=np.int64)
+                if "shift_ptr" in cache:
+                    self.shift_ptr = np.asarray(cache["shift_ptr"][:], dtype=np.int64)
+                if "shift_value_ptr" in cache:
+                    self.shift_value_ptr = np.asarray(
+                        cache["shift_value_ptr"][:], dtype=np.int64
+                    )
+                all_edge_counts = np.asarray(cache["edge_counts"][:], dtype=np.int64)
+                self.edge_counts = all_edge_counts[self.cache_rows]
+                edge_dataset = cache["edge_index"]
+                edge_offset = edge_dataset.id.get_offset()
+                mmap_specs: Dict[str, Tuple[int, np.dtype, Tuple[int, ...]]] = {}
+                if edge_dataset.chunks is None and edge_offset is not None:
+                    mmap_specs["edge_index"] = (
+                        int(edge_offset),
+                        np.dtype(edge_dataset.dtype),
+                        tuple(int(value) for value in edge_dataset.shape),
+                    )
+                if "shifts" in cache:
+                    shift_names = ("shifts",)
+                elif "shift_codes" in cache:
+                    shift_names = (
+                        "shift_nonzero_local_indices",
+                        "shift_codes",
+                        "shift_unique_values",
+                    )
+                else:
+                    shift_names = (
+                        "shift_nonzero_indices",
+                        "shift_nonzero_values",
+                    )
+                for name in shift_names:
+                    dataset = cache[name]
+                    offset = dataset.id.get_offset()
+                    if dataset.chunks is not None or offset is None:
+                        mmap_specs.clear()
+                        break
+                    mmap_specs[name] = (
+                        int(offset),
+                        np.dtype(dataset.dtype),
+                        tuple(int(value) for value in dataset.shape),
+                    )
+                if "edge_index" in mmap_specs and all(
+                    name in mmap_specs for name in shift_names
+                ):
+                    self._topology_mmap_specs = mmap_specs
+                elif "shift_nonzero_indices" in cache and self.shift_ptr is None:
+                    self._fallback_shift_indices = np.asarray(
+                        cache["shift_nonzero_indices"][:], dtype=np.int64
+                    )
+
+    def __len__(self) -> int:
+        return int(self.indices.size)
+
+    def _ensure_handles(self) -> None:
+        pid = os.getpid()
+        if self._handle_pid == pid and self._source_handle is not None:
+            return
+        self.close()
+        self._source_handle = h5py.File(self.plan.path, "r")
+        if self.topology_cache and self._topology_mmap_specs is not None:
+            edge_offset, edge_dtype, edge_shape = self._topology_mmap_specs["edge_index"]
+            self._edge_memmap = np.memmap(
+                self.topology_cache,
+                mode="r",
+                offset=edge_offset,
+                dtype=edge_dtype,
+                shape=edge_shape,
+                order="C",
+            )
+            if "shifts" in self._topology_mmap_specs:
+                shift_offset, shift_dtype, shift_shape = self._topology_mmap_specs["shifts"]
+                self._shift_memmap = np.memmap(
+                    self.topology_cache,
+                    mode="r",
+                    offset=shift_offset,
+                    dtype=shift_dtype,
+                    shape=shift_shape,
+                    order="C",
+                )
+            elif "shift_codes" in self._topology_mmap_specs:
+                index_offset, index_dtype, index_shape = self._topology_mmap_specs[
+                    "shift_nonzero_local_indices"
+                ]
+                code_offset, code_dtype, code_shape = self._topology_mmap_specs[
+                    "shift_codes"
+                ]
+                value_offset, value_dtype, value_shape = self._topology_mmap_specs[
+                    "shift_unique_values"
+                ]
+                self._shift_index_memmap = np.memmap(
+                    self.topology_cache,
+                    mode="r",
+                    offset=index_offset,
+                    dtype=index_dtype,
+                    shape=index_shape,
+                    order="C",
+                )
+                self._shift_code_memmap = np.memmap(
+                    self.topology_cache,
+                    mode="r",
+                    offset=code_offset,
+                    dtype=code_dtype,
+                    shape=code_shape,
+                    order="C",
+                )
+                self._shift_value_memmap = np.memmap(
+                    self.topology_cache,
+                    mode="r",
+                    offset=value_offset,
+                    dtype=value_dtype,
+                    shape=value_shape,
+                    order="C",
+                )
+            else:
+                index_offset, index_dtype, index_shape = self._topology_mmap_specs[
+                    "shift_nonzero_indices"
+                ]
+                value_offset, value_dtype, value_shape = self._topology_mmap_specs[
+                    "shift_nonzero_values"
+                ]
+                self._shift_index_memmap = np.memmap(
+                    self.topology_cache,
+                    mode="r",
+                    offset=index_offset,
+                    dtype=index_dtype,
+                    shape=index_shape,
+                    order="C",
+                )
+                self._shift_value_memmap = np.memmap(
+                    self.topology_cache,
+                    mode="r",
+                    offset=value_offset,
+                    dtype=value_dtype,
+                    shape=value_shape,
+                    order="C",
+                )
+            self._topology_handle = None
+        else:
+            self._topology_handle = (
+                h5py.File(self.topology_cache, "r") if self.topology_cache else None
+            )
+        self._handle_pid = pid
+
+    def __getitem__(self, item: int) -> AtomicData:
+        self._ensure_handles()
+        index = int(self.indices[int(item)])
+        cfg = _read_hdf5_configuration_at(
+            self._source_handle, self.plan, index, include_labels=True
+        )
+        topology = None
+        if (
+            self._edge_memmap is not None
+            and self._shift_index_memmap is not None
+            and self._shift_code_memmap is not None
+            and self._shift_value_memmap is not None
+        ):
+            row = int(self.cache_rows[int(item)])
+            start, end = int(self.edge_ptr[row]), int(self.edge_ptr[row + 1])
+            left = int(self.shift_ptr[row])
+            right = int(self.shift_ptr[row + 1])
+            value_left = int(self.shift_value_ptr[row])
+            value_right = int(self.shift_value_ptr[row + 1])
+            shifts = np.zeros((end - start, 3), dtype=np.float64)
+            if right > left:
+                local_indices = np.asarray(
+                    self._shift_index_memmap[left:right], dtype=np.int64
+                )
+                codes = np.asarray(
+                    self._shift_code_memmap[left:right], dtype=np.int64
+                )
+                dictionary = np.asarray(
+                    self._shift_value_memmap[value_left:value_right],
+                    dtype=np.float64,
+                )
+                shifts[local_indices] = dictionary[codes]
+            topology = (
+                np.asarray(self._edge_memmap[start:end], dtype=np.int64).T,
+                shifts,
+            )
+        elif (
+            self._edge_memmap is not None
+            and self._shift_index_memmap is not None
+            and self._shift_value_memmap is not None
+        ):
+            row = int(self.cache_rows[int(item)])
+            start, end = int(self.edge_ptr[row]), int(self.edge_ptr[row + 1])
+            if self.shift_ptr is not None:
+                left = int(self.shift_ptr[row])
+                right = int(self.shift_ptr[row + 1])
+            else:
+                left = int(np.searchsorted(self._shift_index_memmap, start, side="left"))
+                right = int(np.searchsorted(self._shift_index_memmap, end, side="left"))
+            shifts = np.zeros((end - start, 3), dtype=np.float64)
+            if right > left:
+                local_indices = np.asarray(
+                    self._shift_index_memmap[left:right], dtype=np.int64
+                ) - start
+                shifts[local_indices] = np.asarray(
+                    self._shift_value_memmap[left:right], dtype=np.float64
+                )
+            topology = (
+                np.asarray(self._edge_memmap[start:end], dtype=np.int64).T,
+                shifts,
+            )
+        elif self._edge_memmap is not None and self._shift_memmap is not None:
+            row = int(self.cache_rows[int(item)])
+            start, end = int(self.edge_ptr[row]), int(self.edge_ptr[row + 1])
+            topology = (
+                np.asarray(self._edge_memmap[start:end], dtype=np.int64).T,
+                np.asarray(self._shift_memmap[start:end], dtype=float),
+            )
+        elif self._topology_handle is not None:
+            row = int(self.cache_rows[int(item)])
+            start, end = int(self.edge_ptr[row]), int(self.edge_ptr[row + 1])
+            edges = np.asarray(
+                self._topology_handle["edge_index"][start:end], dtype=np.int64
+            ).T
+            if "shifts" in self._topology_handle:
+                shifts = np.asarray(
+                    self._topology_handle["shifts"][start:end], dtype=float
+                )
+            elif "shift_codes" in self._topology_handle:
+                left = int(self.shift_ptr[row])
+                right = int(self.shift_ptr[row + 1])
+                value_left = int(self.shift_value_ptr[row])
+                value_right = int(self.shift_value_ptr[row + 1])
+                shifts = np.zeros((end - start, 3), dtype=np.float64)
+                if right > left:
+                    local_indices = np.asarray(
+                        self._topology_handle["shift_nonzero_local_indices"][left:right],
+                        dtype=np.int64,
+                    )
+                    codes = np.asarray(
+                        self._topology_handle["shift_codes"][left:right],
+                        dtype=np.int64,
+                    )
+                    dictionary = np.asarray(
+                        self._topology_handle["shift_unique_values"][
+                            value_left:value_right
+                        ],
+                        dtype=np.float64,
+                    )
+                    shifts[local_indices] = dictionary[codes]
+            else:
+                indices = self._fallback_shift_indices
+                if self.shift_ptr is not None:
+                    left = int(self.shift_ptr[row])
+                    right = int(self.shift_ptr[row + 1])
+                    if indices is None:
+                        indices = np.asarray(
+                            self._topology_handle["shift_nonzero_indices"][left:right],
+                            dtype=np.int64,
+                        )
+                        index_slice = indices
+                    else:
+                        index_slice = indices[left:right]
+                else:
+                    left = int(np.searchsorted(indices, start, side="left"))
+                    right = int(np.searchsorted(indices, end, side="left"))
+                    index_slice = indices[left:right]
+                shifts = np.zeros((end - start, 3), dtype=np.float64)
+                if right > left:
+                    shifts[index_slice - start] = np.asarray(
+                        self._topology_handle["shift_nonzero_values"][left:right],
+                        dtype=np.float64,
+                    )
+            topology = (edges, shifts)
+        return AtomicData.from_config(
+            cfg,
+            z_table=self.z_table,
+            cutoff=self.cutoff,
+            topology=topology,
+        )
+
+    def close(self) -> None:
+        for name in ("_source_handle", "_topology_handle"):
+            handle = getattr(self, name, None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                setattr(self, name, None)
+        for name in (
+            "_edge_memmap",
+            "_shift_memmap",
+            "_shift_index_memmap",
+            "_shift_code_memmap",
+            "_shift_value_memmap",
+        ):
+            array = getattr(self, name, None)
+            if array is not None:
+                memory_map = getattr(array, "_mmap", None)
+                if memory_map is not None:
+                    try:
+                        memory_map.close()
+                    except Exception:
+                        pass
+                setattr(self, name, None)
+        self._handle_pid = None
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_source_handle"] = None
+        state["_topology_handle"] = None
+        state["_edge_memmap"] = None
+        state["_shift_memmap"] = None
+        state["_shift_index_memmap"] = None
+        state["_shift_code_memmap"] = None
+        state["_shift_value_memmap"] = None
+        state["_handle_pid"] = None
+        return state
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class _ThreadPrefetchLoader:
+    """Overlap bounded CPU/HDF5 batch assembly with accelerator execution."""
+
+    def __init__(self, loader: DataLoader, depth: int = 2) -> None:
+        self.loader = loader
+        self.depth = max(1, int(depth))
+
+    def __len__(self) -> int:
+        return len(self.loader)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.loader, name)
+
+    def __iter__(self) -> Iterable[Any]:
+        output: queue.Queue = queue.Queue(maxsize=self.depth)
+        stopped = threading.Event()
+        sentinel = object()
+
+        def offer(value: Any) -> bool:
+            while not stopped.is_set():
+                try:
+                    output.put(value, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def produce() -> None:
+            try:
+                for value in self.loader:
+                    if not offer(("value", value)):
+                        return
+            except BaseException as exc:
+                offer(("error", exc))
+            finally:
+                offer(("end", sentinel))
+
+        worker = threading.Thread(
+            target=produce,
+            name="e3mu-hdf5-prefetch",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            while True:
+                kind, value = output.get()
+                if kind == "end":
+                    break
+                if kind == "error":
+                    raise value
+                yield value
+        finally:
+            stopped.set()
+            worker.join(timeout=2.0)
 
 
 def extxyz_to_hdf5(
@@ -5992,11 +7232,14 @@ def dynamic_parameter_reference_ranges(
             "enable_spin", "enable_film",
         )
     )
-    r_low, r_high = ((5.0, 8.0) if periodic else (4.0, 6.0))
+    r_low, r_high = ((5.0, 10.0) if periodic else (4.0, 8.0))
     if _architecture_value(values, "enable_spin"):
-        spin_value = float(_parameter_value(values, "spin_cutoff", r_max))
+        spin_value = _compatible_spin_cutoff(
+            r_max, _parameter_value(values, "spin_cutoff", r_max)
+        )
         r_low = max(r_low, min(spin_value, 8.0))
-    spin_low = max(2.5, min(4.0, 0.65 * r_max))
+        r_high = max(r_high, r_low)
+    spin_low = min(r_max, max(0.5, min(4.0, 0.65 * r_max)))
     qeq_smear_low = max(0.10, 0.03 * r_max)
     qeq_smear_high = min(1.20, max(0.35, 0.16 * r_max))
     stability_low = max(1e-3, 0.04 * hardness)
@@ -6051,7 +7294,11 @@ def dynamic_architecture_search_space(
     """Build data- and architecture-aware overrides for AutoSearch samplers."""
     capability = capability or {"ready": False}
     periodic = int(capability.get("periodic_structures", 0)) > 0
-    r_choices = [5.0, 6.0, 7.0, 8.0] if periodic else [4.0, 5.0, 6.0]
+    r_choices = (
+        [5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        if periodic
+        else [4.0, 5.0, 6.0, 7.0, 8.0]
+    )
     active_physics = sum(
         int(_architecture_value(values, name))
         for name in (
@@ -6060,17 +7307,29 @@ def dynamic_architecture_search_space(
         )
     )
     channel_choices = [64, 96, 128] if active_physics >= 4 else [32, 48, 64, 96]
-    r_max = max(1.0, float(_parameter_value(values, "r_max", 5.0)))
+    r_max = max(0.5, float(_parameter_value(values, "r_max", 5.0)))
+    r_choices = sorted({*r_choices, round(r_max, 6)})
     hardness = max(
         1e-4, float(_parameter_value(values, "qeq_hardness_min", 0.25))
     )
     qeq_low = max(0.10, 0.03 * r_max)
     qeq_high = min(1.20, max(0.35, 0.16 * r_max))
-    spin_choices = [value for value in r_choices if value <= max(r_choices)]
-    if _architecture_value(values, "enable_spin"):
-        spin_choices = [value for value in r_choices if value <= r_max]
-        if not spin_choices:
-            spin_choices = [r_max]
+    spin_low = min(r_max, max(0.5, min(4.0, 0.65 * r_max)))
+    current_spin = _compatible_spin_cutoff(
+        r_max, _parameter_value(values, "spin_cutoff", r_max)
+    )
+    spin_choices = sorted(
+        {
+            round(max(spin_low, min(r_max, value)), 6)
+            for value in (
+                spin_low,
+                0.80 * r_max,
+                0.90 * r_max,
+                current_spin,
+                r_max,
+            )
+        }
+    )
     return {
         "lr": ("log_uniform", 1e-4, 2e-3 if active_physics >= 4 else 5e-3),
         "batch_size": ("choice", [1, 2, 4, 8] if active_physics >= 3 else [2, 4, 8, 16]),
@@ -6101,9 +7360,9 @@ def dynamic_architecture_search_space(
         "coupling_tol": (
             "log_uniform", 1e-7, 1e-4 if active_physics >= 4 else 1e-3
         ),
-        "chem_aug_prob": ("uniform", 0.0, 0.30),
-        "chem_aug_noise_std": ("uniform", 0.0, 0.10),
-        "chem_aug_mix_max": ("uniform", 0.0, 0.30),
+        "chem_aug_prob": ("choice", [0.0, 0.025, 0.05, 0.10, 0.20, 0.30]),
+        "chem_aug_noise_std": ("choice", [0.0, 0.005, 0.01, 0.025, 0.05, 0.10]),
+        "chem_aug_mix_max": ("choice", [0.0, 0.025, 0.05, 0.10, 0.20, 0.30]),
     }
 
 
@@ -7049,13 +8308,22 @@ def minimal_image_relative_positions(
 
 
 def _weighted_mse(pred: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor]) -> torch.Tensor:
-    if weight is None: return torch.mean((pred - target) ** 2)
-    w = weight.to(device=pred.device, dtype=pred.dtype)
-    if w.sum() <= 0.0: return torch.zeros((), dtype=pred.dtype, device=pred.device)
-    diff2 = (pred - target) ** 2
-    while w.ndim < diff2.ndim: w = w.unsqueeze(-1)
-    expanded = w.expand_as(diff2)
-    return torch.sum(diff2 * expanded) / torch.sum(expanded).clamp(min=1e-12)
+    if weight is None:
+        return torch.mean((pred - target) ** 2)
+    expanded = weight.to(device=pred.device, dtype=pred.dtype)
+    while expanded.ndim < pred.ndim:
+        expanded = expanded.unsqueeze(-1)
+    expanded = expanded.expand_as(pred)
+    active = expanded > 0.0
+    if not bool(torch.any(active).detach().cpu()):
+        return torch.zeros((), dtype=pred.dtype, device=pred.device)
+    if not bool(torch.isfinite(target[active]).all().detach().cpu()):
+        raise FloatingPointError("An active MSE target contains NaN or Inf")
+    difference = pred[active] - target[active]
+    active_weight = expanded[active]
+    return torch.sum(difference * difference * active_weight) / torch.sum(
+        active_weight
+    ).clamp(min=1e-12)
 
 
 def _weighted_huber(
@@ -7069,21 +8337,31 @@ def _weighted_huber(
     threshold = float(delta)
     if not math.isfinite(threshold) or threshold <= 0.0:
         raise ValueError("force_huber_delta must be finite and greater than zero")
-    absolute = torch.abs(pred - target)
+    if weight is None:
+        absolute = torch.abs(pred - target)
+        values = torch.where(
+            absolute <= threshold,
+            absolute * absolute,
+            2.0 * threshold * absolute - threshold * threshold,
+        )
+        return torch.mean(values)
+    expanded = weight.to(device=pred.device, dtype=pred.dtype)
+    while expanded.ndim < pred.ndim:
+        expanded = expanded.unsqueeze(-1)
+    expanded = expanded.expand_as(pred)
+    active = expanded > 0.0
+    if not bool(torch.any(active).detach().cpu()):
+        return torch.zeros((), dtype=pred.dtype, device=pred.device)
+    if not bool(torch.isfinite(target[active]).all().detach().cpu()):
+        raise FloatingPointError("An active Huber target contains NaN or Inf")
+    absolute = torch.abs(pred[active] - target[active])
     values = torch.where(
         absolute <= threshold,
         absolute * absolute,
         2.0 * threshold * absolute - threshold * threshold,
     )
-    if weight is None:
-        return torch.mean(values)
-    expanded = weight.to(device=pred.device, dtype=pred.dtype)
-    if expanded.sum() <= 0.0:
-        return torch.zeros((), dtype=pred.dtype, device=pred.device)
-    while expanded.ndim < values.ndim:
-        expanded = expanded.unsqueeze(-1)
-    expanded = expanded.expand_as(values)
-    return torch.sum(values * expanded) / torch.sum(expanded).clamp(min=1e-12)
+    active_weight = expanded[active]
+    return torch.sum(values * active_weight) / torch.sum(active_weight).clamp(min=1e-12)
 
 
 def _configured_force_loss(
@@ -7107,6 +8385,17 @@ def _configured_force_loss(
 
 def _loss_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.mean((pred - target) ** 2)
+
+
+def _compatible_spin_cutoff(r_max: Any, spin_cutoff: Any) -> float:
+    """Return a finite positive spin cutoff bounded by the local graph cutoff."""
+    local_cutoff = float(r_max)
+    magnetic_cutoff = float(spin_cutoff)
+    if not math.isfinite(local_cutoff) or local_cutoff <= 0.0:
+        raise ValueError("r_max must be finite and greater than zero")
+    if not math.isfinite(magnetic_cutoff) or magnetic_cutoff <= 0.0:
+        raise ValueError("spin_cutoff must be finite and greater than zero")
+    return min(magnetic_cutoff, local_cutoff)
 
 
 @dataclass
@@ -7159,13 +8448,19 @@ class ModelConfig:
     deq_damping: float = 0.5
     deq_alpha_max: float = 100.0
     d4_functional: str = "pbe"
-    spin_cutoff: float = 6.0
+    spin_cutoff: float = 5.0
     # DMI remains opt-in because it requires SOC/DMI supervision; MPtrj
     # collinear magnetic moments alone do not identify this interaction.
     enable_dmi: bool = False
     coupling_iterations: int = 2
     coupling_tol: float = 1e-5
     polarizability_unit: str = "angstrom3"
+
+    def __post_init__(self) -> None:
+        # Keep old JSON/checkpoint configurations usable when they contain the
+        # former 6 Angstrom magnetic default with the 5 Angstrom local cutoff.
+        self.r_max = float(self.r_max)
+        self.spin_cutoff = _compatible_spin_cutoff(self.r_max, self.spin_cutoff)
 
 # ══════════════════════════════════════════════════════════════════════════
 # SECTION: E(3)-mu-GNN Core
@@ -7554,6 +8849,27 @@ def _make_e3mu_rbf(cfg: Optional["ModelConfig"], num_basis: int, r_max: float) -
             f"Unknown rbf_type: {rbf_type!r} (expected 'gaussian', 'trainable_gaussian', or 'bessel')"
         )
 
+
+def _smooth_scalar_bound(value: torch.Tensor, max_abs: float = 32.0) -> torch.Tensor:
+    """Near-identity smooth saturation for invariant scalar channels."""
+    cap = float(max_abs)
+    return value * torch.rsqrt(1.0 + torch.square(value / cap))
+
+
+def _smooth_equivariant_bound(value: torch.Tensor, max_norm: float = 100.0) -> torch.Tensor:
+    """Bound an irreducible feature by an invariant norm-preserving scale.
+
+    Component-wise clipping would break rotational equivariance. This radial
+    map leaves small features unchanged and smoothly saturates only unusually
+    large vector/tensor channels before their polynomial couplings overflow.
+    """
+    cap = float(max_norm)
+    # Use the squared norm directly. ``vector_norm`` has an undefined derivative
+    # at the all-zero vectors used to initialize equivariant channels.
+    norm_squared = torch.sum(value * value, dim=-1, keepdim=True)
+    scale = torch.rsqrt(1.0 + norm_squared / (cap * cap))
+    return value * scale
+
 class FastEquivariantBlock(torch.nn.Module):
     r"""
     Core equivariant message passing block.
@@ -7631,11 +8947,19 @@ class FastEquivariantBlock(torch.nn.Module):
         b = self.self_v_b(vt).permute(0, 2, 1)
         self_vec = torch.cross(a, b, dim=-1)
 
-        v_new = v + gate_v.unsqueeze(-1) * agg_v + gate_self.unsqueeze(-1) * self_vec
-        t_new = t + gate_t.unsqueeze(-1) * agg_t
+        v_new = _smooth_equivariant_bound(
+            v
+            + _smooth_scalar_bound(gate_v).unsqueeze(-1) * agg_v
+            + _smooth_scalar_bound(gate_self).unsqueeze(-1) * self_vec
+        )
+        t_new = _smooth_equivariant_bound(
+            t + _smooth_scalar_bound(gate_t).unsqueeze(-1) * agg_t
+        )
         t_norm = torch.sqrt(torch.sum(t_new * t_new, dim=-1) + 1e-12)
-        t_gate = torch.nn.functional.silu(self.t_act_s(s_new) + self.t_act_norm(t_norm))
-        t_new = t_new * t_gate.unsqueeze(-1)
+        t_gate = _smooth_scalar_bound(
+            torch.nn.functional.silu(self.t_act_s(s_new) + self.t_act_norm(t_norm))
+        )
+        t_new = _smooth_equivariant_bound(t_new * t_gate.unsqueeze(-1))
         return s_new, v_new, t_new
 
 
@@ -7856,19 +9180,33 @@ class FastEquivariantBlockO3(torch.nn.Module):
         bb_self = self.self_v_b(vt).permute(0, 2, 1)
         self_ax = torch.cross(aa_self, bb_self, dim=-1)  # (n_nodes, H, 3) axial
 
-        v_new = v + gate_v.unsqueeze(-1) * agg_v
-        a_new = a + gate_a.unsqueeze(-1) * agg_a + gate_self_a.unsqueeze(-1) * self_ax
-        t2_new = t2 + gate_t2.unsqueeze(-1) * agg_t2
-        t3_new = t3 + gate_t3.unsqueeze(-1) * agg_t3
+        v_new = _smooth_equivariant_bound(
+            v + _smooth_scalar_bound(gate_v).unsqueeze(-1) * agg_v
+        )
+        a_new = _smooth_equivariant_bound(
+            a
+            + _smooth_scalar_bound(gate_a).unsqueeze(-1) * agg_a
+            + _smooth_scalar_bound(gate_self_a).unsqueeze(-1) * self_ax
+        )
+        t2_new = _smooth_equivariant_bound(
+            t2 + _smooth_scalar_bound(gate_t2).unsqueeze(-1) * agg_t2
+        )
+        t3_new = _smooth_equivariant_bound(
+            t3 + _smooth_scalar_bound(gate_t3).unsqueeze(-1) * agg_t3
+        )
 
         t2_norm = torch.sqrt(torch.sum(t2_new * t2_new, dim=-1) + 1e-12)
-        t2_gate = torch.nn.functional.silu(self.t2_act_s(s_new) + self.t2_act_norm(t2_norm))
-        t2_new = t2_new * t2_gate.unsqueeze(-1)
+        t2_gate = _smooth_scalar_bound(
+            torch.nn.functional.silu(self.t2_act_s(s_new) + self.t2_act_norm(t2_norm))
+        )
+        t2_new = _smooth_equivariant_bound(t2_new * t2_gate.unsqueeze(-1))
 
         if self.use_l3:
             t3_norm = torch.sqrt(torch.sum(t3_new * t3_new, dim=-1) + 1e-12)
-            t3_gate = torch.nn.functional.silu(self.t3_act_s(s_new) + self.t3_act_norm(t3_norm))
-            t3_new = t3_new * t3_gate.unsqueeze(-1)
+            t3_gate = _smooth_scalar_bound(
+                torch.nn.functional.silu(self.t3_act_s(s_new) + self.t3_act_norm(t3_norm))
+            )
+            t3_new = _smooth_equivariant_bound(t3_new * t3_gate.unsqueeze(-1))
         else:
             t3_new = torch.zeros_like(t3_new)
 
@@ -8037,6 +9375,7 @@ class FastEquivariantCoreO3(torch.nn.Module):
                     self.film_layers[layer_idx](film_condition), 3, dim=-1
                 )
                 gamma_s = 0.25 * torch.tanh(gamma_s)
+                beta_s = _smooth_scalar_bound(beta_s, max_abs=5.0)
                 gamma_tensor = 0.25 * torch.tanh(gamma_tensor)
                 s = s * (1.0 + gamma_s) + beta_s
                 gate = (1.0 + gamma_tensor).unsqueeze(-1)
@@ -9317,8 +10656,12 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
             for _ in range(n_steps):
                 q_cond = torch.tanh(previous_q)
                 potential_cond = torch.tanh(domain["potential"] / 10.0)
-                spin_norm2 = torch.sum(spins * spins, dim=-1)
-                spin_pair = self._spin_condition(batch, spins)
+                spin_norm2 = _smooth_scalar_bound(
+                    torch.sum(spins * spins, dim=-1), max_abs=4.0
+                )
+                spin_pair = _smooth_scalar_bound(
+                    self._spin_condition(batch, spins), max_abs=4.0
+                )
                 batch.film_condition = torch.stack(
                     [q_cond, potential_cond, spin_norm2, spin_pair], dim=-1
                 )
@@ -9335,7 +10678,9 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
                 )
                 q_delta = torch.abs(domain["charges"] - previous_q)
                 coupling_residual = scatter_mean(q_delta, batch.batch, dim_size=n_graphs)
-                previous_q = domain["charges"]
+                # Under-relax the feedback state to prevent charge/FiLM
+                # oscillations while retaining the converged physical output.
+                previous_q = 0.5 * previous_q + 0.5 * domain["charges"]
                 if float(torch.max(coupling_residual).detach().cpu()) <= float(self.cfg.coupling_tol):
                     break
 
@@ -9911,6 +11256,13 @@ class TrainConfig:
     # Optional per-dataset subsampling before the train/val split.
     # ``1.0`` keeps all frames, ``0.2`` keeps 20 percent of each dataset.
     subset_fraction: float = 1.0
+    # Canonical HDF5 datasets keep only their split/mask index in RAM. Structures
+    # and labels are read for the current batch; legacy extXYZ remains materialized.
+    stream_hdf5: bool = True
+    # Persist exact neighbor topology on disk so streaming does not rebuild the
+    # same graph every epoch. Geometry and labels remain in canonical HDF5.
+    cache_neighbor_graphs: bool = True
+    graph_cache_dir: str = ""
     # Write per-epoch .pt checkpoints + scatter/MAE plots to ./train/.
     # Set to False during AutoSearch trials to avoid I/O overhead.
     save_epoch_artifacts: bool = True
@@ -9921,6 +11273,14 @@ class TrainConfig:
     # Zero disables early stopping.
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
+    # Recover from a rare finite-update/next-forward overflow by restoring the
+    # last fully validated epoch, clearing Adam moments, and reducing every LR.
+    # This retries the same batch; no structure or label is silently discarded.
+    nonfinite_recovery_attempts: int = 3
+    nonfinite_lr_decay: float = 0.25
+    # Auto Research fixes this target set across baseline and candidates so a
+    # zero loss weight cannot improve the score merely by hiding its own metric.
+    validation_targets: Tuple[str, ...] = ()
 
 
 # Characteristic scales make the AutoSearch score dimensionless without letting
@@ -9980,13 +11340,16 @@ def _masked_mae_statistics(
     target: torch.Tensor,
     weight: torch.Tensor,
 ) -> Tuple[float, int]:
-    absolute = torch.abs(prediction.detach() - target.detach())
     expanded = weight.detach()
-    while expanded.ndim < absolute.ndim:
+    while expanded.ndim < prediction.ndim:
         expanded = expanded.unsqueeze(-1)
-    expanded = expanded.expand_as(absolute)
-    count = int(torch.count_nonzero(expanded > 0.0).item())
-    return float(torch.sum(absolute * expanded).cpu()), count
+    expanded = expanded.expand_as(prediction)
+    active = expanded > 0.0
+    count = int(torch.count_nonzero(active).item())
+    if count == 0:
+        return 0.0, 0
+    absolute = torch.abs(prediction.detach()[active] - target.detach()[active])
+    return float(torch.sum(absolute * expanded[active]).cpu()), count
 
 
 def _batch_structure_summary(batch: Any, *, limit: int = 8) -> str:
@@ -10027,6 +11390,48 @@ def _nonfinite_gradient_parameters(
             failures.append(f"{name} ({bad_count}/{gradient.numel()} non-finite)")
             if len(failures) >= limit:
                 break
+    return failures
+
+
+def _nonfinite_model_state_names(
+    model: torch.nn.Module,
+    *,
+    limit: int = 12,
+) -> List[str]:
+    """List parameters or persistent buffers corrupted by an optimizer update."""
+    failures: List[str] = []
+    for name, value in model.state_dict().items():
+        if not torch.is_tensor(value) or not value.is_floating_point():
+            continue
+        if not bool(torch.isfinite(value.detach()).all().cpu()):
+            failures.append(str(name))
+            if len(failures) >= limit:
+                break
+    return failures
+
+
+def _nonfinite_optimizer_state_names(
+    optimizer: torch.optim.Optimizer,
+    *,
+    limit: int = 12,
+) -> List[str]:
+    """List non-finite Adam moment tensors after a nominally finite update."""
+    failures: List[str] = []
+    parameter_names = {
+        id(parameter): name
+        for group_index, group in enumerate(optimizer.param_groups)
+        for parameter_index, parameter in enumerate(group["params"])
+        for name in [f"group{group_index}.param{parameter_index}"]
+    }
+    for parameter, state in optimizer.state.items():
+        parameter_name = parameter_names.get(id(parameter), "parameter")
+        for state_name, value in state.items():
+            if not torch.is_tensor(value) or not value.is_floating_point():
+                continue
+            if not bool(torch.isfinite(value.detach()).all().cpu()):
+                failures.append(f"{parameter_name}.{state_name}")
+                if len(failures) >= limit:
+                    return failures
     return failures
 
 
@@ -10089,6 +11494,8 @@ def _additional_physics_loss(
     out: Dict[str, torch.Tensor],
     batch: Any,
     cfg: TrainConfig,
+    *,
+    metric_targets: Sequence[str] = (),
 ) -> Tuple[torch.Tensor, Dict[str, Tuple[float, int]]]:
     zero = torch.zeros((), dtype=batch.positions.dtype, device=batch.positions.device)
     total = zero
@@ -10104,8 +11511,10 @@ def _additional_physics_loss(
         ("J_effective", "J_effective", float(cfg.w_j), False),
         ("DMI_effective", "DMI_effective", float(cfg.w_dmi), False),
     ]
+    requested_metrics = {str(value) for value in metric_targets}
     for target_name, output_name, coefficient, atomwise in specs:
-        if coefficient <= 0.0:
+        collect_metric = target_name in requested_metrics
+        if coefficient <= 0.0 and not collect_metric:
             continue
         if output_name not in out:
             raise ValueError(f"Model does not provide required output {output_name!r}")
@@ -10118,10 +11527,11 @@ def _additional_physics_loss(
         )
         if float(weight.sum().detach().cpu()) <= 0.0:
             continue
-        total = total + coefficient * _weighted_mse(prediction, target, weight)
+        if coefficient > 0.0:
+            total = total + coefficient * _weighted_mse(prediction, target, weight)
         metrics[target_name] = _masked_mae_statistics(prediction, target, weight)
 
-    if float(cfg.w_di) > 0.0:
+    if float(cfg.w_di) > 0.0 or bool({"Di", "Di_effective"} & requested_metrics):
         use_effective = (
             hasattr(batch, "Di_effective_weight")
             and float(torch.as_tensor(batch.Di_effective_weight).sum().detach().cpu()) > 0.0
@@ -10136,7 +11546,8 @@ def _additional_physics_loss(
             batch, target_name, prediction, atomwise=not use_effective
         )
         if float(weight.sum().detach().cpu()) > 0.0:
-            total = total + float(cfg.w_di) * _weighted_mse(prediction, target, weight)
+            if float(cfg.w_di) > 0.0:
+                total = total + float(cfg.w_di) * _weighted_mse(prediction, target, weight)
             metrics[target_name] = _masked_mae_statistics(prediction, target, weight)
     return total, metrics
 
@@ -10160,6 +11571,88 @@ class AutoSearchConfig:
     # tunes only parameters that remain meaningful inside that fixed topology.
     lock_selected_architecture: bool = True
     search_space_overrides: Dict[str, tuple] = field(default_factory=dict)
+    # ``None`` selects the dimensions implied by ``level``. A tuple is an exact,
+    # user-editable selection and may add or remove any compatible dimension.
+    search_params: Optional[Tuple[str, ...]] = None
+
+
+_AUTOSEARCH_SAMPLERS = {
+    "uniform", "log_uniform", "zero_log_uniform", "randint", "choice", "bool"
+}
+
+
+def normalize_search_space_spec(name: str, spec: Sequence[Any]) -> tuple:
+    """Validate and canonicalize one editable Auto Research sampler."""
+    if isinstance(spec, (str, bytes)) or not isinstance(spec, Sequence) or not spec:
+        raise ValueError(f"Search space for {name!r} must be a non-empty sequence")
+    kind = str(spec[0]).strip().lower()
+    if kind not in _AUTOSEARCH_SAMPLERS:
+        raise ValueError(
+            f"Unsupported sampler {kind!r} for {name!r}; expected one of "
+            f"{sorted(_AUTOSEARCH_SAMPLERS)}"
+        )
+    if kind == "bool":
+        if len(spec) != 1:
+            raise ValueError(f"Boolean search space for {name!r} takes no domain")
+        return (kind,)
+    if kind == "choice":
+        if len(spec) != 2 or isinstance(spec[1], (str, bytes)):
+            raise ValueError(f"Choice search space for {name!r} requires a value list")
+        values = list(spec[1])
+        if not values:
+            raise ValueError(f"Choice search space for {name!r} cannot be empty")
+        if len({json.dumps(value, sort_keys=True) for value in values}) != len(values):
+            raise ValueError(f"Choice search space for {name!r} contains duplicates")
+        return (kind, values)
+    if len(spec) < 3:
+        raise ValueError(f"Sampler {kind!r} for {name!r} requires lower and upper bounds")
+    if kind == "randint":
+        lower, upper = int(spec[1]), int(spec[2])
+        if lower > upper:
+            raise ValueError(f"Integer search bounds for {name!r} must satisfy lower <= upper")
+        return (kind, lower, upper)
+    lower, upper = float(spec[1]), float(spec[2])
+    if not math.isfinite(lower) or not math.isfinite(upper) or lower >= upper:
+        raise ValueError(f"Search bounds for {name!r} must be finite with lower < upper")
+    if kind in {"log_uniform", "zero_log_uniform"} and lower <= 0.0:
+        raise ValueError(f"Log search lower bound for {name!r} must be greater than zero")
+    if kind == "zero_log_uniform":
+        probability = float(spec[3]) if len(spec) > 3 else 0.2
+        if not math.isfinite(probability) or not 0.0 < probability < 1.0:
+            raise ValueError(
+                f"Zero probability for {name!r} must be strictly between zero and one"
+            )
+        return (kind, lower, upper, probability)
+    return (kind, lower, upper)
+
+
+def search_space_spec_to_editor(spec: Sequence[Any]) -> Tuple[str, str]:
+    """Return sampler name and JSON domain for the Qt range editor."""
+    normalized = normalize_search_space_spec("parameter", spec)
+    kind = str(normalized[0])
+    if kind == "bool":
+        domain: Any = []
+    elif kind == "choice":
+        domain = list(normalized[1])
+    else:
+        domain = list(normalized[1:])
+    return kind, json.dumps(domain, ensure_ascii=True)
+
+
+def search_space_spec_from_editor(name: str, kind: str, domain_text: str) -> tuple:
+    """Parse the JSON domain entered in the Qt Auto Research editor."""
+    sampler = str(kind).strip().lower()
+    try:
+        domain = json.loads(str(domain_text).strip() or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Search domain for {name!r} must be valid JSON: {exc.msg}") from exc
+    if not isinstance(domain, list):
+        raise ValueError(f"Search domain for {name!r} must be a JSON list")
+    if sampler == "choice":
+        raw: tuple = (sampler, domain)
+    else:
+        raw = (sampler, *domain)
+    return normalize_search_space_spec(name, raw)
 
 
 def _auto_emit(pq: Callable, trial: int, n_trials: int,
@@ -10261,7 +11754,22 @@ class _BayesianCore:
         for i, name in enumerate(self._names):
             v, spec = params[name], self._space[name]
             kind = spec[0]
-            if kind == "log_uniform":
+            if kind == "zero_log_uniform":
+                lo, hi, zero_probability = spec[1], spec[2], spec[3]
+                if float(v) == 0.0:
+                    vec[i] = 0.0
+                else:
+                    v_clamped = float(np.clip(float(v), lo, hi))
+                    log_position = (
+                        (np.log(v_clamped) - np.log(lo))
+                        / (np.log(hi) - np.log(lo))
+                    )
+                    # Reserve a continuous prefix for the zero atom so the GP
+                    # can distinguish disabling a target from a small weight.
+                    vec[i] = float(zero_probability) + (
+                        1.0 - float(zero_probability)
+                    ) * log_position
+            elif kind == "log_uniform":
                 lo, hi = spec[1], spec[2]
                 v_clamped = float(np.clip(float(v), lo, hi))
                 vec[i] = (np.log(v_clamped) - np.log(lo)) / (np.log(hi) - np.log(lo))
@@ -10287,7 +11795,20 @@ class _BayesianCore:
             x    = float(np.clip(vec[i], 0.0, 1.0))
             spec = self._space[name]
             kind = spec[0]
-            if kind == "log_uniform":
+            if kind == "zero_log_uniform":
+                lo, hi, zero_probability = spec[1], spec[2], spec[3]
+                if x < float(zero_probability):
+                    params[name] = 0.0
+                else:
+                    scaled = (x - float(zero_probability)) / (
+                        1.0 - float(zero_probability)
+                    )
+                    params[name] = float(
+                        np.exp(
+                            scaled * (np.log(hi) - np.log(lo)) + np.log(lo)
+                        )
+                    )
+            elif kind == "log_uniform":
                 lo, hi = spec[1], spec[2]
                 params[name] = float(np.exp(x * (np.log(hi) - np.log(lo)) + np.log(lo)))
             elif kind == "uniform":
@@ -10361,26 +11882,29 @@ class AutoSearchEngine:
     # Search space: param_name → (sampler_type, *args)
     SEARCH_SPACE: Dict[str, tuple] = {
         # ── Level 1: loss weights ─────────────────────────────────────────────
-        "w_energy":               ("log_uniform", 0.1,   10.0),
-        "w_forces":               ("log_uniform", 1.0,   100.0),
-        "w_dipole":               ("log_uniform", 0.001, 1.0),
-        "w_polarizability":       ("log_uniform", 0.001, 1.0),
-        "w_charges":               ("log_uniform", 0.001, 10.0),
-        "w_atomic_dipoles":        ("log_uniform", 0.001, 1.0),
-        "w_atomic_polarizability": ("log_uniform", 0.001, 1.0),
-        "w_c6":                    ("log_uniform", 1e-6, 0.1),
-        "w_bec":                   ("log_uniform", 0.001, 10.0),
-        "w_magnetic_moments":      ("log_uniform", 0.001, 10.0),
-        "w_effective_field":       ("log_uniform", 0.001, 10.0),
-        "w_j":                     ("log_uniform", 0.001, 10.0),
-        "w_di":                    ("log_uniform", 0.001, 10.0),
-        "w_dmi":                   ("log_uniform", 0.001, 10.0),
+        # A real zero is a meaningful model-selection choice for every optional
+        # objective. ``zero_log_uniform`` samples it explicitly instead of using
+        # an invalid logarithmic interval with lower bound zero.
+        "w_energy":               ("zero_log_uniform", 0.1,   10.0, 0.10),
+        "w_forces":               ("zero_log_uniform", 1.0,   100.0, 0.10),
+        "w_dipole":               ("zero_log_uniform", 0.001, 1.0, 0.20),
+        "w_polarizability":       ("zero_log_uniform", 0.001, 1.0, 0.20),
+        "w_charges":               ("zero_log_uniform", 0.001, 10.0, 0.20),
+        "w_atomic_dipoles":        ("zero_log_uniform", 0.001, 1.0, 0.20),
+        "w_atomic_polarizability": ("zero_log_uniform", 0.001, 1.0, 0.20),
+        "w_c6":                    ("zero_log_uniform", 1e-6, 0.1, 0.20),
+        "w_bec":                   ("zero_log_uniform", 0.001, 10.0, 0.20),
+        "w_magnetic_moments":      ("zero_log_uniform", 0.001, 10.0, 0.20),
+        "w_effective_field":       ("zero_log_uniform", 0.001, 10.0, 0.20),
+        "w_j":                     ("zero_log_uniform", 0.001, 10.0, 0.20),
+        "w_di":                    ("zero_log_uniform", 0.001, 10.0, 0.20),
+        "w_dmi":                   ("zero_log_uniform", 0.001, 10.0, 0.20),
         # ── Level 2: training hyperparams ────────────────────────────────────
         "lr":                     ("log_uniform", 1e-4,  5e-3),
         "batch_size":             ("choice",      [2, 4, 8, 16]),
         "force_loss":             ("choice",      ["mse", "huber"]),
         "force_huber_delta":      ("log_uniform", 0.25, 2.0),
-        "r_max":                  ("choice",      [4.0, 5.0, 6.0, 7.0, 8.0]),
+        "r_max":                  ("choice",      [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
         "num_channels":           ("choice",      [32, 48, 64, 96, 128]),
         "num_interactions":       ("choice",      [1, 2, 3, 4]),
         "num_radial_basis":       ("choice",      [4, 6, 8, 12, 16]),
@@ -10414,12 +11938,12 @@ class AutoSearchEngine:
         "deq_tol":                ("log_uniform", 1e-7, 1e-4),
         "deq_alpha_max":          ("log_uniform", 10.0, 300.0),
         "d4_functional":          ("choice", ["pbe", "pbe0", "b3lyp"]),
-        "spin_cutoff":            ("choice", [4.0, 5.0, 6.0, 7.0, 8.0]),
+        "spin_cutoff":            ("choice", [3.0, 4.0, 5.0]),
         "coupling_iterations":    ("randint", 1, 4),
         "coupling_tol":           ("log_uniform", 1e-7, 1e-3),
-        "chem_aug_prob":          ("uniform", 0.0, 0.3),
-        "chem_aug_noise_std":     ("uniform", 0.0, 0.1),
-        "chem_aug_mix_max":       ("uniform", 0.0, 0.3),
+        "chem_aug_prob":          ("choice", [0.0, 0.025, 0.05, 0.10, 0.20, 0.30]),
+        "chem_aug_noise_std":     ("choice", [0.0, 0.005, 0.01, 0.025, 0.05, 0.10]),
+        "chem_aug_mix_max":       ("choice", [0.0, 0.025, 0.05, 0.10, 0.20, 0.30]),
     }
 
     # Parameters searched at each level (cumulative)
@@ -10473,31 +11997,63 @@ class AutoSearchEngine:
             "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
         )
     }
+    LOSS_PARAM_TO_TARGET: Dict[str, str] = {
+        "w_energy": "energy",
+        "w_forces": "forces",
+        "w_dipole": "dipole",
+        "w_polarizability": "polarizability",
+        "w_charges": "charges",
+        "w_atomic_dipoles": "atomic_dipoles",
+        "w_atomic_polarizability": "atomic_polarizability",
+        "w_c6": "c6",
+        "w_bec": "bec",
+        "w_magnetic_moments": "magnetic_moments",
+        "w_effective_field": "effective_field",
+        "w_j": "J_effective",
+        "w_di": "Di_effective",
+        "w_dmi": "DMI_effective",
+    }
 
     def __init__(self, base_cfg: "TrainConfig", auto_cfg: AutoSearchConfig, tmp_dir: str) -> None:
         self.base_cfg  = base_cfg
         self.auto_cfg  = auto_cfg
         self.tmp_dir   = tmp_dir
-        requested = self.LEVEL_PARAMS.get(auto_cfg.level, [])
+        requested = (
+            list(auto_cfg.search_params)
+            if auto_cfg.search_params is not None
+            else list(self.LEVEL_PARAMS.get(auto_cfg.level, []))
+        )
         excluded = set(auto_cfg.excluded_params)
         if bool(auto_cfg.lock_selected_architecture):
             excluded.update(architecture_locked_search_exclusions(base_cfg.model))
-        self.search_space = dict(self.SEARCH_SPACE)
-        self.search_space.update(dict(auto_cfg.search_space_overrides))
-        # Search only loss targets that the user activated. This prevents a
-        # missing-label task from being silently enabled by AutoSearch.
-        self._params = [
-            name for name in requested
-            if name not in excluded
-            and (
-                name not in self.LOSS_PARAM_TO_ATTR
-                or float(getattr(base_cfg, self.LOSS_PARAM_TO_ATTR[name], 0.0)) > 0.0
+        unknown = sorted(set(requested) - set(self.SEARCH_SPACE))
+        if unknown:
+            raise ValueError(f"Unknown Auto Research parameter(s): {unknown}")
+        self.search_space = {
+            name: normalize_search_space_spec(name, spec)
+            for name, spec in self.SEARCH_SPACE.items()
+        }
+        for name, spec in dict(auto_cfg.search_space_overrides).items():
+            if name not in self.SEARCH_SPACE:
+                raise ValueError(f"Unknown Auto Research override parameter: {name!r}")
+            self.search_space[name] = normalize_search_space_spec(name, spec)
+        # Dataset masks and architecture relevance determine availability. The
+        # current numeric value does not: zero must remain searchable.
+        self._params = list(dict.fromkeys(
+            name for name in requested if name not in excluded
+        ))
+        fixed_loss_params = {
+            name
+            for name in self.LOSS_PARAM_TO_TARGET
+            if float(getattr(base_cfg, name, 0.0)) > 0.0 or name in self._params
+        }
+        self.validation_targets = tuple(
+            dict.fromkeys(
+                self.LOSS_PARAM_TO_TARGET[name]
+                for name in self.LOSS_PARAM_TO_TARGET
+                if name in fixed_loss_params
             )
-            and (
-                name not in {"force_loss", "force_huber_delta"}
-                or float(base_cfg.w_forces) > 0.0
-            )
-        ]
+        )
         self._bo       = _BayesianCore(self._params, self.search_space) if self._params else None
 
     # Helper methods.
@@ -10573,7 +12129,14 @@ class AutoSearchEngine:
         for p in self._params:
             spec = self.search_space[p]
             kind = spec[0]
-            if kind == "log_uniform":
+            if kind == "zero_log_uniform":
+                lo, hi, zero_probability = spec[1], spec[2], spec[3]
+                candidate[p] = (
+                    0.0
+                    if float(rng.random()) < float(zero_probability)
+                    else float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+                )
+            elif kind == "log_uniform":
                 lo, hi = spec[1], spec[2]
                 candidate[p] = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
             elif kind == "uniform":
@@ -10590,6 +12153,18 @@ class AutoSearchEngine:
             else:
                 raise ValueError(f"Unknown sampler type: {kind}")
         return candidate
+
+    def _constrain_cutoff_pair(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the conditional spin/local cutoff constraint to a flat trial."""
+        constrained = dict(params)
+        local_cutoff = constrained.get("r_max", self.base_cfg.model.r_max)
+        magnetic_cutoff = constrained.get(
+            "spin_cutoff", self.base_cfg.model.spin_cutoff
+        )
+        constrained["spin_cutoff"] = _compatible_spin_cutoff(
+            local_cutoff, magnetic_cutoff
+        )
+        return constrained
 
     def _build_trial_cfg(self, params: Dict[str, Any], trial_idx: int) -> "TrainConfig":
         """Build a TrainConfig for a single trial from flat param dict."""
@@ -10681,6 +12256,10 @@ class AutoSearchEngine:
             export_sevennet        = False,    # Skip TorchScript export during search trials.
             save_epoch_artifacts   = False,    # Skip per-epoch checkpoints and plots during search.
             subset_fraction        = float(self.auto_cfg.subset_fraction),
+            stream_hdf5            = bool(self.base_cfg.stream_hdf5),
+            cache_neighbor_graphs  = bool(self.base_cfg.cache_neighbor_graphs),
+            graph_cache_dir        = str(self.base_cfg.graph_cache_dir),
+            validation_targets     = self.validation_targets,
         )
 
     # Main search loop.
@@ -10708,7 +12287,7 @@ class AutoSearchEngine:
     ) -> "Tuple[Dict[str, Any], float]":
         """Run the search and return ``(best_params, best_validation_score)``."""
         rng = np.random.default_rng(self.auto_cfg.seed)
-        current = self._extract_current(self.base_cfg)
+        current = self._constrain_cutoff_pair(self._extract_current(self.base_cfg))
         best_params = dict(current)
 
         if str(self.base_cfg.device).lower() in ("auto", "mps") and _mps_is_available():
@@ -10801,7 +12380,7 @@ class AutoSearchEngine:
                     candidate = self._sample_candidate(rng)
                     _src = "random"
 
-            merged    = {**best_params, **candidate}
+            merged = self._constrain_cutoff_pair({**best_params, **candidate})
             trial_cfg = self._build_trial_cfg(merged, trial_idx=i + 1)
 
             log(f"[{_now()}] AutoSearch trial {i+1}/{_n} [phase {'1-explore' if i<_p1 else '2-balance' if i<_p2 else '3-exploit'}/{_src}]: "
@@ -10879,6 +12458,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         raise ValueError(f"epochs must be at least 1, got {cfg.epochs}")
     if int(cfg.batch_size) < 1:
         raise ValueError(f"batch_size must be at least 1, got {cfg.batch_size}")
+    if int(getattr(cfg, "nonfinite_recovery_attempts", 3)) < 0:
+        raise ValueError("nonfinite_recovery_attempts cannot be negative")
+    _nonfinite_lr_decay = float(getattr(cfg, "nonfinite_lr_decay", 0.25))
+    if not math.isfinite(_nonfinite_lr_decay) or not 0.0 < _nonfinite_lr_decay < 1.0:
+        raise ValueError("nonfinite_lr_decay must be finite and strictly between 0 and 1")
 
     device, runtime_dtype = resolve_device(getattr(cfg, "device", "auto"), dtype=cfg.model.dtype)
     cfg.model.dtype = runtime_dtype
@@ -10927,6 +12511,9 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         )
         + f"; loss_weights={json.dumps(active_losses, sort_keys=True)}"
     )
+    _validation_targets = {
+        str(value) for value in getattr(cfg, "validation_targets", ())
+    }
 
     # Reuse parsed datasets when ``_cache`` is available so repeated search
     # trials do not spend most of their time on disk I/O.
@@ -10981,7 +12568,44 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     # real run without inheriting their reclaimable MPS allocator blocks.
     _release_mps_cache()
 
-    if cfg.dataset:
+    stream_plan: Optional[HDF5StreamPlan] = None
+    use_hdf5_stream = bool(
+        cfg.dataset
+        and _is_hdf5_path(cfg.dataset)
+        and getattr(cfg, "stream_hdf5", True)
+    )
+    if use_hdf5_stream:
+        plan_key = (
+            "hdf5_stream_plan",
+            str(Path(cfg.dataset).expanduser().resolve()),
+            int(Path(cfg.dataset).expanduser().stat().st_size),
+            int(Path(cfg.dataset).expanduser().stat().st_mtime_ns),
+            float(cfg.val_fraction),
+            int(cfg.seed),
+            float(cfg.subset_fraction),
+        )
+        stream_plan = _cache.get(plan_key) if _cache is not None else None
+        if stream_plan is None:
+            stream_plan = prepare_hdf5_stream_plan(
+                cfg.dataset,
+                val_fraction=float(cfg.val_fraction),
+                seed=int(cfg.seed),
+                sample_fraction=float(cfg.subset_fraction),
+                sample_seed=int(cfg.seed),
+            )
+            if _cache is not None:
+                _cache[plan_key] = stream_plan
+        split_info = dict(stream_plan.split_info)
+        zs = list(stream_plan.elements)
+        log(
+            f"[{_now()}] Canonical HDF5 streaming index: "
+            f"train={len(stream_plan.train_indices)} "
+            f"val={len(stream_plan.val_indices)}; structures and labels remain on disk."
+        )
+        log(f"[{_now()}] Grouped split: {json.dumps(split_info, sort_keys=True)}")
+        static_cfgs = static_fields = resp_cfgs = resp_fields = []
+        all_cfgs = all_fields = train_cfgs = train_fields = val_cfgs = val_fields = []
+    elif cfg.dataset:
         unified_cfgs, unified_fields = _load_cached(cfg.dataset, "unified")
         static_cfgs, static_fields = unified_cfgs, unified_fields
         resp_cfgs, resp_fields = [], []
@@ -11019,26 +12643,25 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     "response targets remain active."
                 )
 
-    if cfg.mode == "base" or cfg.dataset:
-        all_cfgs, all_fields = static_cfgs, static_fields
-    elif cfg.mode == "response":
-        all_cfgs, all_fields = resp_cfgs, resp_fields
-    else:
-        all_cfgs, all_fields = static_cfgs + resp_cfgs, static_fields + resp_fields
+    if not use_hdf5_stream:
+        if cfg.mode == "base" or cfg.dataset:
+            all_cfgs, all_fields = static_cfgs, static_fields
+        elif cfg.mode == "response":
+            all_cfgs, all_fields = resp_cfgs, resp_fields
+        else:
+            all_cfgs, all_fields = static_cfgs + resp_cfgs, static_fields + resp_fields
+        if not all_cfgs:
+            raise ValueError("No data provided.")
+        train_cfgs, train_fields, val_cfgs, val_fields, split_info = split_configurations_grouped(
+            all_cfgs,
+            all_fields,
+            val_fraction=cfg.val_fraction,
+            seed=cfg.seed,
+        )
+        log(f"[{_now()}] Grouped split: {json.dumps(split_info, sort_keys=True)}")
+        zs = sorted({int(z) for c in all_cfgs for z in c.atomic_numbers})
     if stop_flag is not None and stop_flag():
-        return _cancelled_result("dataset loading")
-    if not all_cfgs:
-        raise ValueError("No data provided.")
-
-    train_cfgs, train_fields, val_cfgs, val_fields, split_info = split_configurations_grouped(
-        all_cfgs,
-        all_fields,
-        val_fraction=cfg.val_fraction,
-        seed=cfg.seed,
-    )
-    log(f"[{_now()}] Grouped split: {json.dumps(split_info, sort_keys=True)}")
-
-    zs = sorted({int(z) for c in all_cfgs for z in c.atomic_numbers})
+        return _cancelled_result("dataset indexing")
     z_table = AtomicNumberTable(zs)
     log(f"[{_now()}] Elements: {zs}")
     use_mixed_model = any(
@@ -11105,15 +12728,19 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         if progress is not None:
             progress({"type": "prep", "task": "Fit atomic energies", "overall_frac": 0.01, "current": 0, "total": 1, "stage": "start"})
         log(f"[{_now()}] Fitting atomic energies ...")
-        energy_fit_cfgs = [
-            item for item in train_cfgs
-            if "energy" in item.properties and float(item.property_weights.get("energy", 1.0)) > 0.0
-        ]
-        if energy_fit_cfgs:
-            atomic_energies = fit_atomic_energies_from_configs(energy_fit_cfgs, zs)
+        if stream_plan is not None and "energy" in stream_plan.label_masks:
+            atomic_energies = fit_atomic_energies_from_hdf5_plan(stream_plan, zs)
         else:
-            atomic_energies = np.zeros((len(zs),), dtype=float)
-            log(f"[{_now()}] No training energy labels; atomic reference energies initialized to zero.")
+            energy_fit_cfgs = [
+                item for item in train_cfgs
+                if "energy" in item.properties
+                and float(item.property_weights.get("energy", 1.0)) > 0.0
+            ]
+            if energy_fit_cfgs:
+                atomic_energies = fit_atomic_energies_from_configs(energy_fit_cfgs, zs)
+            else:
+                atomic_energies = np.zeros((len(zs),), dtype=float)
+                log(f"[{_now()}] No training energy labels; atomic reference energies initialized to zero.")
         if progress is not None:
             progress({"type": "prep", "task": "Fit atomic energies", "overall_frac": 0.03, "current": 1, "total": 1, "stage": "done"})
         model_cls = MixedGranularityE3GNN if use_mixed_model else DualLayerFieldModel
@@ -11135,99 +12762,158 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
     model.to(device=device, dtype=torch.get_default_dtype())
     
-    # Convert configurations into graph objects after the group-safe split.
+    # Stream canonical HDF5 or materialize legacy inputs after the group-safe split.
     stopped = False
-    selected_cfgs = train_cfgs + val_cfgs
-    selected_fields = train_fields + val_fields
-    total_all = int(len(selected_cfgs))
-    n_train_graphs = len(train_cfgs)
-    if total_all <= 0:
-        raise ValueError("No frames to train on after mode selection.")
-    graph_cache_key = (
-        "graphs",
-        float(model.cfg.r_max),
-        tuple(int(z) for z in zs),
-        tuple(
-            str(c.properties.get("group_id", index))
-            for index, c in enumerate(selected_cfgs)
-        ),
-    )
-    cached_graphs = _cache.get(graph_cache_key) if _cache is not None else None
-    graph_start = time.perf_counter()
-    if cached_graphs is not None:
-        data_all = list(cached_graphs)
+    if stream_plan is not None:
+        topology_cache: Optional[str] = None
+        if bool(getattr(cfg, "cache_neighbor_graphs", True)):
+            topology_cache = build_hdf5_topology_cache(
+                stream_plan,
+                cutoff=float(model.cfg.r_max),
+                cache_directory=str(getattr(cfg, "graph_cache_dir", "")),
+                log=log,
+                progress=progress,
+                stop_flag=stop_flag,
+            )
+            if topology_cache is None:
+                del model
+                return _cancelled_result("disk topology-cache construction")
+        else:
+            log(
+                f"[{_now()}] HDF5 streaming uses on-demand neighbor construction; "
+                "enable cache_neighbor_graphs to reuse exact topology across epochs."
+            )
+        train_data = HDF5AtomicDataDataset(
+            stream_plan,
+            stream_plan.train_indices,
+            z_table=z_table,
+            cutoff=float(model.cfg.r_max),
+            topology_cache=topology_cache,
+        )
+        val_data = HDF5AtomicDataDataset(
+            stream_plan,
+            stream_plan.val_indices,
+            z_table=z_table,
+            cutoff=float(model.cfg.r_max),
+            topology_cache=topology_cache,
+        )
+        train_atoms = int(np.sum(train_data.atom_counts, dtype=np.int64))
+        if train_data.edge_counts is not None:
+            train_edges = int(np.sum(train_data.edge_counts, dtype=np.int64))
+            avg_n = float(train_edges) / float(max(1, train_atoms))
+        else:
+            avg_n = float("nan")
         log(
-            f"[{_now()}] Reused {len(data_all)} cached graphs "
-            f"for cutoff={float(model.cfg.r_max):g}."
+            f"[{_now()}] Dataset streaming: train={len(train_data)} "
+            f"val={len(val_data)} strategy={split_info['strategy']} "
+            + (
+                f"avg_neighbors/atom={avg_n:.2f}; "
+                if math.isfinite(avg_n) else ""
+            )
+            + "RAM retains only indices/masks; HDF5 graphs load per batch."
         )
     else:
-        data_all = []
-        emit_every = max(1, min(25, total_all // 10 or 1))
-        if progress is not None:
-            progress(
-                {
-                    "type": "prep",
-                    "task": "Build neighbor graphs",
-                    "overall_frac": 0.05,
-                    "current": 0,
-                    "total": int(total_all),
-                    "stage": "neighbor_list",
-                }
+        selected_cfgs = train_cfgs + val_cfgs
+        selected_fields = train_fields + val_fields
+        total_all = int(len(selected_cfgs))
+        n_train_graphs = len(train_cfgs)
+        if total_all <= 0:
+            raise ValueError("No frames to train on after mode selection.")
+        graph_cache_key = (
+            "graphs",
+            float(model.cfg.r_max),
+            tuple(int(z) for z in zs),
+            tuple(
+                str(c.properties.get("group_id", index))
+                for index, c in enumerate(selected_cfgs)
+            ),
+        )
+        cached_graphs = _cache.get(graph_cache_key) if _cache is not None else None
+        graph_start = time.perf_counter()
+        if cached_graphs is not None:
+            data_all = list(cached_graphs)
+            log(
+                f"[{_now()}] Reused {len(data_all)} cached graphs "
+                f"for cutoff={float(model.cfg.r_max):g}."
             )
-        log(f"[{_now()}] Building {total_all} neighbor graphs ...")
-        for i, (c, f) in enumerate(zip(selected_cfgs, selected_fields), start=1):
-            if stop_flag is not None and stop_flag():
-                stopped = True
-                break
-            c2 = Configuration(
-                atomic_numbers=c.atomic_numbers,
-                positions=c.positions,
-                properties=dict(c.properties),
-                property_weights=dict(c.property_weights),
-                cell=c.cell,
-                pbc=c.pbc,
-                weight=c.weight,
-                config_type=c.config_type,
-                head=c.head,
-            )
-            c2.properties["field"] = np.asarray(f, dtype=float).reshape(3)
-            data_all.append(
-                AtomicData.from_config(
-                    c2, z_table=z_table, cutoff=float(model.cfg.r_max)
-                )
-            )
-            if progress is not None and (
-                i == total_all or (i % emit_every == 0)
-            ):
-                frac = 0.05 + 0.15 * (float(i) / float(max(1, total_all)))
+        else:
+            data_all = []
+            emit_every = max(1, min(25, total_all // 10 or 1))
+            if progress is not None:
                 progress(
                     {
                         "type": "prep",
                         "task": "Build neighbor graphs",
-                        "overall_frac": float(max(0.0, min(1.0, frac))),
-                        "current": int(i),
+                        "overall_frac": 0.05,
+                        "current": 0,
                         "total": int(total_all),
                         "stage": "neighbor_list",
                     }
                 )
-        if not stopped and _cache is not None:
-            # A search over cutoffs otherwise retains one complete graph corpus
-            # per r_max. Keep only the most recently used geometry cache while
-            # preserving the much smaller parsed-configuration cache.
-            for key in [value for value in _cache if isinstance(value, tuple) and value and value[0] == "graphs"]:
-                if key != graph_cache_key:
-                    del _cache[key]
-            _cache[graph_cache_key] = tuple(data_all)
-        log(
-            f"[{_now()}] Built {len(data_all)} neighbor graphs in "
-            f"{time.perf_counter() - graph_start:.2f} s."
-        )
-
-    if stopped:
+            log(f"[{_now()}] Building {total_all} neighbor graphs ...")
+            for i, (c, f) in enumerate(zip(selected_cfgs, selected_fields), start=1):
+                if stop_flag is not None and stop_flag():
+                    stopped = True
+                    break
+                c2 = Configuration(
+                    atomic_numbers=c.atomic_numbers,
+                    positions=c.positions,
+                    properties=dict(c.properties),
+                    property_weights=dict(c.property_weights),
+                    cell=c.cell,
+                    pbc=c.pbc,
+                    weight=c.weight,
+                    config_type=c.config_type,
+                    head=c.head,
+                )
+                c2.properties["field"] = np.asarray(f, dtype=float).reshape(3)
+                data_all.append(
+                    AtomicData.from_config(
+                        c2, z_table=z_table, cutoff=float(model.cfg.r_max)
+                    )
+                )
+                if progress is not None and (
+                    i == total_all or (i % emit_every == 0)
+                ):
+                    frac = 0.05 + 0.15 * (float(i) / float(max(1, total_all)))
+                    progress(
+                        {
+                            "type": "prep",
+                            "task": "Build neighbor graphs",
+                            "overall_frac": float(max(0.0, min(1.0, frac))),
+                            "current": int(i),
+                            "total": int(total_all),
+                            "stage": "neighbor_list",
+                        }
+                    )
+            if not stopped and _cache is not None:
+                for key in [
+                    value
+                    for value in _cache
+                    if isinstance(value, tuple) and value and value[0] == "graphs"
+                ]:
+                    if key != graph_cache_key:
+                        del _cache[key]
+                _cache[graph_cache_key] = tuple(data_all)
+            log(
+                f"[{_now()}] Built {len(data_all)} neighbor graphs in "
+                f"{time.perf_counter() - graph_start:.2f} s."
+            )
+        if stopped:
+            del data_all, selected_cfgs, selected_fields, model
+            return _cancelled_result("neighbor-graph construction")
+        train_data = data_all[:n_train_graphs]
+        val_data = data_all[n_train_graphs:]
+        train_atoms = sum(int(graph.num_nodes) for graph in train_data)
+        train_edges = sum(int(graph.edge_index.shape[1]) for graph in train_data)
+        avg_n = float(train_edges) / float(max(1, train_atoms))
         del data_all, selected_cfgs, selected_fields
-        del all_cfgs, all_fields, train_cfgs, train_fields, val_cfgs, val_fields
-        del static_cfgs, static_fields, resp_cfgs, resp_fields, model
-        return _cancelled_result("neighbor-graph construction")
+        gc.collect()
+        log(
+            f"[{_now()}] Dataset graphs: train={len(train_data)} "
+            f"val={len(val_data)} strategy={split_info['strategy']} "
+            f"avg_neighbors/atom={avg_n:.2f}"
+        )
 
     # DataLoader policy tuned for CPU-heavy atomistic workloads.
     def _effective_num_workers() -> int:
@@ -11240,25 +12926,17 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     _dl_pin_memory = False
     _dl_persistent = bool(_dl_num_workers > 0)
     _dl_prefetch = 2
+    _dl_thread_prefetch = 2 if stream_plan is not None else 0
     log(
         f"[{_now()}] DataLoader: num_workers={_dl_num_workers} pin_memory={_dl_pin_memory} "
-        f"persistent_workers={_dl_persistent} prefetch_factor={_dl_prefetch}"
+        f"persistent_workers={_dl_persistent} prefetch_factor={_dl_prefetch} "
+        f"stream_thread_prefetch={_dl_thread_prefetch}"
     )
-    train_data = data_all[:n_train_graphs]
-    val_data = data_all[n_train_graphs:]
-    train_atoms = sum(int(graph.num_nodes) for graph in train_data)
-    train_edges = sum(int(graph.edge_index.shape[1]) for graph in train_data)
-    avg_n = float(train_edges) / float(max(1, train_atoms))
-    # Graph tensors now own all information required by training. Releasing the
-    # parsed NumPy/Python representation matters for full datasets and searches.
-    del data_all, selected_cfgs, selected_fields
+    # Release every materialized representation before optimization. Streamed
+    # datasets retain only their compact plan plus disk-backed dataset objects.
     del all_cfgs, all_fields, train_cfgs, train_fields, val_cfgs, val_fields
     del static_cfgs, static_fields, resp_cfgs, resp_fields
     gc.collect()
-    log(
-        f"[{_now()}] Dataset graphs: train={len(train_data)} val={len(val_data)} "
-        f"strategy={split_info['strategy']} avg_neighbors/atom={avg_n:.2f}"
-    )
 
     def _collate(lst: List[AtomicData]) -> _TGBatch:
         return _TGBatch.from_data_list(lst)
@@ -11273,15 +12951,24 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             seed: int,
             max_edges: Optional[int] = None,
         ) -> None:
+            edge_counts = getattr(ds, "edge_counts", None)
             ranked = sorted(
                 range(len(ds)),
-                key=lambda index: int(ds[index].edge_index.shape[1]),
+                key=(
+                    (lambda index: int(edge_counts[index]))
+                    if edge_counts is not None
+                    else (lambda index: int(ds[index].edge_index.shape[1]))
+                ),
                 reverse=True,
             )
             batches: List[List[int]] = []
             edge_loads: List[int] = []
             for index in ranked:
-                edges = int(ds[index].edge_index.shape[1])
+                edges = (
+                    int(edge_counts[index])
+                    if edge_counts is not None
+                    else int(ds[index].edge_index.shape[1])
+                )
                 candidates = [
                     bin_index
                     for bin_index, batch_indices in enumerate(batches)
@@ -11311,7 +12998,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         def __len__(self) -> int:
             return len(self.batches)
 
-    def _make_loader(ds: Sequence[AtomicData], *, shuffle: bool) -> DataLoader:
+    def _make_loader(ds: Sequence[AtomicData], *, shuffle: bool) -> Any:
         # Clamp the batch size so tiny validation sets still produce a batch.
         _eff_bs = max(1, min(int(cfg.batch_size), len(ds) if ds else 1))
         kwargs: Dict[str, Any] = dict(
@@ -11333,11 +13020,14 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             kwargs["persistent_workers"] = bool(_dl_persistent)
             kwargs["prefetch_factor"] = int(_dl_prefetch)
         try:
-            return DataLoader(ds, **kwargs)
+            created: Any = DataLoader(ds, **kwargs)
         except TypeError:
             kwargs.pop("persistent_workers", None)
             kwargs.pop("prefetch_factor", None)
-            return DataLoader(ds, **kwargs)
+            created = DataLoader(ds, **kwargs)
+        if isinstance(ds, HDF5AtomicDataDataset) and _dl_thread_prefetch > 0:
+            return _ThreadPrefetchLoader(created, depth=_dl_thread_prefetch)
+        return created
 
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=float(cfg.lr))
 
@@ -11372,6 +13062,32 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     if getattr(cfg, "lr_scheduler", "flat") == "cosine":
         from torch.optim.lr_scheduler import CosineAnnealingLR as _CosLR
         _sched = _CosLR(opt, T_max=max(1, int(cfg.epochs)), eta_min=1e-7)
+
+    def _reduce_optimizer_learning_rates() -> List[float]:
+        updated: List[float] = []
+        for group in opt.param_groups:
+            group["lr"] = max(1e-8, float(group["lr"]) * _nonfinite_lr_decay)
+            updated.append(float(group["lr"]))
+        if _sched is not None:
+            _sched.base_lrs = [
+                max(1e-8, float(value) * _nonfinite_lr_decay)
+                for value in _sched.base_lrs
+            ]
+            if hasattr(_sched, "_last_lr"):
+                _sched._last_lr = list(updated)
+        return updated
+
+    def _prepare_retry_batch(batch: Any) -> None:
+        batch.positions = batch.positions.detach()
+        if hasattr(batch, "film_condition"):
+            batch.film_condition = None
+
+    _max_nonfinite_recoveries = int(getattr(cfg, "nonfinite_recovery_attempts", 3))
+    _last_validated_state: Dict[str, torch.Tensor] = {
+        name: value.detach().cpu().clone() for name, value in model.state_dict().items()
+    }
+    _last_validated_epoch = 0
+    _numerical_recoveries: List[Dict[str, Any]] = []
     
     # Main training loop for the multi-objective loss:
     #   L_total = L_E + L_F + L_mu + L_alpha
@@ -11586,7 +13302,47 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             }
             if isinstance(model, MixedGranularityE3GNN):
                 forward_options["use_spin_terms"] = batch_use_spin
-            out = model(batch, **forward_options)
+            _forward_attempt = 0
+            while True:
+                _prepare_retry_batch(batch)
+                out = model(batch, **forward_options)
+                _bad_forward_outputs = _nonfinite_output_names(out)
+                if not _bad_forward_outputs:
+                    break
+                _failure_summary = _batch_structure_summary(batch)
+                if _forward_attempt >= _max_nonfinite_recoveries:
+                    raise FloatingPointError(
+                        f"Non-finite training forward at epoch={epoch}, step={step}. "
+                        f"{_failure_summary}; non-finite outputs={_bad_forward_outputs}. "
+                        f"Recovery exhausted after {_forward_attempt} attempt(s)."
+                    )
+                del out
+                _restore_source = ""
+                model.load_state_dict(_last_validated_state, strict=True)
+                _restore_source = (
+                    f"validated epoch {_last_validated_epoch}"
+                    if _last_validated_epoch > 0
+                    else "initial finite model"
+                )
+                opt.state.clear()
+                _new_lrs = _reduce_optimizer_learning_rates()
+                _forward_attempt += 1
+                _recovery = {
+                    "epoch": int(epoch),
+                    "step": int(step),
+                    "attempt": int(_forward_attempt),
+                    "source": _restore_source,
+                    "outputs": list(_bad_forward_outputs),
+                    "learning_rates": list(_new_lrs),
+                }
+                _numerical_recoveries.append(_recovery)
+                log(
+                    f"[{_now()}] Numerical recovery {len(_numerical_recoveries)}: "
+                    f"epoch={epoch} step={step}, restored {_restore_source}, "
+                    f"cleared Adam state, lr={_new_lrs}; retrying the same batch."
+                )
+                opt.zero_grad(set_to_none=True)
+                _release_mps_cache()
 
             l = torch.zeros((), dtype=batch.positions.dtype, device=batch.positions.device)
             if need_energy:
@@ -11749,13 +13505,26 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 })
             batch = batch.to(device)
             use_response_terms = (cfg.mode != "base")
-            need_energy = bool(cfg.w_energy > 0.0 and _batch_has_label(batch, "energy"))
-            need_forces = bool(cfg.w_forces > 0.0 and _batch_has_label(batch, "forces"))
-            need_mu = bool(cfg.w_dipole > 0.0 and _batch_has_label(batch, "dipole"))
-            need_alpha = bool(
-                cfg.w_polarizability > 0.0 and _batch_has_label(batch, "polarizability")
+            need_energy = bool(
+                (cfg.w_energy > 0.0 or "energy" in _validation_targets)
+                and _batch_has_label(batch, "energy")
             )
-            need_bec = bool(cfg.w_bec > 0.0 and _batch_has_label(batch, "bec"))
+            need_forces = bool(
+                (cfg.w_forces > 0.0 or "forces" in _validation_targets)
+                and _batch_has_label(batch, "forces")
+            )
+            need_mu = bool(
+                (cfg.w_dipole > 0.0 or "dipole" in _validation_targets)
+                and _batch_has_label(batch, "dipole")
+            )
+            need_alpha = bool(
+                (cfg.w_polarizability > 0.0 or "polarizability" in _validation_targets)
+                and _batch_has_label(batch, "polarizability")
+            )
+            need_bec = bool(
+                (cfg.w_bec > 0.0 or "bec" in _validation_targets)
+                and _batch_has_label(batch, "bec")
+            )
             compute_forces = bool(need_forces)
             batch_use_spin = bool(
                 isinstance(model, MixedGranularityE3GNN)
@@ -11789,9 +13558,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     else:
                         _npa_val = torch.ones(y_e.numel(), dtype=y_e.dtype, device=y_e.device)
                     w_e = _expanded_property_weight(batch, "energy", out["energy"], atomwise=False)
-                    l = l + float(cfg.w_energy) * _weighted_mse(
-                        out["energy"] / _npa_val, y_e / _npa_val, w_e
-                    )
+                    if float(cfg.w_energy) > 0.0:
+                        l = l + float(cfg.w_energy) * _weighted_mse(
+                            out["energy"] / _npa_val, y_e / _npa_val, w_e
+                        )
                     _sum, _count = _masked_mae_statistics(
                         out["energy"] / _npa_val, y_e / _npa_val, w_e
                     )
@@ -11806,9 +13576,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 if need_forces:
                     y_f = batch.forces.to(out["forces"].dtype)
                     w_f = _expanded_property_weight(batch, "forces", out["forces"], atomwise=True)
-                    l = l + float(cfg.w_forces) * _configured_force_loss(
-                        out["forces"], y_f, w_f, cfg
-                    )
+                    if float(cfg.w_forces) > 0.0:
+                        l = l + float(cfg.w_forces) * _configured_force_loss(
+                            out["forces"], y_f, w_f, cfg
+                        )
                     _f_pred = out["forces"].detach()
                     _f_true = y_f.detach()
                     _sum, _count = _masked_mae_statistics(_f_pred, _f_true, w_f)
@@ -11851,9 +13622,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 if need_mu:
                     y_mu = batch.dipole.squeeze(1) if batch.dipole.ndim == 3 else batch.dipole
                     w_mu = _expanded_property_weight(batch, "dipole", out["dipole"], atomwise=False)
-                    l = l + _w_mu * _weighted_mse(
-                        out["dipole"], y_mu.to(out["dipole"].dtype), w_mu
-                    )
+                    if _w_mu > 0.0:
+                        l = l + _w_mu * _weighted_mse(
+                            out["dipole"], y_mu.to(out["dipole"].dtype), w_mu
+                        )
                     _sum, _count = _masked_mae_statistics(
                         out["dipole"], y_mu.to(out["dipole"].dtype), w_mu
                     )
@@ -11865,16 +13637,19 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     w_a = _expanded_property_weight(
                         batch, "polarizability", out["polarizability"], atomwise=False
                     )
-                    l = l + _w_alpha * _weighted_mse(
-                        out["polarizability"], y_a.to(out["polarizability"].dtype), w_a
-                    )
+                    if _w_alpha > 0.0:
+                        l = l + _w_alpha * _weighted_mse(
+                            out["polarizability"], y_a.to(out["polarizability"].dtype), w_a
+                        )
                     _sum, _count = _masked_mae_statistics(
                         out["polarizability"], y_a.to(out["polarizability"].dtype), w_a
                     )
                     _acc = val_extra_metrics.setdefault("polarizability", [0.0, 0.0])
                     _acc[0] += _sum
                     _acc[1] += _count
-                additional_loss, additional_metrics = _additional_physics_loss(out, batch, cfg)
+                additional_loss, additional_metrics = _additional_physics_loss(
+                    out, batch, cfg, metric_targets=_validation_targets
+                )
                 l = l + additional_loss
                 for name, (value_sum, value_count) in additional_metrics.items():
                     accumulator = val_extra_metrics.setdefault(name, [0.0, 0.0])
@@ -11936,6 +13711,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             _best_state = {
                 name: value.detach().cpu().clone() for name, value in model.state_dict().items()
             }
+        _last_validated_state = {
+            name: value.detach().cpu().clone() for name, value in model.state_dict().items()
+        }
+        _last_validated_epoch = int(epoch)
         if (
             _epoch_validation_score
             < _previous_best_validation_score - _early_stopping_delta
@@ -12304,6 +14083,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 "physics_residual_max": dict(val_residual_max),
                 "memory": dict(memory),
                 "memory_leak_warning": leak_warning,
+                "numerical_recoveries": int(len(_numerical_recoveries)),
                 "artifact_dir": str(_train_dir),
                 "plots_dir": str(_plots_dir),
             })
@@ -12332,6 +14112,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
     if stopped and _best_state is None:
         opt.zero_grad(set_to_none=True)
+        for dataset_object in (train_data, val_data):
+            close = getattr(dataset_object, "close", None)
+            if callable(close):
+                close()
         del opt, model, loader, v_loader, train_data, val_data, _best_state
         if _sched is not None:
             del _sched
@@ -12376,6 +14160,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 )
                 and _epoch_memory_hist[-1]["rss_growth_mib"] > 256.0
             ),
+            "numerical_recoveries": _checkpoint_safe(_numerical_recoveries),
             "loss_weights": {
                 name: float(getattr(cfg, name))
                 for name in (
@@ -12399,6 +14184,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             log(f"[{_now()}] WARN: SevenNet TS export failed: {e}")
     # Adam state remains on the accelerator even after model.cpu(). Drop every
     # owner before the next AutoSearch trial, then return allocator pages.
+    for dataset_object in (train_data, val_data):
+        close = getattr(dataset_object, "close", None)
+        if callable(close):
+            close()
     del opt, model, loader, v_loader, train_data, val_data, _best_state
     if _sched is not None:
         del _sched
@@ -12436,10 +14225,49 @@ def evaluate_checkpoint(
     set_default_dtype(runtime_dtype)
     model = DualLayerFieldModel.load(checkpoint_path, map_location="cpu", allow_unsafe_legacy=False)
     model.to(device=device, dtype=torch.get_default_dtype()).eval()
+    streamed_dataset: Optional[HDF5AtomicDataDataset] = None
     if _is_hdf5_path(dataset_path):
-        configurations = load_hdf5_configurations(
-            dataset_path, split=None if split in (None, "all") else str(split)
+        plan = prepare_hdf5_stream_plan(
+            dataset_path,
+            val_fraction=0.1,
+            seed=0,
+            require_train_val=False,
         )
+        if split in (None, "all"):
+            evaluation_indices = np.arange(len(plan.group_ids), dtype=np.int64)
+        else:
+            requested_split = str(split).strip().lower()
+            evaluation_indices = np.asarray(
+                [
+                    index
+                    for index, split_name in enumerate(plan.split_values)
+                    if split_name == requested_split
+                ],
+                dtype=np.int64,
+            )
+        if evaluation_indices.size == 0:
+            raise ValueError(f"No structures found for split={split!r}")
+        selected_elements = set(_hdf5_elements_for_indices(plan, evaluation_indices))
+        structure_count = int(evaluation_indices.size)
+        atom_count = int(
+            np.sum(
+                plan.atom_ptr[evaluation_indices + 1]
+                - plan.atom_ptr[evaluation_indices],
+                dtype=np.int64,
+            )
+        )
+        z_table = AtomicNumberTable(model.z_table_zs)
+        missing_elements = sorted(selected_elements - set(model.z_table_zs))
+        if missing_elements:
+            raise ValueError(f"Checkpoint does not contain element types: {missing_elements}")
+        streamed_dataset = HDF5AtomicDataDataset(
+            plan,
+            evaluation_indices,
+            z_table=z_table,
+            cutoff=float(model.cfg.r_max),
+            topology_cache=None,
+        )
+        graph_data: Sequence[AtomicData] = streamed_dataset
     else:
         configurations, _ = load_configurations_auto(dataset_path, DatasetKeys())
         if split not in (None, "all"):
@@ -12449,18 +14277,21 @@ def evaluate_checkpoint(
             ]
             if selected:
                 configurations = selected
-    if not configurations:
-        raise ValueError(f"No structures found for split={split!r}")
-    z_table = AtomicNumberTable(model.z_table_zs)
-    missing_elements = sorted(
-        {int(z) for cfg in configurations for z in cfg.atomic_numbers} - set(model.z_table_zs)
-    )
-    if missing_elements:
-        raise ValueError(f"Checkpoint does not contain element types: {missing_elements}")
-    graph_data = [
-        AtomicData.from_config(cfg, z_table=z_table, cutoff=float(model.cfg.r_max))
-        for cfg in configurations
-    ]
+        if not configurations:
+            raise ValueError(f"No structures found for split={split!r}")
+        z_table = AtomicNumberTable(model.z_table_zs)
+        missing_elements = sorted(
+            {int(z) for cfg in configurations for z in cfg.atomic_numbers}
+            - set(model.z_table_zs)
+        )
+        if missing_elements:
+            raise ValueError(f"Checkpoint does not contain element types: {missing_elements}")
+        graph_data = [
+            AtomicData.from_config(cfg, z_table=z_table, cutoff=float(model.cfg.r_max))
+            for cfg in configurations
+        ]
+        structure_count = len(configurations)
+        atom_count = int(sum(len(cfg.atomic_numbers) for cfg in configurations))
     loader = DataLoader(
         graph_data,
         batch_size=max(1, min(int(batch_size), len(graph_data))),
@@ -12566,6 +14397,8 @@ def evaluate_checkpoint(
         }
         for name, values in residual_values.items()
     }
+    if streamed_dataset is not None:
+        streamed_dataset.close()
     report = {
         "schema": "e3mu-evaluation-v1",
         "created_at": _now(),
@@ -12573,8 +14406,9 @@ def evaluate_checkpoint(
         "dataset": str(Path(dataset_path).expanduser().resolve()),
         "dataset_sha256": sha256_file(dataset_path),
         "split": split or "all",
-        "structures": len(configurations),
-        "atoms": int(sum(len(cfg.atomic_numbers) for cfg in configurations)),
+        "structures": structure_count,
+        "atoms": atom_count,
+        "streaming": bool(streamed_dataset is not None),
         "metrics": metrics,
         "residuals": residuals,
     }
@@ -12994,6 +14828,8 @@ class App(tk.Tk):
         
         self.var_export_sevennet = tk.BooleanVar(value=True)
         self.var_save_epoch_artifacts = tk.BooleanVar(value=True)
+        self.var_stream_hdf5 = tk.BooleanVar(value=True)
+        self.var_cache_neighbor_graphs = tk.BooleanVar(value=True)
 
         # Physics and architecture flags mirrored from ``ModelConfig``.
         self.var_e3mu_use_parity = tk.BooleanVar(value=True)
@@ -13022,7 +14858,7 @@ class App(tk.Tk):
         self.var_deq_damping = tk.StringVar(value="0.5")
         self.var_deq_alpha_max = tk.StringVar(value="100.0")
         self.var_d4_functional = tk.StringVar(value="pbe")
-        self.var_spin_cutoff = tk.StringVar(value="6.0")
+        self.var_spin_cutoff = tk.StringVar(value="5.0")
         self.var_coupling_iterations = tk.StringVar(value="2")
         self.var_coupling_tol = tk.StringVar(value="1e-5")
 
@@ -13048,6 +14884,9 @@ class App(tk.Tk):
         self._auto_best_params: Dict[str, Any] = {}
         self._auto_best_score: Optional[float] = None
         self._auto_best_level = 0
+        self._selected_training_mode = "joint"
+        self._custom_search_specs: Dict[str, tuple] = {}
+        self._search_space_customized = False
         self._auto_apply_button: Optional[_MacaronButton] = None
         self._auto_best_text_var = tk.StringVar(value="No completed search result yet.")
 
@@ -13150,6 +14989,13 @@ class App(tk.Tk):
                     pass
         if int(cfg.get("version", 1)) < 2:
             self.var_e3mu_use_parity.set(True)
+        try:
+            bounded_spin = _compatible_spin_cutoff(
+                self.var_rmax.get(), self.var_spin_cutoff.get()
+            )
+            self.var_spin_cutoff.set(f"{bounded_spin:.12g}")
+        except (tk.TclError, TypeError, ValueError):
+            pass
 
     def _save_config_to_file(self, path: str) -> None:
         cfg = self._collect_config()
@@ -14327,6 +16173,10 @@ class App(tk.Tk):
                         variable=self.var_export_sevennet).grid(row=3, column=2, columnspan=2, sticky="w", padx=4)
         ttk.Checkbutton(hp, text="Epoch artifacts + live plots",
                         variable=self.var_save_epoch_artifacts).grid(row=3, column=4, columnspan=4, sticky="w", padx=4)
+        ttk.Checkbutton(hp, text="Stream canonical HDF5",
+                        variable=self.var_stream_hdf5).grid(row=4, column=0, columnspan=3, sticky="w", padx=4)
+        ttk.Checkbutton(hp, text="Disk topology cache",
+                        variable=self.var_cache_neighbor_graphs).grid(row=4, column=3, columnspan=3, sticky="w", padx=4)
         for column in (1, 3, 5, 7):
             hp.columnconfigure(column, weight=1)
 
@@ -14971,6 +16821,8 @@ class App(tk.Tk):
             "lr_scheduler": str(self.var_lr_scheduler.get()),
             "export_sevennet": bool(self.var_export_sevennet.get()),
             "save_epoch_artifacts": bool(self.var_save_epoch_artifacts.get()),
+            "stream_hdf5": bool(self.var_stream_hdf5.get()),
+            "cache_neighbor_graphs": bool(self.var_cache_neighbor_graphs.get()),
         }
 
     def _gui_train_kwargs_for_mode(self, mode: str) -> Dict[str, Any]:
@@ -15362,6 +17214,9 @@ class App(tk.Tk):
                 trial_epochs=trial_epochs,
                 subset_fraction=subset_frac,
                 excluded_params=tuple(sorted(self._auto_excluded_params())),
+                search_space_overrides=dynamic_architecture_search_space(
+                    base_cfg.model, self._dataset_capability
+                ),
             )
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("Auto Search Error", str(e))
@@ -15684,6 +17539,20 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "Writes checkpoints, parity plots, histories, and solver diagnostics each epoch.",
         "Validation observables are streamed to the GUI and saved as machine-readable JSON.",
         "Enable for normal runs; disable only for I/O-sensitive searches.",
+    ),
+    "stream_hdf5": _p(
+        "Stream canonical HDF5",
+        "Keeps structures, labels, and graph tensors on disk until their batch is requested.",
+        "A compact split/mask index remains in RAM; only the current PyG batch is transferred to the accelerator.",
+        "Recommended on for canonical HDF5. Legacy extXYZ is still materialized before training.",
+        "Available for canonical HDF5 input.",
+    ),
+    "cache_neighbor_graphs": _p(
+        "Disk topology cache",
+        "Stores exact neighbor indices and periodic shifts on disk for reuse across epochs and runs.",
+        "The cache uses the same deterministic cutoff and neighbor implementation as uncached graph construction.",
+        "Recommended on. Disable only when disk space is constrained or geometry changes every epoch.",
+        "Used with canonical HDF5 streaming.",
     ),
     "joint_stages": _p(
         "Joint fine-tuning stages",
@@ -16076,6 +17945,8 @@ GUI_DEFAULTS = {
     "seed": "0",
     "export_sevennet": True,
     "save_epoch_artifacts": True,
+    "stream_hdf5": True,
+    "cache_neighbor_graphs": True,
     "joint_stages": "2",
     "warmup_epochs": "3",
     "lr_ground_scale": "0.05",
@@ -16155,6 +18026,8 @@ LEGACY_TK_VARIABLES = {
     "seed": "var_seed",
     "export_sevennet": "var_export_sevennet",
     "save_epoch_artifacts": "var_save_epoch_artifacts",
+    "stream_hdf5": "var_stream_hdf5",
+    "cache_neighbor_graphs": "var_cache_neighbor_graphs",
     "joint_stages": "var_joint_stages",
     "warmup_epochs": "var_warmup_epochs",
     "lr_ground_scale": "var_lr_ground_scale",
@@ -16545,6 +18418,54 @@ class ParameterToolTipFilter(QtCore.QObject):
         return False
 
 
+class AutoResearchEditorDelegate(QtWidgets.QStyledItemDelegate):
+    """Opaque, full-cell editor for Auto Research sampler specifications."""
+
+    def createEditor(
+        self,
+        parent: QtWidgets.QWidget,
+        _option: QtWidgets.QStyleOptionViewItem,
+        _index: QtCore.QModelIndex,
+    ) -> QtWidgets.QLineEdit:
+        editor = QtWidgets.QLineEdit(parent)
+        editor.setObjectName("autoResearchEditor")
+        editor.setAutoFillBackground(True)
+        editor.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+        palette = editor.palette()
+        palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#FFFDFE"))
+        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#FFFDFE"))
+        palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#302C3C"))
+        editor.setPalette(palette)
+        editor.setStyleSheet(
+            "QLineEdit#autoResearchEditor { background-color:#FFFDFE; color:#302C3C; "
+            "border:2px solid #8F7AC8; border-radius:8px; padding:3px 8px; "
+            "selection-background-color:#DCCFEC; }"
+        )
+        return editor
+
+    def setEditorData(
+        self, editor: QtWidgets.QLineEdit, index: QtCore.QModelIndex
+    ) -> None:
+        editor.setText(str(index.data(QtCore.Qt.ItemDataRole.EditRole) or ""))
+        editor.selectAll()
+
+    def setModelData(
+        self,
+        editor: QtWidgets.QLineEdit,
+        model: QtCore.QAbstractItemModel,
+        index: QtCore.QModelIndex,
+    ) -> None:
+        model.setData(index, editor.text(), QtCore.Qt.ItemDataRole.EditRole)
+
+    def updateEditorGeometry(
+        self,
+        editor: QtWidgets.QLineEdit,
+        option: QtWidgets.QStyleOptionViewItem,
+        _index: QtCore.QModelIndex,
+    ) -> None:
+        editor.setGeometry(option.rect.adjusted(1, 1, -1, -1))
+
+
 class ModernE3MUGui(QtWidgets.QMainWindow):
     """PyQt6 front end backed by the existing model and training module."""
 
@@ -16579,6 +18500,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._auto_best_params: Dict[str, Any] = {}
         self._auto_best_score: Optional[float] = None
         self._auto_best_level = 0
+        self._custom_search_specs: Dict[str, tuple] = {}
+        self._search_space_customized = False
         self._metric_history: List[Dict[str, Any]] = []
         self._artifact_dir: Optional[Path] = None
         self._default_path = Path.home() / ".dual_layer_field_gui.defaults.json"
@@ -16644,6 +18567,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 0; }}
             QScrollBar::handle:vertical {{ background: #CFC6D8; border-radius: 4px; min-height: 35px; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 0 4px; }}
+            QScrollBar::handle:horizontal {{ background: #CFC6D8; border-radius: 4px; min-width: 35px; }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+            QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+            QAbstractScrollArea::corner {{ background: #FFFDFE; border: 0; }}
             QSplitter::handle {{ background: transparent; width: 10px; }}
             QProgressBar {{
                 min-height: 8px; max-height: 8px; border: 0; border-radius: 4px; background: #E7E0EA;
@@ -16656,7 +18584,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             }}
             QTabBar::tab:selected {{ background: #FFFDFE; color: #40374F; }}
             QTableWidget {{
-                background: rgba(255,255,255,204); alternate-background-color: rgba(244,240,248,179);
+                background: #FFFDFE; alternate-background-color: #F7F3FA;
                 border: 1px solid rgba(76,58,91,20); border-radius: 12px; gridline-color: #EEE9F1;
                 selection-background-color: #E6DEF3;
             }}
@@ -16855,6 +18783,10 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         toggle_row.addWidget(self._make_toggle_tile("export_sevennet", "SevenNet export"))
         toggle_row.addWidget(self._make_toggle_tile("save_epoch_artifacts", "Live plots + artifacts"))
         card.body_layout.addLayout(toggle_row)
+        streaming_row = QtWidgets.QHBoxLayout()
+        streaming_row.addWidget(self._make_toggle_tile("stream_hdf5", "Stream HDF5 batches"))
+        streaming_row.addWidget(self._make_toggle_tile("cache_neighbor_graphs", "Disk graph cache"))
+        card.body_layout.addLayout(streaming_row)
         layout.addWidget(card)
 
         cascade = Card(
@@ -17035,9 +18967,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         )
         self.auto_apply_button.clicked.connect(self._apply_auto_best)
         self.auto_apply_button.setEnabled(False)
-        actions.addWidget(self.auto_run_button)
-        actions.addWidget(self.auto_apply_button)
-        actions.addStretch(1)
+        actions.addWidget(self.auto_run_button, 1)
+        actions.addWidget(self.auto_apply_button, 1)
         card.body_layout.addLayout(actions)
         self.auto_summary = QtWidgets.QLabel("No completed search result yet.")
         self.auto_summary.setWordWrap(True)
@@ -17050,27 +18981,73 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             "The table updates immediately when architecture, labels, losses, or search level change.",
             PALETTE["surface"],
         )
-        self.search_table = QtWidgets.QTableWidget(0, 5)
+        self.search_table = QtWidgets.QTableWidget(0, 6)
         self.search_table.setHorizontalHeaderLabels(
-            ("Parameter", "Search domain", "Best / current", "Last tried", "Status")
+            ("Parameter", "Sampler", "Domain (JSON)", "Best / current", "Last tried", "Status")
         )
-        self.search_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.search_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.search_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.search_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.search_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        search_header = self.search_table.horizontalHeader()
+        search_header.setMinimumSectionSize(72)
+        for column in range(6):
+            search_header.setSectionResizeMode(
+                column, QtWidgets.QHeaderView.ResizeMode.Interactive
+            )
+        for column, width in enumerate((145, 105, 285, 115, 105, 82)):
+            self.search_table.setColumnWidth(column, width)
         self.search_table.verticalHeader().setVisible(False)
         self.search_table.setAlternatingRowColors(True)
-        self.search_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.search_table.setMinimumHeight(285)
+        self.search_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.search_table.setMinimumHeight(340)
         self.search_table.setHorizontalScrollBarPolicy(
-            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self.search_table.setWordWrap(False)
+        self.search_scroll_corner = QtWidgets.QWidget(self.search_table)
+        self.search_scroll_corner.setStyleSheet(
+            "background-color:#FFFDFE; border:0;"
+        )
+        self.search_table.setCornerWidget(self.search_scroll_corner)
+        self.search_editor_delegate = AutoResearchEditorDelegate(self.search_table)
+        self.search_table.setItemDelegateForColumn(1, self.search_editor_delegate)
+        self.search_table.setItemDelegateForColumn(2, self.search_editor_delegate)
         search_viewport = self.search_table.viewport()
         search_viewport.setProperty("parameterTable", True)
         search_viewport.installEventFilter(self._tooltip_filter)
         table_card.body_layout.addWidget(self.search_table)
+        editor_actions = QtWidgets.QGridLayout()
+        editor_actions.setHorizontalSpacing(9)
+        editor_actions.setVerticalSpacing(8)
+        self.search_add_button = QtWidgets.QPushButton("Add Parameter")
+        self.search_remove_button = QtWidgets.QPushButton("Remove Selected")
+        self.search_reset_button = QtWidgets.QPushButton("Reset Suggested Ranges")
+        self.search_add_button.clicked.connect(self._add_search_parameter)
+        self.search_remove_button.clicked.connect(self._remove_search_parameters)
+        self.search_reset_button.clicked.connect(self._reset_search_space_editor)
+        self.search_table.itemChanged.connect(self._search_space_item_changed)
+        for button in (self.search_add_button, self.search_remove_button):
+            button.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+        self.search_reset_button.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        editor_actions.addWidget(self.search_add_button, 0, 0)
+        editor_actions.addWidget(self.search_remove_button, 0, 1)
+        editor_actions.addWidget(self.search_reset_button, 1, 0, 1, 2)
+        editor_actions.setColumnStretch(0, 1)
+        editor_actions.setColumnStretch(1, 1)
+        table_card.body_layout.addLayout(editor_actions)
+        range_help = QtWidgets.QLabel(
+            "Double-click Sampler or Domain to edit. Domains are JSON lists: "
+            "[min,max], [min,max,zero_probability], or [choice,...]."
+        )
+        range_help.setWordWrap(True)
+        range_help.setStyleSheet("color:#7E7585;")
+        table_card.body_layout.addWidget(range_help)
         layout.addWidget(table_card)
 
     def _build_dashboard(self) -> QtWidgets.QWidget:
@@ -17080,27 +19057,75 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         layout.setContentsMargins(5, 17, 18, 18)
         layout.setSpacing(12)
 
-        controls = Card("Run Control", "Launch, inspect, or stop the current research workflow.", PALETTE["surface"])
-        row = QtWidgets.QHBoxLayout()
+        controls = Card(
+            "Run Control",
+            "Select one workflow and choose whether canonical HDF5 stays streamed.",
+            PALETTE["surface"],
+        )
         self.training_buttons: List[QtWidgets.QPushButton] = []
-        for text, slot, color, primary in (
-            ("Mixed Joint", lambda: self._start_training("joint"), PALETTE["purple"], True),
-            ("Base", lambda: self._start_training("base"), PALETTE["mint"], False),
-            ("Response", lambda: self._start_training("response"), PALETTE["blue"], False),
-            ("Full Chain", self._run_full_chain, PALETTE["peach"], False),
-            ("Artifacts", self._open_artifacts, PALETTE["yellow"], False),
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.setSpacing(8)
+        mode_label = QtWidgets.QLabel("Training mode")
+        mode_label.setStyleSheet("color:#665E70; font-weight:700;")
+        mode_row.addWidget(mode_label)
+        self.training_mode_group = QtWidgets.QButtonGroup(self)
+        self.training_mode_group.setExclusive(True)
+        self.training_mode_buttons: Dict[str, QtWidgets.QPushButton] = {}
+        for mode, text in (
+            ("base", "Base"),
+            ("response", "Response"),
+            ("joint", "Mixed Joint"),
+            ("full_chain", "Full Chain"),
         ):
             button = QtWidgets.QPushButton(text)
+            button.setCheckable(True)
             button.setStyleSheet(
-                f"QPushButton {{ background-color:{color if primary else '#FFFDFE'}; "
-                f"color:{'#FFFFFF' if primary else '#403849'}; border:2px solid {color}; }}"
-                f"QPushButton:hover {{ background-color:{'#7E68B9' if primary else color}; "
+                "QPushButton { background-color:#FFFDFE; color:#403849; "
+                "border:2px solid #CFC5D7; }"
+                "QPushButton:hover { background-color:#EEE8F7; border-color:#8F7AC8; }"
+                "QPushButton:checked { background-color:#8F7AC8; color:#FFFFFF; "
                 "border-color:#6C5A9E; }"
             )
-            button.clicked.connect(slot)
-            row.addWidget(button)
-            if text != "Artifacts":
-                self.training_buttons.append(button)
+            button.setToolTip(f"Select {text} training workflow")
+            button.toggled.connect(
+                lambda checked, selected=mode: (
+                    self._set_selected_training_mode(selected) if checked else None
+                )
+            )
+            self.training_mode_group.addButton(button)
+            self.training_mode_buttons[mode] = button
+            self.training_buttons.append(button)
+            mode_row.addWidget(button, 1)
+        self.training_mode_buttons["joint"].setChecked(True)
+        controls.body_layout.addLayout(mode_row)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.streaming_mode_button = QtWidgets.QPushButton()
+        self.streaming_mode_button.setCheckable(True)
+        self.streaming_mode_button.setStyleSheet(
+            "QPushButton { background-color:#F9E7DD; color:#6D4E45; "
+            "border:2px solid #E5BFAE; }"
+            "QPushButton:hover { background-color:#F4D9CA; border-color:#C9957D; }"
+            "QPushButton:checked { background-color:#DFF2EA; color:#376553; "
+            "border-color:#86BDA8; }"
+        )
+        self.streaming_mode_button.setChecked(bool(self.value("stream_hdf5")))
+        self.streaming_mode_button.toggled.connect(self._streaming_mode_toggled)
+        self._update_streaming_mode_button()
+        self._set_tooltip_targets("stream_hdf5", self.streaming_mode_button)
+        self.training_buttons.append(self.streaming_mode_button)
+        row.addWidget(self.streaming_mode_button)
+
+        self.start_training_button = QtWidgets.QPushButton("Start Training")
+        self.start_training_button.setProperty("primary", True)
+        self.start_training_button.clicked.connect(self._start_selected_training)
+        self.training_buttons.append(self.start_training_button)
+        row.addWidget(self.start_training_button)
+
+        artifacts = QtWidgets.QPushButton("Artifacts")
+        artifacts.clicked.connect(self._open_artifacts)
+        row.addWidget(artifacts)
         row.addStretch(1)
         stop = QtWidgets.QPushButton("Stop")
         stop.setProperty("danger", True)
@@ -17292,6 +19317,74 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         del blocker
         if switch_blocker is not None:
             del switch_blocker
+        if key == "stream_hdf5" and hasattr(self, "streaming_mode_button"):
+            mode_blocker = QtCore.QSignalBlocker(self.streaming_mode_button)
+            self.streaming_mode_button.setChecked(bool(value))
+            del mode_blocker
+            self._update_streaming_mode_button()
+
+    def _set_selected_training_mode(self, mode: str) -> None:
+        selected = str(mode).strip().lower()
+        if selected not in {"base", "response", "joint", "full_chain"}:
+            raise ValueError(f"Unsupported GUI training mode: {mode!r}")
+        self._selected_training_mode = selected
+        button = getattr(self, "training_mode_buttons", {}).get(selected)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+
+    def _start_selected_training(self) -> None:
+        if self._selected_training_mode == "full_chain":
+            self._run_full_chain()
+        else:
+            self._start_training(self._selected_training_mode)
+
+    def _update_streaming_mode_button(self) -> None:
+        if not hasattr(self, "streaming_mode_button"):
+            return
+        streamed = self.streaming_mode_button.isChecked()
+        self.streaming_mode_button.setText(
+            "Streaming ON" if streamed else "Full Load"
+        )
+        self.streaming_mode_button.setAccessibleName(
+            "Streaming training enabled" if streamed else "Full dataset loading enabled"
+        )
+
+    def _streaming_mode_toggled(self, checked: bool) -> None:
+        self.set_value("stream_hdf5", bool(checked))
+        self._update_streaming_mode_button()
+        self._parameter_changed("stream_hdf5")
+
+    def _streaming_setting_toggled(self, checked: bool) -> None:
+        if not hasattr(self, "streaming_mode_button"):
+            return
+        blocker = QtCore.QSignalBlocker(self.streaming_mode_button)
+        self.streaming_mode_button.setChecked(bool(checked))
+        del blocker
+        self._update_streaming_mode_button()
+
+    def _enforce_spin_cutoff_bound(self) -> bool:
+        """Clamp stale/imported magnetic cutoffs to the current local graph."""
+        if "r_max" not in self.controls or "spin_cutoff" not in self.controls:
+            return False
+        try:
+            local_cutoff = float(self.value("r_max"))
+            magnetic_cutoff = float(self.value("spin_cutoff"))
+            bounded = self.backend._compatible_spin_cutoff(
+                local_cutoff, magnetic_cutoff
+            )
+        except (TypeError, ValueError):
+            return False
+        if math.isclose(bounded, magnetic_cutoff, rel_tol=0.0, abs_tol=1e-12):
+            return False
+        self.set_value("spin_cutoff", f"{bounded:.12g}")
+        return True
+
+    def _cutoff_editing_finished(self) -> None:
+        if not self._enforce_spin_cutoff_bound():
+            return
+        self._refresh_tooltips()
+        self._refresh_search_table()
+        self.estimate_timer.start()
 
     def current_values(self) -> Dict[str, Any]:
         return {key: self.value(key) for key in self.controls}
@@ -17305,10 +19398,14 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     control.textChanged.connect(lambda _text, name=key: self._dataset_selection_changed(name))
                 else:
                     control.textChanged.connect(lambda _text, name=key: self._parameter_changed(name))
+                if key in {"r_max", "spin_cutoff"}:
+                    control.editingFinished.connect(self._cutoff_editing_finished)
             elif isinstance(control, QtWidgets.QComboBox):
                 control.currentTextChanged.connect(lambda _text, name=key: self._parameter_changed(name))
             elif isinstance(control, ToggleTile) and key not in architecture_keys:
                 control.toggled.connect(lambda _checked, name=key: self._parameter_changed(name))
+                if key == "stream_hdf5":
+                    control.toggled.connect(self._streaming_setting_toggled)
 
     def _parameter_changed(self, key: str) -> None:
         if self._signal_guard:
@@ -17594,6 +19691,10 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
     def _model_config(self) -> Any:
         values = self.current_values()
+        local_cutoff = float(values["r_max"])
+        spin_cutoff = self.backend._compatible_spin_cutoff(
+            local_cutoff, values["spin_cutoff"]
+        )
         enable_pme = bool(values["enable_pme"])
         use_l3 = bool(values["e3mu_use_l3"])
         enable_film = bool(values["enable_film"])
@@ -17605,13 +19706,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             raise RuntimeError("PME requires torch-pme.")
         if bool(values["enable_d4"]) and not self.backend.HAS_TAD_DFTD4:
             raise RuntimeError("D4 requires tad-dftd4.")
-        if bool(values["enable_spin"]) and float(values["spin_cutoff"]) > float(values["r_max"]):
-            raise ValueError("Spin cutoff cannot exceed local cutoff r_max.")
         max_element = max([int(value) for value in self._capability.get("elements", [])] or [1])
         if bool(values["enable_continuous_chem"]) and int(values["chem_max_z"]) < max_element:
             raise ValueError(f"chem_max_z must cover dataset max Z={max_element}.")
         return self.backend.ModelConfig(
-            r_max=float(values["r_max"]),
+            r_max=local_cutoff,
             num_channels=int(values["num_channels"]),
             num_interactions=int(values["num_interactions"]),
             num_radial_basis=int(values["num_radial_basis"]),
@@ -17642,7 +19741,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             deq_damping=float(values["deq_damping"]),
             deq_alpha_max=float(values["deq_alpha_max"]),
             d4_functional=str(values["d4_functional"]),
-            spin_cutoff=float(values["spin_cutoff"]),
+            spin_cutoff=spin_cutoff,
             coupling_iterations=int(values["coupling_iterations"]),
             coupling_tol=float(values["coupling_tol"]),
         )
@@ -17722,6 +19821,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             "lr_scheduler": str(values["lr_scheduler"]),
             "export_sevennet": bool(values["export_sevennet"]),
             "save_epoch_artifacts": bool(values["save_epoch_artifacts"]),
+            "stream_hdf5": bool(values["stream_hdf5"]),
+            "cache_neighbor_graphs": bool(values["cache_neighbor_graphs"]),
         }
 
     def _train_kwargs_for_mode(self, mode: str) -> Dict[str, Any]:
@@ -17991,6 +20092,17 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             excluded = self.backend.architecture_locked_search_exclusions(
                 base.model, self._capability
             )
+            suggested = self.backend.dynamic_architecture_search_space(
+                self.current_values(), self._capability
+            )
+            default_params = list(self.backend.AutoSearchEngine.LEVEL_PARAMS.get(level, []))
+            selected_params = (
+                list(self._custom_search_specs)
+                if self._search_space_customized
+                else default_params
+            )
+            search_overrides = dict(suggested)
+            search_overrides.update(self._custom_search_specs)
             auto_cfg = self.backend.AutoSearchConfig(
                 level=level,
                 n_trials=max(1, int(self.value("auto_trials"))),
@@ -17998,9 +20110,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 subset_fraction=float(self.value("auto_subset")) / 100.0,
                 excluded_params=tuple(sorted(excluded)),
                 lock_selected_architecture=True,
-                search_space_overrides=self.backend.dynamic_architecture_search_space(
-                    self.current_values(), self._capability
-                ),
+                search_space_overrides=search_overrides,
+                search_params=tuple(selected_params),
             )
             tmp_dir = str(self._artifact_dir_for_checkpoint(str(self.value("out_ckpt"))) / "auto_trials")
             engine = self.backend.AutoSearchEngine(base, auto_cfg, tmp_dir)
@@ -18011,13 +20122,21 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
     def _refresh_search_table(self) -> None:
         if not hasattr(self, "search_table"):
             return
+        selected_rows = {
+            self.search_table.item(row, 0).text()
+            for row in range(self.search_table.rowCount())
+            if self.search_table.item(row, 0) is not None
+            and self.search_table.item(row, 0).isSelected()
+        }
         _engine, params, error = self._active_search_preview()
+        blocker = QtCore.QSignalBlocker(self.search_table)
         self.search_table.setRowCount(len(params) if params else (1 if error else 0))
         if error:
             item = QtWidgets.QTableWidgetItem(error)
             item.setForeground(QtGui.QColor(PALETTE["danger"]))
             self.search_table.setItem(0, 0, item)
-            self.search_table.setSpan(0, 0, 1, 5)
+            self.search_table.setSpan(0, 0, 1, 6)
+            del blocker
             return
         self.search_table.clearSpans()
         for row, parameter in enumerate(params):
@@ -18026,21 +20145,26 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 current = self.value(gui_key)
             except (KeyError, TypeError):
                 current = ""
-            search_domain = self._format_search_domain(
+            sampler, search_domain = self.backend.search_space_spec_to_editor(
                 _engine.search_space[parameter]
             )
-            cells = (parameter, search_domain, str(current), "", "Active")
+            cells = (parameter, sampler, search_domain, str(current), "", "Active")
             for column, text in enumerate(cells):
                 item = QtWidgets.QTableWidgetItem(text)
-                if column == 4:
+                if column not in (1, 2):
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                if column == 5:
                     item.setForeground(QtGui.QColor("#4B806A"))
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, gui_key)
                 self.search_table.setItem(row, column, item)
             tooltip = self._tooltip_html(gui_key)
-            for column in range(5):
+            for column in range(6):
                 table_item = self.search_table.item(row, column)
                 if table_item is not None:
                     table_item.setToolTip(tooltip)
+            if parameter in selected_rows:
+                self.search_table.selectRow(row)
+        del blocker
 
     @staticmethod
     def _format_search_domain(spec: tuple) -> str:
@@ -18049,13 +20173,112 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             return "{" + ", ".join(str(value) for value in spec[1]) + "}"
         if kind == "bool":
             return "{off, on}"
-        if kind in {"uniform", "log_uniform", "randint"}:
-            scale = "log " if kind == "log_uniform" else ""
+        if kind in {"uniform", "log_uniform", "zero_log_uniform", "randint"}:
+            scale = "log " if kind in {"log_uniform", "zero_log_uniform"} else ""
             return f"{scale}[{_fmt_p(spec[1])}, {_fmt_p(spec[2])}]"
         return str(spec)
 
+    def _sync_search_space_editor(self, *, mark_custom: bool = True) -> None:
+        if not hasattr(self, "search_table"):
+            return
+        parsed: Dict[str, tuple] = {}
+        for row in range(self.search_table.rowCount()):
+            parameter_item = self.search_table.item(row, 0)
+            sampler_item = self.search_table.item(row, 1)
+            domain_item = self.search_table.item(row, 2)
+            if parameter_item is None or sampler_item is None or domain_item is None:
+                continue
+            parameter = parameter_item.text().strip()
+            if not parameter:
+                continue
+            parsed[parameter] = self.backend.search_space_spec_from_editor(
+                parameter, sampler_item.text(), domain_item.text()
+            )
+        self._custom_search_specs = parsed
+        if mark_custom:
+            self._search_space_customized = True
+
+    def _search_space_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._signal_guard or item.column() not in (1, 2):
+            return
+        try:
+            self._sync_search_space_editor()
+            item.setBackground(QtGui.QColor("#FFFDFE"))
+            item.setToolTip("Editable Auto Research range")
+            self._invalidate_auto_result("Search space changed")
+        except Exception as exc:
+            item.setBackground(QtGui.QColor("#FBE2E7"))
+            item.setToolTip(str(exc))
+
+    def _add_search_parameter(self) -> None:
+        active = {
+            self.search_table.item(row, 0).text()
+            for row in range(self.search_table.rowCount())
+            if self.search_table.item(row, 0) is not None
+        }
+        candidates = [
+            name for name in self.backend.AutoSearchEngine.SEARCH_SPACE
+            if name not in active
+        ]
+        if not candidates:
+            QtWidgets.QMessageBox.information(
+                self, "Auto Research", "Every supported parameter is already present."
+            )
+            return
+        parameter, accepted = QtWidgets.QInputDialog.getItem(
+            self, "Add Search Parameter", "Parameter", candidates, 0, False
+        )
+        if not accepted or not parameter:
+            return
+        try:
+            self._sync_search_space_editor()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Search range", str(exc))
+            return
+        suggested = self.backend.dynamic_architecture_search_space(
+            self.current_values(), self._capability
+        )
+        self._custom_search_specs[str(parameter)] = self.backend.normalize_search_space_spec(
+            str(parameter),
+            suggested.get(
+                str(parameter), self.backend.AutoSearchEngine.SEARCH_SPACE[str(parameter)]
+            ),
+        )
+        self._search_space_customized = True
+        self._refresh_search_table()
+
+    def _remove_search_parameters(self) -> None:
+        rows = sorted(
+            {index.row() for index in self.search_table.selectedIndexes()}, reverse=True
+        )
+        if not rows:
+            return
+        try:
+            self._sync_search_space_editor()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Search range", str(exc))
+            return
+        for row in rows:
+            item = self.search_table.item(row, 0)
+            if item is not None:
+                self._custom_search_specs.pop(item.text().strip(), None)
+        self._search_space_customized = True
+        self._refresh_search_table()
+
+    def _reset_search_space_editor(self) -> None:
+        self._custom_search_specs.clear()
+        self._search_space_customized = False
+        self._refresh_search_table()
+
     def _run_auto_search(self) -> None:
         if self._training_running:
+            return
+        try:
+            self._sync_search_space_editor(
+                mark_custom=self._search_space_customized
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Search range", str(exc))
             return
         engine, params, error = self._active_search_preview()
         if engine is None or not params:
@@ -18162,6 +20385,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     self.set_value(key, value)
         finally:
             self._signal_guard = False
+        self._enforce_spin_cutoff_bound()
         self.auto_summary.setText(
             f"Applied {len(self._auto_best_params)} best values "
             f"(score {self._auto_best_score:.6g})."
@@ -18265,11 +20489,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             parameter = first.text()
             if parameter in best:
                 self.search_table.setItem(
-                    row, 2, QtWidgets.QTableWidgetItem(str(self.backend._fmt_p(best[parameter])))
+                    row, 3, QtWidgets.QTableWidgetItem(str(self.backend._fmt_p(best[parameter])))
                 )
             if parameter in latest:
                 self.search_table.setItem(
-                    row, 3, QtWidgets.QTableWidgetItem(str(self.backend._fmt_p(latest[parameter])))
+                    row, 4, QtWidgets.QTableWidgetItem(str(self.backend._fmt_p(latest[parameter])))
                 )
                 status_text = (
                     "Failed" if not math.isfinite(trial_score)
@@ -18282,7 +20506,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                         else "#3F8065" if improved else "#8A7B54"
                     )
                 )
-                self.search_table.setItem(row, 4, status)
+                self.search_table.setItem(row, 5, status)
 
     @staticmethod
     def _format_eta(seconds: float) -> str:
@@ -18510,11 +20734,17 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Open artifacts", str(exc))
 
     def _collect_config(self) -> Dict[str, Any]:
+        self._enforce_spin_cutoff_bound()
         return {
-            "version": 3,
+            "version": 4,
             "gui": "pyqt6",
+            "training_mode": self._selected_training_mode,
             "saved_at": self.backend._now(),
             "values": self.current_values(),
+            "auto_research_space": {
+                name: list(spec)
+                for name, spec in self._custom_search_specs.items()
+            } if self._search_space_customized else None,
             "vars": {
                 LEGACY_TK_VARIABLES[key]: value
                 for key, value in self.current_values().items()
@@ -18536,6 +20766,18 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 for name, value in legacy.items()
                 if name in reverse
             }
+        raw_search_space = payload.get("auto_research_space")
+        if raw_search_space is None:
+            custom_search_space: Dict[str, tuple] = {}
+            search_space_customized = False
+        elif not isinstance(raw_search_space, dict):
+            raise TypeError("auto_research_space must be an object or null")
+        else:
+            custom_search_space = {
+                str(name): self.backend.normalize_search_space_spec(str(name), spec)
+                for name, spec in raw_search_space.items()
+            }
+            search_space_customized = True
         self._signal_guard = True
         try:
             for key, value in values.items():
@@ -18543,6 +20785,12 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     self.set_value(key, value)
         finally:
             self._signal_guard = False
+        self._enforce_spin_cutoff_bound()
+        self._set_selected_training_mode(
+            str(payload.get("training_mode", self._selected_training_mode))
+        )
+        self._custom_search_specs = custom_search_space
+        self._search_space_customized = search_space_customized
         self._dataset_revision += 1
         self._invalidate_auto_result("Configuration changed")
         self._refresh_architecture_state()
@@ -18925,6 +21173,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--enable-all-physics", action="store_true")
     train_parser.add_argument("--no-epoch-artifacts", action="store_true")
     train_parser.add_argument("--no-sevennet", action="store_true")
+    train_parser.add_argument(
+        "--no-stream-hdf5",
+        action="store_true",
+        help="Materialize canonical HDF5 in RAM (debug/compatibility only)",
+    )
+    train_parser.add_argument(
+        "--no-graph-cache",
+        action="store_true",
+        help="Build neighbors on demand every epoch instead of using a disk cache",
+    )
+    train_parser.add_argument("--graph-cache-dir")
 
     evaluate_parser = subparsers.add_parser("evaluate", help="Evaluate a safe checkpoint")
     evaluate_parser.add_argument("checkpoint")
@@ -19000,6 +21259,12 @@ def _cli_train(args: argparse.Namespace) -> Dict[str, Any]:
         payload["save_epoch_artifacts"] = False
     if args.no_sevennet:
         payload["export_sevennet"] = False
+    if args.no_stream_hdf5:
+        payload["stream_hdf5"] = False
+    if args.no_graph_cache:
+        payload["cache_neighbor_graphs"] = False
+    if args.graph_cache_dir:
+        payload["graph_cache_dir"] = str(args.graph_cache_dir)
     config = train_config_from_dict(payload)
     checkpoint, validation_score = train_dual_layer(config, print)
     return {
