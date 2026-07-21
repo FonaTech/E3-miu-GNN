@@ -64,20 +64,20 @@ flowchart TB
 
 For structure $i$, atom-level arrays use the half-open interval
 
-$$
+```math
 \mathcal I_i=
 [\mathrm{atom\_ptr}_i,\mathrm{atom\_ptr}_{i+1}).
-$$
+```
 
 Every label $t$ has a structure mask $m_{t,i}\in\{0,1\}$. The loss may read a
 target only when $m_{t,i}=1$:
 
-$$
+```math
 \mathcal L_t=
 \frac{\sum_i m_{t,i}
 \left\|\widehat{\mathbf y}_{t,i}-\mathbf y_{t,i}\right\|_2^2}
 {\sum_i m_{t,i}d_t}.
-$$
+```
 
 Dense storage slots outside an active mask are padding, normally `NaN`, and
 must never be interpreted as zero observations.
@@ -129,9 +129,9 @@ not a guarantee of generalization.
 Tiny and Small are deterministic nested subsets of Standard, using seed
 `20260720`:
 
-$$
+```math
 \mathrm{Tiny}\subset\mathrm{Small}\subset\mathrm{Standard}.
-$$
+```
 
 Sampling weights are proportional to the square root of source population and
 are stratified by source, fixed split, label family, chemical complexity,
@@ -185,10 +185,10 @@ targets while their mixed-corpus energy masks are false.
 
 This policy avoids an ill-defined objective such as
 
-$$
+```math
 \min_\theta\sum_s
 \left|E_\theta(\mathbf R_s)-E_s^{(\mathrm{method}\;s)}\right|^2
-$$
+```
 
 when the target zero and Hamiltonian change with source. A future calibrated
 multi-domain energy model would require explicit offsets or source-conditioned
@@ -197,13 +197,13 @@ heads and independent validation.
 ## Validation commands
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py dataset-summary \
+python E3_miu_GNN.py dataset-summary \
   Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5
 
-python Dual_Layer_Atomic_E3_GNN.py dataset-validate \
+python E3_miu_GNN.py dataset-validate \
   Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5
 
-python Dual_Layer_Atomic_E3_GNN.py dataset-tier-audit \
+python E3_miu_GNN.py dataset-tier-audit \
   --tier tiny=Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5 \
   --tier small=Datasets/Neo/canonical/neo_small_l1_l2_l3.h5 \
   --tier standard=Datasets/Neo/canonical/neo_mixed_l1_l2_l3.h5

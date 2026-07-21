@@ -30,13 +30,13 @@ For target family $t$, prediction $\widehat{\mathbf y}_{t,k}$, reference
 $\mathbf y_{t,k}$, mask or sample weight $m_{t,k}$, and component count $d_t$,
 the implemented multi-task objective is
 
-$$
+```math
 \mathcal L(\theta)=
 \sum_{t\in\mathcal T}w_t
 \frac{\sum_k m_{t,k}
 \left\|\widehat{\mathbf y}_{t,k}-\mathbf y_{t,k}\right\|_2^2}
 {\sum_k m_{t,k}d_t}.
-$$
+```
 
 Active targets can include energy, forces, dipole, molecular and atomic
 polarizability, charges, atomic dipoles, C6, Born effective charge, magnetic
@@ -74,7 +74,7 @@ flowchart TD
     PME[PME / Ewald] --> Q[QEq]
     D4[D4] --> Q
     DMI[DMI] --> S[Spin]
-    DMI --> P[O(3) parity]
+    DMI --> P["O(3) parity"]
     L3[L=3 tensor] --> P
     FILM[FiLM] --> P
     FILM --> DOMAIN[At least one active domain]
@@ -106,12 +106,12 @@ rather than presented as a calibrated physical result.
 Loss weights are optimization choices and must not control model ranking.
 Checkpoint selection and Auto Research therefore use
 
-$$
+```math
 S_{\mathrm{val}}=
 \frac{1}{|\mathcal T_{\mathrm{active}}|}
 \sum_{t\in\mathcal T_{\mathrm{active}}}
-\frac{\operatorname{MAE}_t}{s_t},
-$$
+\frac{\mathrm{MAE}_t}{s_t},
+```
 
 where $s_t$ is a fixed characteristic scale. Current scales are 1 for energy,
 force, dipole, polarizability, and magnetic moment; 0.1 for charge, atomic

@@ -3,10 +3,9 @@
 **Yufeng Zhan (Fona)**  
 Implementation-aligned manuscript, July 2026
 
-> This manuscript follows the completed E(3)-GNN chapters of the research
-> proposal. It describes only functionality present in
-> `Dual_Layer_Atomic_E3_GNN.py`: the atomic, domain, and spin layers, their FiLM
-> coupling, the canonical dataset system, and verified training behavior.
+This manuscript documents the atomic, domain, and spin layers implemented in
+`E3_miu_GNN.py`, together with FiLM coupling, the canonical dataset system,
+and verified training behavior.
 
 ## Abstract
 
@@ -42,17 +41,17 @@ separate scientific validation problem.
 The many-electron problem is reduced in Kohn-Sham density-functional theory
 (DFT) to auxiliary one-electron equations [2,3]:
 
-$$
+```math
 \left[-\frac{\hbar^2}{2m_e}\nabla^2 + V_{\mathrm{eff}}(\mathbf r)\right]
 \phi_i(\mathbf r)=\epsilon_i\phi_i(\mathbf r),
 \qquad
 n(\mathbf r)=\sum_i\left|\phi_i(\mathbf r)\right|^2,
 \tag{1}
-$$
+```
 
 where
 
-$$
+```math
 V_{\mathrm{eff}}(\mathbf r)
 =V_{\mathrm n}(\mathbf r)+V_{\mathrm H}(\mathbf r)
 +V_{\mathrm{xc}}(\mathbf r),
@@ -60,31 +59,31 @@ V_{\mathrm{eff}}(\mathbf r)
 V_{\mathrm{xc}}(\mathbf r)
 =\frac{\delta E_{\mathrm{xc}}[n]}{\delta n(\mathbf r)}.
 \tag{2}
-$$
+```
 
 The exchange-correlation approximation controls a major part of the accuracy
 and cost trade-off. One expression of its limitation is the difference between
 the Kohn-Sham and quasiparticle gap,
 
-$$
+```math
 E_g^{\mathrm{QP}}=I-A=E_g^{\mathrm{KS}}+\Delta_{\mathrm{xc}}.
 \tag{3}
-$$
+```
 
 Strongly localized states are often treated with an additional on-site
 correction,
 
-$$
+```math
 E_{\mathrm{DFT}+U}
 =E_{\mathrm{DFT}}
 +\frac{U_{\mathrm{eff}}}{2}\sum_\sigma
-\operatorname{Tr}\!\left[\mathbf n_\sigma
+\mathrm{Tr}\!\left[\mathbf n_\sigma
 \left(\mathbf I-\mathbf n_\sigma\right)\right],
 \qquad U_{\mathrm{eff}}=U-J.
 \tag{4}
-$$
+```
 
-Equations (1)-(4) motivate the proposal but are not embedded as an explicit
+Equations (1)-(4) provide physical background but are not embedded as an explicit
 DFT or DFT+$U$ solver in E(3)-mu-GNN. The implemented model instead learns an
 effective atomistic Hamiltonian from labelled calculations while enforcing
 geometric and physical structure in its representation and solver layers.
@@ -95,11 +94,11 @@ An ML interatomic potential approximates the Born-Oppenheimer potential energy
 surface $E(\mathbf R)$ and evaluates forces by differentiation. A strictly
 local decomposition,
 
-$$
+```math
 E_{\mathrm{local}}(\mathbf R)=\sum_i \varepsilon_i
 \left(\mathcal N_i^{r_c}\right),
 \tag{5}
-$$
+```
 
 is effective when interactions outside the cutoff $r_c$ are screened or can be
 absorbed into local environments. It becomes incomplete when the state depends
@@ -145,9 +144,8 @@ formed.
 
 ![Implemented system overview](assets/proposal/system-overview-core.png)
 
-*Figure 1. Implemented portion of the proposal system diagram. The image is
-cropped at the E(3)-GNN boundary and contains only the three physical layers and
-their electronic coupling network.*
+*Figure 1. Implemented E(3)-GNN system with three physical layers and their
+electronic coupling network.*
 
 ## 3. Research method and implemented architecture
 
@@ -158,14 +156,14 @@ positions $\mathbf R_i$, cell $\mathbf A_g$, periodic flags, total charge
 $Q_g$, external field $\boldsymbol{\mathcal E}_g$, and optional unit spin
 vectors $\mathbf S_i$. Directed edges connect neighbors inside a cutoff,
 
-$$
+```math
 \mathbf r_{ij}=\mathbf R_j+\mathbf t_{ij}-\mathbf R_i,
 \qquad
 r_{ij}=\|\mathbf r_{ij}\|,
 \qquad
 \widehat{\mathbf r}_{ij}=\frac{\mathbf r_{ij}}{r_{ij}},
 \tag{6}
-$$
+```
 
 where $\mathbf t_{ij}$ is the periodic image shift. Translation invariance
 follows from relative positions. The learned energy is invariant under O(3),
@@ -188,17 +186,15 @@ flowchart TB
     H --> D[Autograd observables]
 ```
 
-![Proposal view of the three physical granularities](assets/proposal/mixed-granularity-core.png)
+![Three physical granularities](assets/proposal/mixed-granularity-core.png)
 
-*Figure 2. Atomic, domain, and spin portions of the original proposal figure.
-The image is cropped before publication to exclude unimplemented agent,
-reinforcement-learning, and LoRA stages.*
+*Figure 2. Atomic, domain, spin, and cross-granularity feedback components.*
 
 ### 3.2 Layer 1: parity-aware atomic E(3)-GNN
 
-The proposal writes equivariant message passing as a tensor-product expansion,
+The equivariant message-passing layer is expressed as a tensor-product expansion,
 
-$$
+```math
 \mathbf m_{ij}^{L_{\mathrm{out}}}
 =\sum_{L_{\mathrm{in}},L_{\mathrm{edge}}}
 W_{L_{\mathrm{in}},L_{\mathrm{edge}}\rightarrow L_{\mathrm{out}}}
@@ -208,18 +204,18 @@ W_{L_{\mathrm{in}},L_{\mathrm{edge}}\rightarrow L_{\mathrm{out}}}
 \mathbf Y^{L_{\mathrm{edge}}}(\widehat{\mathbf r}_{ij})
 \right]_{L_{\mathrm{out}}}.
 \tag{7}
-$$
+```
 
 The implementation realizes the selected products directly in a real
 Cartesian basis. Node state contains
 
-$$
+```math
 \mathbf h_i=\left(
 \mathbf s_i,\mathbf v_i,\mathbf a_i,\mathbf T_i^{(2)},
 \mathbf T_i^{(3)}
 \right),
 \tag{8}
-$$
+```
 
 with scalar $\mathbf s_i$, polar vector $\mathbf v_i$, axial vector
 $\mathbf a_i$, five-component symmetric-traceless $L=2$ tensor
@@ -227,18 +223,18 @@ $\mathbf T_i^{(2)}$, and optional seven-component symmetric-traceless $L=3$
 tensor $\mathbf T_i^{(3)}$. Examples of explicit parity-preserving channels
 are
 
-$$
+```math
 \mathbf v_j\cdot\widehat{\mathbf r}_{ij}\rightarrow 0e,
 \quad
 \mathbf v_j\times\widehat{\mathbf r}_{ij}\rightarrow 1e,
 \quad
 \mathbf a_j\times\widehat{\mathbf r}_{ij}\rightarrow 1o,
 \quad
-\operatorname{ST}\!\left(
+\mathrm{ST}\!\left(
 \mathbf v_j\otimes\widehat{\mathbf r}_{ij}
 \right)\rightarrow 2e.
 \tag{9}
-$$
+```
 
 Radial filters use fixed Gaussian, trainable Gaussian, or Bessel bases and a
 cosine cutoff. Aggregation is a mean over incoming edges; update gates depend
@@ -247,18 +243,18 @@ $\|\mathbf a\|^2$, and tensor norms.
 
 The short-range energy is
 
-$$
+```math
 E_{\mathrm{short}}
 =\sum_i\left[E_{z_i}^{\mathrm{ref}}
 +f_E(\mathbf s_i)\right].
 \tag{10}
-$$
+```
 
 The reference atomic energies are obtained from a regularized least-squares
 fit over the active training set. The Hessian and dynamical matrix remain
 derivatives of the same scalar surface,
 
-$$
+```math
 H_{i\alpha,j\beta}
 =\frac{\partial^2 E_{\mathrm{tot}}}
 {\partial R_{i\alpha}\partial R_{j\beta}},
@@ -268,7 +264,7 @@ D_{\alpha\beta}^{ab}(\mathbf q)
 \sum_{\mathbf T}H_{0a\alpha,\mathbf T b\beta}
 e^{i\mathbf q\cdot\mathbf T}.
 \tag{11}
-$$
+```
 
 Equation (11) states the automatic-differentiation interface. The current
 validation suite tests first-derivative force consistency; it does not report a
@@ -280,7 +276,7 @@ Under the Born-Oppenheimer approximation, a static electric field is treated as
 a perturbation $\widehat V_{\mathrm{ext}}=-\widehat{\boldsymbol\mu}\cdot
 \boldsymbol{\mathcal E}$. Retaining second order gives
 
-$$
+```math
 E(\mathbf R,\boldsymbol{\mathcal E})
 =E_{\mathrm{PES}}(\mathbf R)
 -\boldsymbol\mu(\mathbf R)\cdot\boldsymbol{\mathcal E}
@@ -288,31 +284,31 @@ E(\mathbf R,\boldsymbol{\mathcal E})
 \boldsymbol\alpha(\mathbf R)\boldsymbol{\mathcal E}
 +\mathcal O(\|\boldsymbol{\mathcal E}\|^3).
 \tag{12}
-$$
+```
 
 The response network reads scalar, polar, and $L=2$ features. It predicts raw
 charges, permanent atomic dipoles, electronegativities, positive hardnesses,
 C6 scaling, and atomic polarizabilities. The latter are decomposed into an
 isotropic and symmetric-traceless part,
 
-$$
+```math
 \boldsymbol\alpha_i
-=\operatorname{softplus}(a_i)\mathbf I
+=\mathrm{softplus}(a_i)\mathbf I
 +\sum_{k=1}^{5}c_{ik}\mathbf B_k^{(2)},
 \qquad
 \boldsymbol\alpha=\sum_i\boldsymbol\alpha_i.
 \tag{13}
-$$
+```
 
 The total dipole combines permanent, charge-displacement, and induced terms,
 
-$$
+```math
 \boldsymbol\mu
 =\sum_i\boldsymbol\mu_i^{\mathrm{perm}}
 +\sum_i q_i(\mathbf R_i-\mathbf R_c)
 +\sum_i\mathbf p_i^{\mathrm{ind}}.
 \tag{14}
-$$
+```
 
 For non-periodic structures $\mathbf R_c$ is the geometric center. Periodic
 relative positions use the minimum-image finite-cell convention recorded in
@@ -322,44 +318,44 @@ the data metadata.
 
 The total energy separates local and domain contributions,
 
-$$
+```math
 E_{\mathrm{tot}}=E_{\mathrm{short}}+E_{\mathrm{domain}}+E_{\mathrm{spin}}.
 \tag{15}
-$$
+```
 
 #### Differentiable charge equilibration
 
 For one graph, QEq minimizes
 
-$$
+```math
 E_{\mathrm{QEq}}(\mathbf q)
 =\boldsymbol\chi^{\mathsf T}\mathbf q
 +\frac{1}{2}\mathbf q^{\mathsf T}
-\left[\operatorname{diag}(\boldsymbol\eta)+\mathbf K\right]\mathbf q
+\left[\mathrm{diag}(\boldsymbol\eta)+\mathbf K\right]\mathbf q
 +\boldsymbol\phi_{\mathrm{ext}}^{\mathsf T}\mathbf q,
 \qquad
 \mathbf 1^{\mathsf T}\mathbf q=Q.
 \tag{16}
-$$
+```
 
 The direct non-periodic kernel is softened at short range,
 
-$$
+```math
 K_{ij}=\frac{k_e}{\sqrt{r_{ij}^2+\sigma^2}},\qquad i\ne j.
 \tag{17}
-$$
+```
 
 Periodic graphs obtain $\mathbf K$ from an Ewald calculator. The reciprocal
 contribution has the familiar form
 
-$$
+```math
 E_{\mathrm{rec}}
 =\frac{1}{2\Omega}\sum_{\mathbf k\ne 0}
 \frac{4\pi k_e}{\|\mathbf k\|^2}
 e^{-\|\mathbf k\|^2/(4\alpha_E^2)}
 \left|S(\mathbf k)\right|^2.
 \tag{18}
-$$
+```
 
 Rather than solve an indefinite KKT system, the implementation eliminates the
 constraint. Let $\mathbf B$ be an analytic Helmert basis satisfying
@@ -368,13 +364,13 @@ $\mathbf B^{\mathsf T}\mathbf B=\mathbf I$. With
 $\mathbf q=\mathbf q_0+\mathbf B\mathbf z$ and
 $\mathbf 1^{\mathsf T}\mathbf q_0=Q$,
 
-$$
+```math
 \left(\mathbf B^{\mathsf T}\mathbf H\mathbf B\right)\mathbf z
 =-\mathbf B^{\mathsf T}\left(\mathbf H\mathbf q_0+\mathbf b\right),
 \qquad
-\mathbf H=\operatorname{diag}(\boldsymbol\eta)+\mathbf K.
+\mathbf H=\mathrm{diag}(\boldsymbol\eta)+\mathbf K.
 \tag{19}
-$$
+```
 
 A differentiable stability shift makes the reduced Hessian positive definite;
 Cholesky and triangular solves then work on CPU, CUDA, and Apple MPS. The model
@@ -384,35 +380,35 @@ reports stationarity, charge, and stability residuals.
 
 The induced-dipole interaction uses Thole damping [9]. Define
 
-$$
+```math
 u_{ij}=\frac{r_{ij}}{(\alpha_i\alpha_j)^{1/6}},
 \quad
 f_3=1-e^{-a u_{ij}^3},
 \quad
 f_5=1-(1+a u_{ij}^3)e^{-a u_{ij}^3},
 \tag{20}
-$$
+```
 
 and
 
-$$
+```math
 \mathbf T_{ij}
 =\frac{k_e}{r_{ij}^3}
 \left(3f_5\widehat{\mathbf r}_{ij}
 \widehat{\mathbf r}_{ij}^{\mathsf T}-f_3\mathbf I\right).
 \tag{21}
-$$
+```
 
 The fixed point $\mathbf p=\mathbf A(\mathbf E_{\mathrm{drv}}+\mathbf T\mathbf p)$
 is linear. The implementation solves its symmetric transformed system exactly,
 
-$$
+```math
 \left(\mathbf I-\mathbf A^{1/2}\mathbf T\mathbf A^{1/2}\right)\mathbf x
 =\mathbf A^{1/2}\mathbf E_{\mathrm{drv}},
 \qquad
 \mathbf p=\mathbf A^{1/2}\mathbf x,
 \tag{22}
-$$
+```
 
 with a reported positive-definiteness shift. This is the implemented
 deep-equilibrium response: it avoids retaining a long unrolled iteration graph
@@ -424,13 +420,13 @@ For non-periodic structures, the D4 sublayer delegates the charge-dependent
 dispersion energy and atomic C6 coefficients to `tad-dftd4` [10]. Its
 two-body damping form is schematically
 
-$$
+```math
 E_{\mathrm{D4}}^{(2)}
 =-\frac{1}{2}\sum_{A\ne B}\sum_{n\in\{6,8\}}
 s_n\frac{C_n^{AB}}
 {R_{AB}^{n}+\left(a_1R_0^{AB}+a_2\right)^n}.
 \tag{23}
-$$
+```
 
 The current backend is molecular. Periodic structures receive no D4 energy,
 and the GUI disables the switch for a dataset containing periodic structures.
@@ -439,22 +435,22 @@ and the GUI disables the switch for a dataset containing periodic structures.
 
 A spin is an axial vector: under an orthogonal spatial transform $\mathbf Q$,
 
-$$
+```math
 \mathbf S_i\mapsto \det(\mathbf Q)\mathbf Q\mathbf S_i,
 \tag{24}
-$$
+```
 
 while time reversal maps $\mathbf S_i\mapsto-\mathbf S_i$. The implemented
 spin energy is
 
-$$
+```math
 E_{\mathrm{spin}}
 =-\sum_{i<j}J_{ij}\mathbf S_i\cdot\mathbf S_j
 +\sum_i\mathbf S_i^{\mathsf T}\mathbf D_i\mathbf S_i
 +\sum_{i<j}\mathbf D_{ij}^{\mathrm{DMI}}\cdot
 \left(\mathbf S_i\times\mathbf S_j\right).
 \tag{25}
-$$
+```
 
 $J_{ij}$ is a scalar pair readout. $\mathbf D_i$ is symmetric and explicitly
 made traceless. $\mathbf D_{ij}^{\mathrm{DMI}}$ is an axial vector assembled
@@ -462,45 +458,45 @@ from axial features and cross products of polar channels. Every term in
 Equation (25) is even under simultaneous spin reversal. The predicted magnetic
 moment is
 
-$$
-\mathbf m_i=\operatorname{softplus}(f_m(\mathbf s_i))\mathbf S_i,
+```math
+\mathbf m_i=\mathrm{softplus}(f_m(\mathbf s_i))\mathbf S_i,
 \tag{26}
-$$
+```
 
 and the effective field is the energy derivative
 
-$$
+```math
 \mathbf H_i^{\mathrm{eff}}
 =-\frac{\partial E_{\mathrm{spin}}}{\partial\mathbf S_i}.
 \tag{27}
-$$
+```
 
 ### 3.6 Cross-granularity FiLM coupling
 
 The first domain/spin pass produces a four-component condition at every atom,
 
-$$
+```math
 \mathbf c_i=\left[
 \tanh(q_i),
 \tanh(\phi_i/10),
 \|\mathbf S_i\|^2,
-\underset{j\in\mathcal N(i)}{\operatorname{mean}}
+\underset{j\in\mathcal N(i)}{\mathrm{mean}}
 (\mathbf S_i\cdot\mathbf S_j)
 \right].
 \tag{28}
-$$
+```
 
 Each atomic interaction block maps $\mathbf c_i$ to scalar scale, scalar bias,
 and tensor scale. The actual bounded modulation is
 
-$$
+```math
 \mathbf s_i\leftarrow
 \left[1+0.25\tanh\boldsymbol\gamma_i^{(s)}\right]\odot\mathbf s_i
 +\boldsymbol\beta_i^{(s)},
 \tag{29}
-$$
+```
 
-$$
+```math
 \mathbf X_i^{(L)}\leftarrow
 \left[1+0.25\tanh\boldsymbol\gamma_i^{(L)}\right]
 \odot\mathbf X_i^{(L)},
@@ -508,7 +504,7 @@ $$
 \mathbf X^{(L)}\in
 \{\mathbf v,\mathbf a,\mathbf T^{(2)},\mathbf T^{(3)}\}.
 \tag{30}
-$$
+```
 
 The coupled forward pass recomputes atomic, response, QEq, and spin quantities
 for a bounded number of outer iterations. It stops early when the graph-wise
@@ -534,18 +530,18 @@ sequenceDiagram
 
 The complete implemented Hamiltonian is
 
-$$
+```math
 E_{\mathrm{tot}}
 =E_{\mathrm{short}}+E_{\mathrm{QEq}}+E_{\mathrm{PME}}
 +E_{\mathrm{D4}}+E_{\mathrm{spin}}+E_{\mathrm{resp}}.
 \tag{31}
-$$
+```
 
 The dipole-field term is not double-counted: when QEq is active, the charge
 coupling to the field is already contained in the QEq linear potential.
 Observables are differentiated after Equation (31):
 
-$$
+```math
 \mathbf F_i=-\frac{\partial E_{\mathrm{tot}}}{\partial\mathbf R_i},
 \qquad
 Z^{*}_{i,\alpha\beta}
@@ -554,7 +550,7 @@ Z^{*}_{i,\alpha\beta}
 \mathbf H_i^{\mathrm{eff}}
 =-\frac{\partial E_{\mathrm{spin}}}{\partial\mathbf S_i}.
 \tag{32}
-$$
+```
 
 ## 4. Data generation and training strategy
 
@@ -609,14 +605,14 @@ split boundaries.
 For target $t$, mask $m_{t,k}$, prediction $\widehat{\mathbf y}_{t,k}$, and
 reference $\mathbf y_{t,k}$, the training objective is
 
-$$
+```math
 \mathcal L
 =\sum_{t\in\mathcal T}w_t
 \frac{\sum_k m_{t,k}
 \left\|\widehat{\mathbf y}_{t,k}-\mathbf y_{t,k}\right\|_2^2}
 {\sum_k m_{t,k}\,d_t},
 \tag{33}
-$$
+```
 
 where $d_t$ is the number of components per labelled item. The implemented
 target set includes energy, forces, dipole, molecular and atomic
@@ -627,13 +623,13 @@ atom so large cells do not dominate solely by size.
 Checkpoint selection and Auto Research use a weight-independent normalized
 score,
 
-$$
+```math
 S_{\mathrm{val}}
 =\frac{1}{|\mathcal T_{\mathrm{active}}|}
 \sum_{t\in\mathcal T_{\mathrm{active}}}
-\frac{\operatorname{MAE}_t}{s_t},
+\frac{\mathrm{MAE}_t}{s_t},
 \tag{34}
-$$
+```
 
 with fixed characteristic scales $s_t$. A candidate cannot improve its ranking
 merely by reducing its own loss weight.
@@ -729,8 +725,8 @@ Several boundaries are material when interpreting results:
 
 ## 7. Conclusion
 
-E(3)-mu-GNN implements the completed core proposal as an energy-based,
-mixed-granularity atomistic model. Its atomic layer provides explicit O(3)
+E(3)-mu-GNN is an energy-based, mixed-granularity atomistic model. Its atomic
+layer provides explicit O(3)
 parity channels; its domain layer turns predicted electronic parameters into
 constrained electrostatic, polarization, and dispersion energies; its spin
 layer supplies a time-reversal-consistent magnetic Hamiltonian; and FiLM
@@ -743,7 +739,7 @@ claims.
 
 ## Code, data, and licensing statement
 
-The implementation is in `Dual_Layer_Atomic_E3_GNN.py` and is released under
+The implementation is in `E3_miu_GNN.py` and is released under
 MIT terms. Neo dataset binaries are not covered by the software license.
 MPtrj, JARVIS-DFT, QM7-X, SO3LR, SCFNN, and DeepSPIN retain their respective
 upstream terms. Public redistribution of the current aggregate remains blocked
@@ -753,7 +749,7 @@ records are removed. Exact source declarations and transformations are in
 
 ## References
 
-1. Y. Zhan, *Mixed-Granularity-Aware Graph Neural Network Framework for Physical Information Prediction*, research proposal, version 5.1 (2026).
+1. Y. Zhan, *E(3)-mu-GNN*, open-source software repository (2026), <https://github.com/FonaTech/E3-miu-GNN>.
 2. P. Hohenberg and W. Kohn, "Inhomogeneous Electron Gas," *Physical Review* **136**, B864-B871 (1964), <https://doi.org/10.1103/PhysRev.136.B864>.
 3. W. Kohn and L. J. Sham, "Self-Consistent Equations Including Exchange and Correlation Effects," *Physical Review* **140**, A1133-A1138 (1965), <https://doi.org/10.1103/PhysRev.140.A1133>.
 4. I. Batatia et al., "MACE: Higher Order Equivariant Message Passing Neural Networks for Fast and Accurate Force Fields," *NeurIPS* (2022), <https://doi.org/10.48550/arXiv.2206.07697>.

@@ -11,9 +11,8 @@ time-reversal-aware spin Hamiltonian in one trainable model.
 
 ![Mixed-granularity architecture](docs/assets/proposal/mixed-granularity-core.png)
 
-*Figure 1. Completed E(3)-mu-GNN portion of the research-proposal diagram. The
-crop excludes the proposal's unimplemented agent, reinforcement-learning, and
-LoRA workflow.*
+*Figure 1. Implemented E(3)-mu-GNN atomic, domain-response, spin, and coupling
+architecture.*
 
 ## What is implemented
 
@@ -41,37 +40,37 @@ LoRA workflow.*
 
 The implemented model assembles
 
-$$
+```math
 E_{\mathrm{tot}} =
 E_{\mathrm{short}} + E_{\mathrm{QEq}} + E_{\mathrm{PME}}
 + E_{\mathrm{D4}} + E_{\mathrm{spin}} + E_{\mathrm{resp}},
-$$
+```
 
 with electric response
 
-$$
+```math
 E_{\mathrm{resp}}
 = -\boldsymbol{\mu}\cdot\boldsymbol{\mathcal E}
 - \frac{1}{2}\boldsymbol{\mathcal E}^{\mathsf T}
 \boldsymbol{\alpha}\boldsymbol{\mathcal E}.
-$$
+```
 
 Forces and spin fields remain derivatives of the same energy:
 
-$$
+```math
 \mathbf F_i=-\frac{\partial E_{\mathrm{tot}}}{\partial \mathbf R_i},
 \qquad
 \mathbf H_i^{\mathrm{eff}}=-\frac{\partial E_{\mathrm{spin}}}{\partial \mathbf S_i},
 \qquad
 Z^{*}_{i,\alpha\beta}=\frac{\partial \mu_\alpha}{\partial R_{i\beta}}.
-$$
+```
 
 ## Execution graph
 
 ```mermaid
 flowchart LR
     A[Atomic numbers, positions, cell, field, spins] --> G[Neighbor graph]
-    G --> L1[Layer 1: parity-aware O(3) message passing]
+    G --> L1["Layer 1: parity-aware O(3) message passing"]
     L1 --> PES[Short-range energy]
     L1 --> R[Response tensor heads]
     R --> Q[Layer 2: QEq and PME]
@@ -100,8 +99,8 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
 pytest -q
-python Dual_Layer_Atomic_E3_GNN.py self-test
-python Dual_Layer_Atomic_E3_GNN.py gui
+python E3_miu_GNN.py self-test
+python E3_miu_GNN.py gui
 ```
 
 The GUI is the default research workflow for dataset inspection, architecture
@@ -115,21 +114,21 @@ Auto Research.
 Inspect and validate a canonical dataset:
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py dataset-summary path/to/data.h5
-python Dual_Layer_Atomic_E3_GNN.py dataset-validate path/to/data.h5 --output validation.json
+python E3_miu_GNN.py dataset-summary path/to/data.h5
+python E3_miu_GNN.py dataset-validate path/to/data.h5 --output validation.json
 ```
 
 Train and evaluate:
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py train \
+python E3_miu_GNN.py train \
   --dataset path/to/data.h5 \
   --mode joint \
   --device auto \
   --epochs 50 \
   --out-ckpt model.pt
 
-python Dual_Layer_Atomic_E3_GNN.py evaluate \
+python E3_miu_GNN.py evaluate \
   model.pt path/to/data.h5 \
   --split test \
   --output test_metrics.json
@@ -138,11 +137,11 @@ python Dual_Layer_Atomic_E3_GNN.py evaluate \
 Convert an extXYZ file into the canonical schema:
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py dataset-extxyz \
+python E3_miu_GNN.py dataset-extxyz \
   input.extxyz.gz output.h5
 ```
 
-Run `python Dual_Layer_Atomic_E3_GNN.py --help` for the complete dataset,
+Run `python E3_miu_GNN.py --help` for the complete dataset,
 training, evaluation, VASP, self-test, and GUI command set.
 
 ## Dataset policy
@@ -188,8 +187,8 @@ must not be interpreted as production accuracy claims.
 
 ## Paper and technical documentation
 
-The Markdown manuscript follows the completed E(3)-GNN chapters of the research
-proposal. Each paper part maps to a deeper technical document:
+The Markdown manuscript describes the implemented E(3)-GNN system. Each paper
+part maps to a deeper user or developer reference:
 
 | Manuscript part | Technical document |
 | --- | --- |
@@ -200,21 +199,16 @@ proposal. Each paper part maps to a deeper technical document:
 | Neo composition, schema, and rights | [Datasets](docs/DATASETS.md) |
 | Optimization, validation, and measured results | [Training and validation](docs/TRAINING_AND_VALIDATION.md) |
 | Installation and reproducibility | [Reproducibility](docs/REPRODUCIBILITY.md) |
-| Proposal-to-code equation audit | [Formula crosswalk](docs/FORMULAE.md) |
-
-The original proposal is retained as
-[Research_Proposal Mixed-Granularity-Aware Graph Neural Network V5.1_Comp.pdf](Research_Proposal%20Mixed-Granularity-Aware%20Graph%20Neural%20Network%20V5.1_Comp.pdf).
-The manuscript includes only the implemented E(3)-GNN scope; later proposal
-material is intentionally excluded.
+| Mathematical definitions and code map | [Formula reference](docs/FORMULAE.md) |
 
 ## Repository layout
 
 ```text
-Dual_Layer_Atomic_E3_GNN.py   Single executable implementation
+E3_miu_GNN.py   Single executable implementation
 tests/                        Regression and physics tests
 docs/PAPER.md                 Markdown manuscript
 docs/*.md                     Technical sections and reproducibility notes
-docs/assets/                  Proposal figures and measured plots
+docs/assets/                  Architecture figures and measured plots
 Datasets/Neo/*.md             Dataset card, schema, provenance, and rights docs
 requirements.txt              Runtime and test dependencies
 ```

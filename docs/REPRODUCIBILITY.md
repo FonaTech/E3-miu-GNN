@@ -48,7 +48,7 @@ reviewed commit, and record its commit hash in every experiment report.
 The executable implementation is a single file:
 
 ```text
-Dual_Layer_Atomic_E3_GNN.py
+E3_miu_GNN.py
 ```
 
 Historical `Dual_Layer_Atomic_E3_GNN_L*.py` snapshots are excluded by
@@ -57,9 +57,9 @@ Historical `Dual_Layer_Atomic_E3_GNN_L*.py` snapshots are excluded by
 ## Fast source checks
 
 ```bash
-python -m py_compile Dual_Layer_Atomic_E3_GNN.py
+python -m py_compile E3_miu_GNN.py
 pytest -q
-python Dual_Layer_Atomic_E3_GNN.py self-test \
+python E3_miu_GNN.py self-test \
   --seed 7 \
   --output Validation/self_test.json
 ```
@@ -76,10 +76,10 @@ canonical file at the path used by the chosen config, then validate it before
 training:
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py dataset-summary \
+python E3_miu_GNN.py dataset-summary \
   Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5
 
-python Dual_Layer_Atomic_E3_GNN.py dataset-validate \
+python E3_miu_GNN.py dataset-validate \
   Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5 \
   --output Validation/neo_tiny_validation.json
 ```
@@ -87,7 +87,7 @@ python Dual_Layer_Atomic_E3_GNN.py dataset-validate \
 Audit portable-tier nesting with ordered name/path pairs:
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py dataset-tier-audit \
+python E3_miu_GNN.py dataset-tier-audit \
   --tier tiny=Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5 \
   --tier small=Datasets/Neo/canonical/neo_small_l1_l2_l3.h5 \
   --tier standard=Datasets/Neo/canonical/neo_mixed_l1_l2_l3.h5 \
@@ -102,14 +102,14 @@ manifest. Do not regenerate a split for a published benchmark.
 CPU smoke configuration:
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py train \
+python E3_miu_GNN.py train \
   --config Datasets/Neo/presets/smoke_cpu.json
 ```
 
 Portable Apple MPS smoke configuration:
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py train \
+python E3_miu_GNN.py train \
   --config Datasets/Neo/presets/portable_tier_smoke_mps.json
 ```
 
@@ -120,7 +120,7 @@ execution and gradients; it is not an accuracy-training schedule.
 For an explicit small base run:
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py train \
+python E3_miu_GNN.py train \
   --dataset path/to/canonical.h5 \
   --mode base \
   --device cpu \
@@ -140,7 +140,7 @@ python Dual_Layer_Atomic_E3_GNN.py train \
 Evaluate only a finite validated checkpoint:
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py evaluate \
+python E3_miu_GNN.py evaluate \
   Validation/base_smoke.pt \
   path/to/canonical.h5 \
   --split test \
@@ -164,7 +164,7 @@ Report all of the following with a result:
 ## GUI workflow
 
 ```bash
-python Dual_Layer_Atomic_E3_GNN.py gui
+python E3_miu_GNN.py gui
 ```
 
 The PyQt6 interface uses the same configuration builders and trainer as the

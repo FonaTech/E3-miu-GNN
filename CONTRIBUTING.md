@@ -10,7 +10,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 pytest -q
-python Dual_Layer_Atomic_E3_GNN.py self-test
+python E3_miu_GNN.py self-test
 ```
 
 ## Required checks
@@ -19,7 +19,7 @@ Before opening a pull request:
 
 1. Run `pytest -q` and the deterministic `self-test` command.
 2. Add focused tests for changed symmetry, solver, dataset, or checkpoint logic.
-3. Keep executable implementation changes in `Dual_Layer_Atomic_E3_GNN.py`.
+3. Keep executable implementation changes in `E3_miu_GNN.py`.
 4. Do not commit raw datasets, HDF5 corpora, checkpoints, VASP outputs, POTCAR
    files, local absolute paths, credentials, proxy settings, or generated
    training artifacts.

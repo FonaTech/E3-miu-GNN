@@ -2,7 +2,7 @@
 
 This document expands Sections 2 and 3 of the [paper](PAPER.md) and maps the
 three-layer design to the single-file implementation in
-[`Dual_Layer_Atomic_E3_GNN.py`](../Dual_Layer_Atomic_E3_GNN.py).
+[`E3_miu_GNN.py`](../E3_miu_GNN.py).
 
 ## Component map
 
@@ -47,10 +47,9 @@ classDiagram
 
 ## Data flow
 
-![Completed proposal architecture](assets/proposal/mixed-granularity-core.png)
+![Implemented mixed-granularity architecture](assets/proposal/mixed-granularity-core.png)
 
-The crop contains only the implemented local, domain, spin, and coupling
-concepts. Proposal-only agent and reinforcement-learning stages are excluded.
+The diagram shows the implemented local, domain, spin, and coupling components.
 
 The implemented forward path is:
 
@@ -106,16 +105,16 @@ construction, so the accelerated neighbor search does not change the graph.
 Periodic graphs use ASE or the optional MACE neighborhood backend. An edge
 vector includes its lattice image shift:
 
-$$
+```math
 \mathbf r_{ij}=\mathbf R_j+\mathbf t_{ij}-\mathbf R_i.
-$$
+```
 
 The radial envelope is
 
-$$
+```math
 f_c(r)=\frac{1}{2}\left[\cos\left(\frac{\pi r}{r_c}\right)+1\right],
 \qquad 0\le r<r_c.
-$$
+```
 
 Available radial bases are fixed Gaussian, trainable Gaussian, and spherical
 Bessel families.
@@ -137,13 +136,13 @@ representation rotations.
 
 The O(3) block has separate channels for products such as
 
-$$
+```math
 v\cdot\widehat r\rightarrow 0e,
 \qquad
 v\times\widehat r\rightarrow 1e,
 \qquad
 a\times\widehat r\rightarrow 1o.
-$$
+```
 
 Update gates receive only even invariants. This prevents a scalar gate from
 changing sign under inversion and corrupting the parity contract.
@@ -170,10 +169,10 @@ They are disabled by default and never alter evaluation inputs.
 The ground branch produces atom-wise learned corrections plus fitted atomic
 references,
 
-$$
+```math
 E_{\mathrm{short}}=\sum_i
 \left(E^{\mathrm{ref}}_{z_i}+f_E(s_i)\right).
-$$
+```
 
 References are fit with a weakly regularized least-squares solve so small
 multi-element subsets remain finite even when the composition matrix is rank
@@ -199,10 +198,10 @@ field-induced targets.
 FiLM is enabled only with parity-aware O(3). Before the first atomic pass, the
 condition is zero. Domain and spin predictions then produce
 
-$$
+```math
 c_i=\left[\tanh q_i,\tanh(\phi_i/10),\|S_i\|^2,
 \langle S_i\cdot S_j\rangle_{j\in\mathcal N(i)}\right].
-$$
+```
 
 Every core interaction has a learned linear map from $c_i$ to three hidden
 vectors: scalar scale, scalar bias, and tensor scale. Scales are bounded to
@@ -254,7 +253,7 @@ flowchart TD
     PME[PME] --> QEQ[QEq]
     D4[D4] --> QEQ
     DMI[DMI] --> SPIN[Spin]
-    DMI --> O3[O(3) parity]
+    DMI --> O3["O(3) parity"]
     L3[L=3] --> O3
     FILM[FiLM] --> O3
     FILM --> DOMAIN[At least one electric or spin domain]

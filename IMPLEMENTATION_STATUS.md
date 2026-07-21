@@ -9,7 +9,7 @@ behavior, and remaining scientific validation. The complete manuscript is in
 ## Current implementation
 
 All executable project logic is merged into
-`Dual_Layer_Atomic_E3_GNN.py`. The default GUI command launches PyQt6;
+`E3_miu_GNN.py`. The default GUI command launches PyQt6;
 `gui-tk` retains the legacy Tk interface.
 
 | Layer | Implemented components | Available outputs |
