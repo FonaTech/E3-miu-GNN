@@ -17,7 +17,7 @@ architecture.*
 ## What is implemented
 
 - **Layer 1 - local atomic representation:** scalar, polar-vector,
-  axial-vector, symmetric-traceless $L=2$, and optional $L=3$ channels with
+  axial-vector, symmetric-traceless $`L=2`$, and optional $`L=3`$ channels with
   explicit O(3) parity handling.
 - **Layer 2 - domain response:** constrained differentiable QEq, periodic
   Ewald/PME through `torch-pme`, Thole-damped self-consistent polarization,
@@ -144,6 +144,21 @@ python E3_miu_GNN.py dataset-extxyz \
 Run `python E3_miu_GNN.py --help` for the complete dataset,
 training, evaluation, VASP, self-test, and GUI command set.
 
+### Phonon workflow
+
+Launch the finite-displacement Phonopy interface with:
+
+```bash
+python Verify_Program_Phonon.py
+```
+
+Native mixed-granularity checkpoints default to `full_coupled`, so enabled
+QEq, PME, polarization, D4, FiLM, and available spin terms contribute to the
+same conservative energy used for forces. The interface also provides a
+`ground_only` comparison mode, unit-cell charge scaling, external fields,
+frozen ASE/VASP spin states, equilibrium-force subtraction, and CPU/MPS/CUDA
+device selection. SevenNet TorchScript exports remain ground-only by design.
+
 ## Dataset policy
 
 Large data files are intentionally excluded from this GitHub repository. Neo
@@ -166,7 +181,7 @@ archive-level rights confirmation or removal. See
 
 ## Verified behavior
 
-The current source tree passes 44 regression tests and the deterministic
+The current source tree passes 54 regression tests and the deterministic
 physics self-test. The checked invariants include:
 
 - rotation and reflection behavior of energy, force, dipole, and

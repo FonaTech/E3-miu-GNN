@@ -26,8 +26,8 @@ flowchart LR
 
 ## Mask-aware objective
 
-For target family $t$, prediction $\widehat{\mathbf y}_{t,k}$, reference
-$\mathbf y_{t,k}$, mask or sample weight $m_{t,k}$, and component count $d_t$,
+For target family $`t`$, prediction $`\widehat{\mathbf{y}}_{t,k}`$, reference
+$`\mathbf{y}_{t,k}`$, mask or sample weight $`m_{t,k}`$, and component count $`d_t`$,
 the implemented multi-task objective is
 
 ```math
@@ -40,7 +40,7 @@ the implemented multi-task objective is
 
 Active targets can include energy, forces, dipole, molecular and atomic
 polarizability, charges, atomic dipoles, C6, Born effective charge, magnetic
-moments, effective spin field, $J$, $D_i$, and DMI. A target contributes only
+moments, effective spin field, $`J`$, $`D_i`$, and DMI. A target contributes only
 when all three conditions hold:
 
 1. its loss weight is positive;
@@ -84,7 +84,7 @@ flowchart TD
 ```
 
 The current D4 backend is molecular, so periodic datasets disable D4. PME is
-meaningful only for periodic records and requires QEq. Direct $J$, $D_i$, or
+meaningful only for periodic records and requires QEq. Direct $`J`$, $`D_i`$, or
 DMI losses remain unavailable for the current portable Neo tiers because their
 masks are false.
 
@@ -113,7 +113,7 @@ S_{\mathrm{val}}=
 \frac{\mathrm{MAE}_t}{s_t},
 ```
 
-where $s_t$ is a fixed characteristic scale. Current scales are 1 for energy,
+where $`s_t`$ is a fixed characteristic scale. Current scales are 1 for energy,
 force, dipole, polarizability, and magnetic moment; 0.1 for charge, atomic
 dipole, atomic polarizability, and BEC; 10 for C6; and 0.01 eV for effective
 spin field and Hamiltonian parameters. A candidate cannot appear better by
@@ -176,14 +176,14 @@ differences. With the documented seed 7, the current maximum errors are:
 | Check | Maximum error |
 | --- | ---: |
 | Rotation: energy | 0 |
-| Rotation: force | $3.47\times10^{-18}$ |
-| Rotation: dipole | $2.61\times10^{-15}$ |
-| Rotation: polarizability | $2.22\times10^{-16}$ |
+| Rotation: force | $`3.47\times10^{-18}`$ |
+| Rotation: dipole | $`2.61\times10^{-15}`$ |
+| Rotation: polarizability | $`2.22\times10^{-16}`$ |
 | Reflection: energy, force, dipole, polarizability | 0 |
 | Time reversal: spin energy and effective field | 0 |
 | Charge conservation | 0 e |
-| QEq stationarity residual | $9.39\times10^{-12}$ |
-| Conservative-force finite difference | $8.15\times10^{-12}$ eV/angstrom |
+| QEq stationarity residual | $`9.39\times10^{-12}`$ |
+| Conservative-force finite difference | $`8.15\times10^{-12}`$ eV/angstrom |
 
 ![Deterministic validation margins](assets/generated/physics-self-tests.png)
 
@@ -231,7 +231,7 @@ solver configuration.
 
 - Symmetry and derivative tests establish structural correctness, not
   predictive coverage across all elements.
-- The portable corpus has no direct active $J$, $D_i$, or DMI labels.
+- The portable corpus has no direct active $`J`$, $`D_i`$, or DMI labels.
 - The current D4 implementation does not provide periodic lattice dispersion.
 - No converged phonon spectrum or production molecular-dynamics stability
   study is reported.

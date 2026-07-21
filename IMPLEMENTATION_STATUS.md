@@ -21,11 +21,11 @@ All executable project logic is merged into
 
 The active Hamiltonian is
 
-$$
+```math
 E_{\mathrm{tot}}=
 E_{\mathrm{short}}+E_{\mathrm{QEq}}+E_{\mathrm{PME}}
 +E_{\mathrm{D4}}+E_{\mathrm{spin}}+E_{\mathrm{resp}}.
-$$
+```
 
 Forces, BEC, and spin effective fields are derivatives of the assembled energy,
 not post-processing corrections.

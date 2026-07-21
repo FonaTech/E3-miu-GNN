@@ -84,14 +84,14 @@ E_{\mathrm{DFT}+U}
 ```
 
 Equations (1)-(4) provide physical background but are not embedded as an explicit
-DFT or DFT+$U$ solver in E(3)-mu-GNN. The implemented model instead learns an
+DFT or DFT+U solver in E(3)-mu-GNN. The implemented model instead learns an
 effective atomistic Hamiltonian from labelled calculations while enforcing
 geometric and physical structure in its representation and solver layers.
 
 ### 1.2 Why a local scalar model is insufficient
 
 An ML interatomic potential approximates the Born-Oppenheimer potential energy
-surface $E(\mathbf R)$ and evaluates forces by differentiation. A strictly
+surface $`E(\mathbf R)`$ and evaluates forces by differentiation. A strictly
 local decomposition,
 
 ```math
@@ -100,7 +100,7 @@ E_{\mathrm{local}}(\mathbf R)=\sum_i \varepsilon_i
 \tag{5}
 ```
 
-is effective when interactions outside the cutoff $r_c$ are screened or can be
+is effective when interactions outside the cutoff $`r_c`$ are screened or can be
 absorbed into local environments. It becomes incomplete when the state depends
 on a global charge constraint, reciprocal-space electrostatics, collective
 polarization, or spin order. Treating all such effects as an unconstrained
@@ -151,10 +151,10 @@ electronic coupling network.*
 
 ### 3.1 Inputs, graph, and transformation contract
 
-For each structure $g$, the model receives atomic numbers $z_i$, Cartesian
-positions $\mathbf R_i$, cell $\mathbf A_g$, periodic flags, total charge
-$Q_g$, external field $\boldsymbol{\mathcal E}_g$, and optional unit spin
-vectors $\mathbf S_i$. Directed edges connect neighbors inside a cutoff,
+For each structure $`g`$, the model receives atomic numbers $`z_i`$, Cartesian
+positions $`\mathbf R_i`$, cell $`\mathbf A_g`$, periodic flags, total charge
+$`Q_g`$, external field $`\boldsymbol{\mathcal E}_g`$, and optional unit spin
+vectors $`\mathbf S_i`$. Directed edges connect neighbors inside a cutoff,
 
 ```math
 \mathbf r_{ij}=\mathbf R_j+\mathbf t_{ij}-\mathbf R_i,
@@ -165,7 +165,7 @@ r_{ij}=\|\mathbf r_{ij}\|,
 \tag{6}
 ```
 
-where $\mathbf t_{ij}$ is the periodic image shift. Translation invariance
+where $`\mathbf t_{ij}`$ is the periodic image shift. Translation invariance
 follows from relative positions. The learned energy is invariant under O(3),
 while vector and tensor outputs transform in their corresponding
 representations.
@@ -217,10 +217,10 @@ Cartesian basis. Node state contains
 \tag{8}
 ```
 
-with scalar $\mathbf s_i$, polar vector $\mathbf v_i$, axial vector
-$\mathbf a_i$, five-component symmetric-traceless $L=2$ tensor
-$\mathbf T_i^{(2)}$, and optional seven-component symmetric-traceless $L=3$
-tensor $\mathbf T_i^{(3)}$. Examples of explicit parity-preserving channels
+with scalar $`\mathbf s_i`$, polar vector $`\mathbf v_i`$, axial vector
+$`\mathbf a_i`$, five-component symmetric-traceless $`L=2`$ tensor
+$`\mathbf T_i^{(2)}`$, and optional seven-component symmetric-traceless $`L=3`$
+tensor $`\mathbf T_i^{(3)}`$. Examples of explicit parity-preserving channels
 are
 
 ```math
@@ -238,8 +238,8 @@ are
 
 Radial filters use fixed Gaussian, trainable Gaussian, or Bessel bases and a
 cosine cutoff. Aggregation is a mean over incoming edges; update gates depend
-only on parity-even invariants such as $\|\mathbf v\|^2$,
-$\|\mathbf a\|^2$, and tensor norms.
+only on parity-even invariants such as $`\|\mathbf v\|^2`$,
+$`\|\mathbf a\|^2`$, and tensor norms.
 
 The short-range energy is
 
@@ -273,8 +273,9 @@ converged phonon benchmark.
 ### 3.3 Field-response parameterization
 
 Under the Born-Oppenheimer approximation, a static electric field is treated as
-a perturbation $\widehat V_{\mathrm{ext}}=-\widehat{\boldsymbol\mu}\cdot
-\boldsymbol{\mathcal E}$. Retaining second order gives
+a perturbation
+$`\widehat V_{\mathrm{ext}}=-\widehat{\boldsymbol\mu}\cdot\boldsymbol{\mathcal E}`$.
+Retaining second order gives
 
 ```math
 E(\mathbf R,\boldsymbol{\mathcal E})
@@ -286,7 +287,7 @@ E(\mathbf R,\boldsymbol{\mathcal E})
 \tag{12}
 ```
 
-The response network reads scalar, polar, and $L=2$ features. It predicts raw
+The response network reads scalar, polar, and $`L=2`$ features. It predicts raw
 charges, permanent atomic dipoles, electronegativities, positive hardnesses,
 C6 scaling, and atomic polarizabilities. The latter are decomposed into an
 isotropic and symmetric-traceless part,
@@ -310,7 +311,7 @@ The total dipole combines permanent, charge-displacement, and induced terms,
 \tag{14}
 ```
 
-For non-periodic structures $\mathbf R_c$ is the geometric center. Periodic
+For non-periodic structures $`\mathbf R_c`$ is the geometric center. Periodic
 relative positions use the minimum-image finite-cell convention recorded in
 the data metadata.
 
@@ -345,7 +346,7 @@ K_{ij}=\frac{k_e}{\sqrt{r_{ij}^2+\sigma^2}},\qquad i\ne j.
 \tag{17}
 ```
 
-Periodic graphs obtain $\mathbf K$ from an Ewald calculator. The reciprocal
+Periodic graphs obtain $`\mathbf K`$ from an Ewald calculator. The reciprocal
 contribution has the familiar form
 
 ```math
@@ -358,11 +359,11 @@ e^{-\|\mathbf k\|^2/(4\alpha_E^2)}
 ```
 
 Rather than solve an indefinite KKT system, the implementation eliminates the
-constraint. Let $\mathbf B$ be an analytic Helmert basis satisfying
-$\mathbf 1^{\mathsf T}\mathbf B=0$ and
-$\mathbf B^{\mathsf T}\mathbf B=\mathbf I$. With
-$\mathbf q=\mathbf q_0+\mathbf B\mathbf z$ and
-$\mathbf 1^{\mathsf T}\mathbf q_0=Q$,
+constraint. Let $`\mathbf B`$ be an analytic Helmert basis satisfying
+$`\mathbf 1^{\mathsf T}\mathbf B=0`$ and
+$`\mathbf B^{\mathsf T}\mathbf B=\mathbf I`$. With
+$`\mathbf q=\mathbf q_0+\mathbf B\mathbf z`$ and
+$`\mathbf 1^{\mathsf T}\mathbf q_0=Q`$,
 
 ```math
 \left(\mathbf B^{\mathsf T}\mathbf H\mathbf B\right)\mathbf z
@@ -399,7 +400,7 @@ and
 \tag{21}
 ```
 
-The fixed point $\mathbf p=\mathbf A(\mathbf E_{\mathrm{drv}}+\mathbf T\mathbf p)$
+The fixed point $`\mathbf p=\mathbf A(\mathbf E_{\mathrm{drv}}+\mathbf T\mathbf p)`$
 is linear. The implementation solves its symmetric transformed system exactly,
 
 ```math
@@ -433,14 +434,14 @@ and the GUI disables the switch for a dataset containing periodic structures.
 
 ### 3.5 Layer 3: time-reversal-aware spin Hamiltonian
 
-A spin is an axial vector: under an orthogonal spatial transform $\mathbf Q$,
+A spin is an axial vector: under an orthogonal spatial transform $`\mathbf Q`$,
 
 ```math
 \mathbf S_i\mapsto \det(\mathbf Q)\mathbf Q\mathbf S_i,
 \tag{24}
 ```
 
-while time reversal maps $\mathbf S_i\mapsto-\mathbf S_i$. The implemented
+while time reversal maps $`\mathbf S_i\mapsto-\mathbf S_i`$. The implemented
 spin energy is
 
 ```math
@@ -452,8 +453,8 @@ E_{\mathrm{spin}}
 \tag{25}
 ```
 
-$J_{ij}$ is a scalar pair readout. $\mathbf D_i$ is symmetric and explicitly
-made traceless. $\mathbf D_{ij}^{\mathrm{DMI}}$ is an axial vector assembled
+$`J_{ij}`$ is a scalar pair readout. $`\mathbf D_i`$ is symmetric and explicitly
+made traceless. $`\mathbf D_{ij}^{\mathrm{DMI}}`$ is an axial vector assembled
 from axial features and cross products of polar channels. Every term in
 Equation (25) is even under simultaneous spin reversal. The predicted magnetic
 moment is
@@ -486,7 +487,7 @@ The first domain/spin pass produces a four-component condition at every atom,
 \tag{28}
 ```
 
-Each atomic interaction block maps $\mathbf c_i$ to scalar scale, scalar bias,
+Each atomic interaction block maps $`\mathbf c_i`$ to scalar scale, scalar bias,
 and tensor scale. The actual bounded modulation is
 
 ```math
@@ -585,7 +586,7 @@ active-label counts are:
 | Spins and magnetic moments | 12,100 |
 | Effective spin field | 100 |
 
-Direct $J$, $D_i$, and DMI aggregate labels are absent from the portable tiers;
+Direct $`J`$, $`D_i`$, and DMI aggregate labels are absent from the portable tiers;
 their masks remain false. This is not interpreted as a zero physical value.
 
 ![Dataset tiers](assets/generated/dataset-tiers.png)
@@ -602,8 +603,8 @@ split boundaries.
 
 ### 4.3 Mask-aware objective
 
-For target $t$, mask $m_{t,k}$, prediction $\widehat{\mathbf y}_{t,k}$, and
-reference $\mathbf y_{t,k}$, the training objective is
+For target $`t`$, mask $`m_{t,k}`$, prediction $`\widehat{\mathbf{y}}_{t,k}`$, and
+reference $`\mathbf{y}_{t,k}`$, the training objective is
 
 ```math
 \mathcal L
@@ -614,10 +615,10 @@ reference $\mathbf y_{t,k}$, the training objective is
 \tag{33}
 ```
 
-where $d_t$ is the number of components per labelled item. The implemented
+where $`d_t`$ is the number of components per labelled item. The implemented
 target set includes energy, forces, dipole, molecular and atomic
 polarizability, charges, atomic dipoles, C6, BEC, magnetic moments, effective
-spin fields, and available $J/D_i$/DMI targets. Energy loss is evaluated per
+spin fields, and available $`J/D_i`$/DMI targets. Energy loss is evaluated per
 atom so large cells do not dominate solely by size.
 
 Checkpoint selection and Auto Research use a weight-independent normalized
@@ -631,7 +632,7 @@ S_{\mathrm{val}}
 \tag{34}
 ```
 
-with fixed characteristic scales $s_t$. A candidate cannot improve its ranking
+with fixed characteristic scales $`s_t`$. A candidate cannot improve its ranking
 merely by reducing its own loss weight.
 
 ### 4.4 Optimization modes
@@ -660,14 +661,14 @@ derivatives. With the documented seed 7, the current maximum errors are:
 | Check | Maximum error |
 | --- | ---: |
 | Rotation: energy | 0 |
-| Rotation: force | $3.47\times10^{-18}$ |
-| Rotation: dipole | $2.61\times10^{-15}$ |
-| Rotation: polarizability | $2.22\times10^{-16}$ |
+| Rotation: force | $`3.47\times10^{-18}`$ |
+| Rotation: dipole | $`2.61\times10^{-15}`$ |
+| Rotation: polarizability | $`2.22\times10^{-16}`$ |
 | Reflection: energy/force/dipole/polarizability | 0 |
 | Time reversal: spin energy/effective field | 0 |
 | Charge conservation | 0 e |
-| QEq stationarity residual | $9.39\times10^{-12}$ |
-| Conservative-force finite difference | $8.15\times10^{-12}$ eV/A |
+| QEq stationarity residual | $`9.39\times10^{-12}`$ |
+| Conservative-force finite difference | $`8.15\times10^{-12}`$ eV/A |
 
 ![Physics validation](assets/generated/physics-self-tests.png)
 
@@ -711,7 +712,7 @@ elements or every source domain.
 Several boundaries are material when interpreting results:
 
 - The current D4 backend is molecular and is not a periodic dispersion model.
-- Direct $J$, $D_i$, and DMI labels are not present in the portable Neo tiers;
+- Direct $`J`$, $`D_i`$, and DMI labels are not present in the portable Neo tiers;
   the Layer-3 Hamiltonian is functionally and symmetry validated but does not
   yet have a paper-grade cross-material calibration result.
 - Absolute energies from different electronic-structure methods remain

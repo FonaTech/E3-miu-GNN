@@ -123,13 +123,13 @@ Bessel families.
 
 | Channel | Dimension per hidden channel | Spatial character | Example source |
 | --- | ---: | --- | --- |
-| Scalar $s$ | 1 | $0e$ | element and invariant messages |
-| Polar vector $v$ | 3 | $1o$ | displacement direction |
-| Axial vector $a$ | 3 | $1e$ | cross product of polar vectors |
-| ST rank-2 $T^{(2)}$ | 5 | $2e$ | traceless part of $\widehat r\otimes\widehat r$ |
-| ST rank-3 $T^{(3)}$ | 7 | $3o$ | optional cubic directional basis |
+| Scalar $`s`$ | 1 | $`0e`$ | element and invariant messages |
+| Polar vector $`v`$ | 3 | $`1o`$ | displacement direction |
+| Axial vector $`a`$ | 3 | $`1e`$ | cross product of polar vectors |
+| ST rank-2 $`T^{(2)}`$ | 5 | $`2e`$ | traceless part of $`\widehat r\otimes\widehat r`$ |
+| ST rank-3 $`T^{(3)}`$ | 7 | $`3o`$ | optional cubic directional basis |
 
-The fixed $L=2$ basis is orthonormal in Cartesian tensor space. The $L=3$
+The fixed $`L=2`$ basis is orthonormal in Cartesian tensor space. The $`L=3`$
 basis is built deterministically by symmetrizing cubic monomials, projecting
 out all traces, and applying Gram-Schmidt. A fixed basis avoids run-dependent
 representation rotations.
@@ -186,7 +186,7 @@ typed:
 - scalar features produce raw charge, electronegativity, hardness, isotropic
   polarizability, and C6 scale;
 - polar features produce permanent atomic dipoles;
-- $L=2$ features produce the anisotropic polarizability tensor; and
+- $`L=2`$ features produce the anisotropic polarizability tensor; and
 - axial features condition DMI in the spin layer.
 
 The branch separation permits base-only training, frozen-ground response
@@ -203,10 +203,10 @@ c_i=\left[\tanh q_i,\tanh(\phi_i/10),\|S_i\|^2,
 \langle S_i\cdot S_j\rangle_{j\in\mathcal N(i)}\right].
 ```
 
-Every core interaction has a learned linear map from $c_i$ to three hidden
+Every core interaction has a learned linear map from $`c_i`$ to three hidden
 vectors: scalar scale, scalar bias, and tensor scale. Scales are bounded to
-$\pm0.25$ through `tanh`; tensor modulation is shared across polar, axial,
-$L=2$, and optional $L=3$ channels. The outer loop records mean graph-wise
+$`\pm0.25`$ through `tanh`; tensor modulation is shared across polar, axial,
+$`L=2`$, and optional $`L=3`$ channels. The outer loop records mean graph-wise
 charge change as `coupling_residual` and can stop before the configured maximum.
 
 ## Energy and derivative order

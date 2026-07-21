@@ -22,7 +22,7 @@ solvers.
 | ---: | --- | --- | --- | --- |
 | 1 | many-body, Kohn-Sham, density, XC, LDA/GGA | (1)-(2) | scientific background only | training-label provenance, no DFT solver |
 | 2 | Kohn-Sham versus quasiparticle gap | (3) | scientific background only | no electronic gap solver |
-| 3 | DFT+$U$ correction | (4) | dataset-method context | VASP job metadata; no DFT+$U$ solver |
+| 3 | DFT+U correction | (4) | dataset-method context | VASP job metadata; no DFT+U solver |
 | 4 | Hessian and dynamical matrix | (11) | derivative interface implemented | `MixedGranularityE3GNN`, autograd outputs |
 | 5 | equivariant tensor-product message | (7)-(9) | implemented in selected real Cartesian O(3) products | `FastEquivariantCoreO3` |
 | 6-8 | field perturbation and second-order energy expansion | (12) | implemented through second order | response-energy assembly |
@@ -87,7 +87,7 @@ E_g^{\mathrm{QP}}=I-A=E_g^{\mathrm{KS}}+\Delta_{\mathrm{xc}}.
 
 This background equation is not a model output in the current implementation.
 
-## Formula 3: DFT+$U$
+## Formula 3: DFT+U
 
 ```math
 E_{\mathrm{DFT}+U}
@@ -99,8 +99,8 @@ E_{\mathrm{DFT}+U}
 \qquad U_{\mathrm{eff}}=U-J.
 ```
 
-The local VASP workflow records PBE+$U$ settings for Ni-bearing calculations,
-but the neural network is not itself a DFT+$U$ implementation.
+The local VASP workflow records PBE+U settings for Ni-bearing calculations,
+but the neural network is not itself a DFT+U implementation.
 
 ## Formula 4: Hessian and dynamical matrix
 
@@ -161,13 +161,13 @@ The implementation uses the resulting effective energy expansion; it does not
 represent the electronic wavefunction factor explicitly.
 
 The field-coupling convention defines
-$\widehat V_{\mathrm{ext}}=-\widehat{\boldsymbol\mu}\cdot
-\boldsymbol{\mathcal E}$ but later prints
-$\widehat H=\widehat H_0-\widehat V_{\mathrm{ext}}=
-\widehat H_0-\widehat{\boldsymbol\mu}\cdot\boldsymbol{\mathcal E}$, whose two
+$`\widehat V_{\mathrm{ext}}=-\widehat{\boldsymbol\mu}\cdot\boldsymbol{\mathcal E}`$
+but later prints
+$`\widehat H=\widehat H_0-\widehat V_{\mathrm{ext}}=\widehat H_0-\widehat{\boldsymbol\mu}\cdot\boldsymbol{\mathcal E}`$,
+whose two
 equalities have inconsistent signs. The normalized equation above and the code
 use the physically consistent relation
-$\widehat H=\widehat H_0+\widehat V_{\mathrm{ext}}$.
+$`\widehat H=\widehat H_0+\widehat V_{\mathrm{ext}}`$.
 
 ## Formula 7: second-order expansion
 
@@ -198,7 +198,7 @@ E^{(2)}
 ```
 
 The usual sum-over-states expression motivates
-$\boldsymbol\alpha$. The network directly parameterizes the response tensor
+$`\boldsymbol\alpha`$. The network directly parameterizes the response tensor
 instead of learning excited-state wavefunctions.
 
 ## Formula 9: effective field Hamiltonian and response heads
@@ -222,7 +222,7 @@ E_{\mathrm{eff}}(\mathbf R,\boldsymbol{\mathcal E})
 ```
 
 The implementation multiplies the polarizability term by the documented unit
-conversion when $\alpha$ is stored as a volume in angstrom cubed.
+conversion when $`\alpha`$ is stored as a volume in angstrom cubed.
 
 ## Formula 10: force under electric field
 
@@ -260,7 +260,7 @@ Z^*_{i,\alpha\beta}
 ```
 
 and the first-order field force follows by contraction with
-$\boldsymbol{\mathcal E}$. The exact stored BEC convention remains part of each
+$`\boldsymbol{\mathcal E}`$. The exact stored BEC convention remains part of each
 source's metadata.
 
 ## Formula 12: long-range field and equilibrium response
@@ -363,7 +363,7 @@ E_{\mathrm{spin}}
 (\mathbf S_i\times\mathbf S_j).
 ```
 
-Every term is even under simultaneous $\mathbf S_i\mapsto-\mathbf S_i$.
+Every term is even under simultaneous $`\mathbf S_i\mapsto-\mathbf S_i`$.
 
 ## Formula 17: conditioned message update
 
@@ -402,7 +402,7 @@ The implemented scalar update bounds the scale perturbation,
 \odot\mathbf s_i+\boldsymbol\beta_i^{(s)},
 ```
 
-while polar, axial, $L=2$, and optional $L=3$ tensors receive bounded
+while polar, axial, $`L=2`$, and optional $`L=3`$ tensors receive bounded
 multiplicative modulation without an equivariance-breaking tensor bias.
 
 ## Formula 19: comprehensive objective

@@ -34,7 +34,7 @@ gap,
 E_g^{\mathrm{QP}}=I-A=E_g^{\mathrm{KS}}+\Delta_{\mathrm{xc}}.
 ```
 
-Localized correlated orbitals are often treated with a DFT+$U$ correction,
+Localized correlated orbitals are often treated with a DFT+U correction,
 
 ```math
 E_{\mathrm{DFT}+U}=E_{\mathrm{DFT}}
@@ -44,7 +44,7 @@ E_{\mathrm{DFT}+U}=E_{\mathrm{DFT}}
 ```
 
 These equations motivate the training labels and physical structure of the
-model. The software does not contain a Kohn-Sham or DFT+$U$ solver. It learns
+model. The software does not contain a Kohn-Sham or DFT+U solver. It learns
 an effective atomistic Hamiltonian from calculations performed upstream.
 
 ```mermaid
@@ -65,7 +65,7 @@ E_{\mathrm{local}}(\mathbf R)
 =\sum_i\varepsilon_i\!\left(\mathcal N_i^{r_c}\right),
 ```
 
-where $\mathcal N_i^{r_c}$ is the neighborhood inside a finite cutoff. This
+where $`\mathcal N_i^{r_c}`$ is the neighborhood inside a finite cutoff. This
 form is efficient and is appropriate when distant interactions are screened or
 can be represented through local correlations. It is not a complete state
 description when the energy depends explicitly on a global charge constraint,
@@ -79,8 +79,8 @@ Those contracts must be preserved before a final scalar energy is formed.
 
 ## Why E(3) and O(3) equivariance matter
 
-For an orthogonal transformation $\mathbf Q\in O(3)$ and translation
-$\mathbf t$, positions transform as
+For an orthogonal transformation $`\mathbf Q\in O(3)`$ and translation
+$`\mathbf t`$, positions transform as
 
 ```math
 \mathbf R_i' = \mathbf Q\mathbf R_i+\mathbf t.
@@ -118,7 +118,7 @@ smallest granularity that retains its governing constraints.
 | --- | --- | --- | --- |
 | Layer 1 | local atoms and edges | short-range chemical environment | parity-aware equivariant message passing and atomic energy |
 | Layer 2 | molecular or periodic domain | charge, electric field, polarization, dispersion | constrained QEq, Ewald/PME, Thole equilibrium, molecular D4 |
-| Layer 3 | spin-bearing sites and pairs | exchange and spin-lattice energy | $J_{ij}$, $\mathbf D_i$, DMI, moment and effective-field heads |
+| Layer 3 | spin-bearing sites and pairs | exchange and spin-lattice energy | $`J_{ij}`$, $`\mathbf D_i`$, DMI, moment and effective-field heads |
 | Coupling | atom-wise shared state | electronic and magnetic feedback | bounded FiLM modulation of Layer-1 features |
 
 ![Implemented three-layer architecture](assets/proposal/system-overview-core.png)

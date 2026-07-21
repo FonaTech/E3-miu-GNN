@@ -43,7 +43,7 @@ are recorded in the source declaration and license ledger linked above.
 
 ## Canonical ragged HDF5
 
-Let $S$ be the number of structures and $A$ the total number of packed atoms.
+Let $`S`$ be the number of structures and $`A`$ the total number of packed atoms.
 The schema stores geometry once and indexes variable-size structures with
 `atom_ptr`.
 
@@ -62,15 +62,15 @@ flowchart TB
     R --> MD[metadata: source, method, group, split, provenance]
 ```
 
-For structure $i$, atom-level arrays use the half-open interval
+For structure $`i`$, atom-level arrays use the half-open interval
 
 ```math
 \mathcal I_i=
 [\mathrm{atom\_ptr}_i,\mathrm{atom\_ptr}_{i+1}).
 ```
 
-Every label $t$ has a structure mask $m_{t,i}\in\{0,1\}$. The loss may read a
-target only when $m_{t,i}=1$:
+Every label $`t`$ has a structure mask $`m_{t,i}\in\{0,1\}`$. The loss may read a
+target only when $`m_{t,i}=1`$:
 
 ```math
 \mathcal L_t=
@@ -88,14 +88,14 @@ must never be interpreted as zero observations.
 | --- | --- | --- |
 | Geometry | positions, cell | angstrom |
 | Layer 1 | energy; forces | eV; eV/angstrom |
-| Electric response | total charge, charges, dipole, atomic dipoles | $e$; $e\,\mathrm{angstrom}$ |
-| Tensor response | polarizability, atomic polarizability; BEC | $\mathrm{angstrom}^3$; $e$ |
-| Dispersion | C6 | eV $\mathrm{angstrom}^6$ |
-| Layer 3 | spins; magnetic moments; effective field | dimensionless; $\mu_B$; eV/spin |
-| Reserved spin targets | $J$, $D_i$, DMI | eV |
+| Electric response | total charge, charges, dipole, atomic dipoles | $`e`$; $`e\,\mathrm{angstrom}`$ |
+| Tensor response | polarizability, atomic polarizability; BEC | $`\mathrm{angstrom}^3`$; $`e`$ |
+| Dispersion | C6 | eV $`\mathrm{angstrom}^6`$ |
+| Layer 3 | spins; magnetic moments; effective field | dimensionless; $`\mu_B`$; eV/spin |
+| Reserved spin targets | $`J`$, $`D_i`$, DMI | eV |
 
 The current portable tiers contain spins, magnetic moments, and 100 effective
-spin-field records. Direct aggregate $J$, $D_i$, and DMI masks are all false.
+spin-field records. Direct aggregate $`J`$, $`D_i`$, and DMI masks are all false.
 The architecture can consume those targets after compatible VASP collections
 are added, but their absence must not be described as fully supervised
 three-layer magnetic calibration.

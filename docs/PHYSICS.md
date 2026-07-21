@@ -10,12 +10,12 @@ of the [paper](PAPER.md).
 | Position | angstrom |
 | Energy | eV |
 | Force | eV/angstrom |
-| Charge and BEC | elementary charge $e$ |
-| Dipole | $e\,\mathrm{angstrom}$ |
-| Polarizability | $\mathrm{angstrom}^3$ |
-| C6 | eV $\mathrm{angstrom}^6$ |
+| Charge and BEC | elementary charge $`e`$ |
+| Dipole | $`e\,\mathrm{angstrom}`$ |
+| Polarizability | $`\mathrm{angstrom}^3`$ |
+| C6 | eV $`\mathrm{angstrom}^6`$ |
 | Electric field | V/angstrom |
-| Magnetic moment | $\mu_B$ |
+| Magnetic moment | $`\mu_B`$ |
 | Spin Hamiltonian parameters | eV |
 
 The implementation uses
@@ -34,7 +34,7 @@ c_\alpha=0.06944615422483141
 
 ## Electric perturbation response
 
-For a static field $\mathcal E$, the implemented second-order response is
+For a static field $`\mathcal E`$, the implemented second-order response is
 
 ```math
 E_{\mathrm{resp}}
@@ -51,14 +51,14 @@ polarization solver is active, induced dipoles:
 +\sum_iq_i(R_i-R_c)+\sum_ip_i^{\mathrm{ind}}.
 ```
 
-The factor $c_\alpha$ is omitted only when a configuration explicitly declares
+The factor $`c_\alpha`$ is omitted only when a configuration explicitly declares
 that polarizability is already in energy-per-field-squared units.
 
 ## Charge equilibration
 
 ### Variational model
 
-The learned electronegativity $\chi_i$ and positive hardness $\eta_i$ define
+The learned electronegativity $`\chi_i`$ and positive hardness $`\eta_i`$ define
 
 ```math
 E(q)=\sum_i\left(\chi_iq_i+\frac{1}{2}\eta_iq_i^2
@@ -78,20 +78,20 @@ Without periodic PME,
 K_{ij}=\frac{k_e}{\sqrt{r_{ij}^2+\sigma^2}},\quad K_{ii}=0.
 ```
 
-The external scalar potential is $\phi_i^{\mathrm{ext}}=-R_i\cdot\mathcal E$
+The external scalar potential is $`\phi_i^{\mathrm{ext}}=-R_i\cdot\mathcal E`$
 after centering non-periodic coordinates.
 
 ### Exact constrained solve
 
-Let $H=\mathrm{diag}(\eta)+K$, $b=\chi+\phi^{\mathrm{ext}}$,
-and let $B$ span the neutral subspace. The exact constrained variable is
+Let $`H=\mathrm{diag}(\eta)+K`$, $`b=\chi+\phi^{\mathrm{ext}}`$,
+and let $`B`$ span the neutral subspace. The exact constrained variable is
 
 ```math
 q=q_0+Bz,\qquad
 (B^{\mathsf T}HB)z=-B^{\mathsf T}(Hq_0+b).
 ```
 
-`DifferentiableQEq` constructs $B$ analytically as a Helmert basis. This avoids
+`DifferentiableQEq` constructs $`B`$ analytically as a Helmert basis. This avoids
 QR on Apple MPS and avoids the indefinite backward path of a KKT/LU solve. A
 minimum-eigenvalue check is evaluated robustly on CPU float64. Its eigenvector
 defines an on-device Rayleigh quotient so first derivatives remain connected
@@ -135,7 +135,7 @@ calculation to numerical precision.
 ### Short-range damping
 
 Bare point polarizabilities can diverge at short separation. For isotropic
-volumes $\alpha_i$, the dimensionless separation and damping factors are
+volumes $`\alpha_i`$, the dimensionless separation and damping factors are
 
 ```math
 u_{ij}=\frac{r_{ij}}{(\alpha_i\alpha_j)^{1/6}},
@@ -155,7 +155,7 @@ field of permanent atomic dipoles.
 
 ### Symmetric exact equilibrium
 
-With block-diagonal polarizability $A$, solve
+With block-diagonal polarizability $`A`$, solve
 
 ```math
 (I-A^{1/2}TA^{1/2})x=A^{1/2}E_{\mathrm{drv}},
@@ -199,7 +199,7 @@ E_{\mathrm{spin}}
 
 ### Heisenberg exchange
 
-$J_{ij}$ is a scalar readout of symmetric pair features:
+$`J_{ij}`$ is a scalar readout of symmetric pair features:
 
 ```math
 x_{ij}=[s_i+s_j,|s_i-s_j|,\mathrm{RBF}(r_{ij})],
@@ -208,7 +208,7 @@ x_{ij}=[s_i+s_j,|s_i-s_j|,\mathrm{RBF}(r_{ij})],
 
 ### Single-ion anisotropy
 
-An $L=2$ readout is mapped back to Cartesian form, symmetrized, and made
+An $`L=2`$ readout is mapped back to Cartesian form, symmetrized, and made
 traceless:
 
 ```math
@@ -224,7 +224,7 @@ O(3) parity and explicit DMI activation.
 
 ### Time reversal
 
-Under $S_i\mapsto-S_i$,
+Under $`S_i\mapsto-S_i`$,
 
 ```math
 S_i\cdot S_j\mapsto S_i\cdot S_j,
@@ -234,8 +234,8 @@ S_i^{\mathsf T}D_iS_i\mapsto S_i^{\mathsf T}D_iS_i,
 S_i\times S_j\mapsto S_i\times S_j.
 ```
 
-Thus $E_{\mathrm{spin}}$ is even, while
-$H_i^{\mathrm{eff}}=-\partial E_{\mathrm{spin}}/\partial S_i$ is odd. Both
+Thus $`E_{\mathrm{spin}}`$ is even, while
+$`H_i^{\mathrm{eff}}=-\partial E_{\mathrm{spin}}/\partial S_i`$ is odd. Both
 properties are exact in the deterministic self-test.
 
 ## Conservative derivative observables
