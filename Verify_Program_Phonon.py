@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import argparse
+import gzip
+import hashlib
 import os
 import json
 import queue
 import re
+import sys
 import threading
 import time
 import traceback
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -900,6 +905,16 @@ def compute_phonon_thermo_phonopy(
     if len(mesh) != 3 or any(value <= 0 for value in mesh):
         raise ValueError("dos_mesh must contain three positive integers")
     phonon.run_mesh(mesh=np.asarray(mesh, dtype=int))
+    mesh_result = phonon.get_mesh_dict() or {}
+    mesh_frequencies = np.asarray(mesh_result.get("frequencies", []), dtype=float)
+    mesh_qpoints = np.asarray(mesh_result.get("qpoints", []), dtype=float)
+    mesh_weights = np.asarray(mesh_result.get("weights", []), dtype=float)
+    if mesh_frequencies.size and not np.isfinite(mesh_frequencies).all():
+        raise FloatingPointError("Phonopy mesh contains non-finite frequencies")
+    if mesh_weights.size and (
+        not np.isfinite(mesh_weights).all() or np.any(mesh_weights < 0.0)
+    ):
+        raise FloatingPointError("Phonopy mesh contains invalid q-point weights")
     requested_dos_sigma = None if dos_sigma_THz in (None, "", "none") else float(dos_sigma_THz)
     if requested_dos_sigma is not None and (
         not np.isfinite(requested_dos_sigma) or requested_dos_sigma <= 0.0
@@ -907,9 +922,6 @@ def compute_phonon_thermo_phonopy(
         raise ValueError("dos_sigma_THz must be a positive finite value")
     effective_dos_sigma = requested_dos_sigma
     if effective_dos_sigma is None:
-        mesh_frequencies = np.asarray(
-            (phonon.get_mesh_dict() or {}).get("frequencies", []), dtype=float
-        )
         if mesh_frequencies.size:
             frequency_span = float(np.nanmax(mesh_frequencies) - np.nanmin(mesh_frequencies))
             if not np.isfinite(frequency_span):
@@ -1023,12 +1035,477 @@ def compute_phonon_thermo_phonopy(
             "fmin_THz": fmin,
             "fmax_THz": fmax,
         },
+        "mesh": {
+            "qpoints": _to_list(mesh_qpoints),
+            "weights": _to_list(mesh_weights),
+            "frequencies_THz": _to_list(mesh_frequencies),
+        },
         "dos": {
             "frequency_points_THz": _to_list(dos.get("frequency_points", [])),
             "total_dos": _to_list(dos.get("total_dos", [])),
         },
         "thermal": thermal_out,
     }
+
+
+PHONONDB_REFERENCE_URL = (
+    "https://github.com/janosh/matbench-discovery/releases/download/v1.0.0/"
+    "kappa-parity-phonondb-v1-base.json.gz"
+)
+PHONONDB_SEVENNET_URL = (
+    "https://github.com/janosh/matbench-discovery/releases/download/v1.0.0/"
+    "kappa-parity-phonondb-v1-model-sevennet-omni-i12.json.gz"
+)
+
+# Declared before model training. These chemically diverse materials have no
+# exact material-ID overlap with Neo Standard and therefore form a small blind
+# benchmark. The CLI can also run all 103 PhononDB structures.
+DEFAULT_PHONONDB_BENCHMARK_IDS: Tuple[str, ...] = (
+    "mp-2472",      # SrO, rocksalt
+    "mp-23703",     # LiH, rocksalt
+    "mp-1008559",   # BP, wurtzite
+    "mp-8062",      # SiC, zincblende
+    "mp-1700",      # AlN, zincblende
+    "mp-8883",      # GaAs, wurtzite
+    "mp-8884",      # ZnTe, wurtzite
+    "mp-22913",     # CuBr, zincblende
+    "mp-22862",     # NaCl, rocksalt
+    "mp-19717",     # PbTe, rocksalt
+    "mp-1784",      # CsF, rocksalt
+    "mp-580941",    # AgI, wurtzite
+)
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return _json_ready(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_ready(value.item())
+    if isinstance(value, Mapping):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(_json_ready(payload), indent=2, sort_keys=True, allow_nan=False),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _load_json_resource(
+    source: str,
+    *,
+    cache_path: Path,
+    proxy: Optional[str] = None,
+) -> Tuple[Dict[str, Any], str, str]:
+    """Load a local or versioned remote JSON/GZip resource with a durable cache."""
+    local = Path(str(source)).expanduser()
+    resolved_source = str(source)
+    if local.exists():
+        payload = local.read_bytes()
+        resolved_source = str(local.resolve())
+    else:
+        if cache_path.exists():
+            payload = cache_path.read_bytes()
+        else:
+            handlers: List[Any] = []
+            if proxy:
+                handlers.append(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                )
+            opener = urllib.request.build_opener(*handlers)
+            request = urllib.request.Request(
+                str(source), headers={"User-Agent": "E3-miu-GNN/phonondb-benchmark"}
+            )
+            with opener.open(request, timeout=180) as response:
+                payload = response.read()
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(payload)
+    digest = _sha256_bytes(payload)
+    decoded = gzip.decompress(payload) if payload.startswith(b"\x1f\x8b") else payload
+    value = json.loads(decoded.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError(f"Expected a JSON object from {source!r}")
+    return value, digest, resolved_source
+
+
+def phonon_dos_wasserstein_1(
+    prediction: Mapping[str, Any],
+    reference: Mapping[str, Any],
+) -> float:
+    """Return the density-weighted spectrum Wasserstein-1 distance in THz."""
+    from scipy.stats import wasserstein_distance
+
+    def _distribution(values: Mapping[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+        frequencies = np.asarray(
+            values.get("frequencies", values.get("frequency_points_THz", [])),
+            dtype=float,
+        ).reshape(-1)
+        densities = np.asarray(
+            values.get("densities", values.get("total_dos", [])), dtype=float
+        ).reshape(-1)
+        count = min(int(frequencies.size), int(densities.size))
+        frequencies, densities = frequencies[:count], densities[:count]
+        valid = np.isfinite(frequencies) & np.isfinite(densities) & (densities >= 0.0)
+        frequencies, densities = frequencies[valid], densities[valid]
+        if frequencies.size < 2 or float(np.sum(densities)) <= 0.0:
+            raise ValueError("A phonon DOS distribution must contain positive finite mass")
+        return frequencies, densities
+
+    pred_frequency, pred_density = _distribution(prediction)
+    ref_frequency, ref_density = _distribution(reference)
+    return float(
+        wasserstein_distance(
+            pred_frequency,
+            ref_frequency,
+            u_weights=pred_density,
+            v_weights=ref_density,
+        )
+    )
+
+
+def _normalised_dos(values: Mapping[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+    frequencies = np.asarray(
+        values.get("frequencies", values.get("frequency_points_THz", [])), dtype=float
+    ).reshape(-1)
+    density = np.asarray(
+        values.get("densities", values.get("total_dos", [])), dtype=float
+    ).reshape(-1)
+    count = min(int(frequencies.size), int(density.size))
+    frequencies, density = frequencies[:count], density[:count]
+    valid = np.isfinite(frequencies) & np.isfinite(density) & (density >= 0.0)
+    frequencies, density = frequencies[valid], density[valid]
+    maximum = float(np.max(density)) if density.size else 0.0
+    return frequencies, density / maximum if maximum > 0.0 else density
+
+
+def _write_phonondb_plots(
+    records: Sequence[Mapping[str, Any]], output_directory: Path
+) -> Dict[str, str]:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    valid = [record for record in records if record.get("status") == "ok"]
+    if not valid:
+        return {}
+    overlay_records = valid[:18]
+    columns = 3
+    rows = int(np.ceil(len(overlay_records) / columns))
+    figure, axes = plt.subplots(
+        rows, columns, figsize=(15.0, max(3.4, 3.25 * rows)), squeeze=False
+    )
+    for axis, record in zip(axes.reshape(-1), overlay_records):
+        for key, label, color, style in (
+            ("dft_dos", "DFT", "#111827", "-"),
+            ("e3_dos", "E3-miu-GNN", "#2563eb", "-"),
+            ("sevennet_dos", "SevenNet-Omni-i12", "#d97706", "--"),
+        ):
+            frequencies, density = _normalised_dos(record[key])
+            axis.plot(frequencies, density, color=color, linestyle=style, linewidth=1.25, label=label)
+        axis.set_title(
+            f"{record['material_id']}  {record.get('formula', '')}\n"
+            f"W1 E3={record['e3_w1_THz']:.3f}, SevenNet={record['sevennet_w1_THz']:.3f} THz",
+            fontsize=9,
+        )
+        axis.set_xlabel("Frequency (THz)")
+        axis.set_ylabel("Normalized DOS")
+        axis.grid(alpha=0.2)
+    for axis in axes.reshape(-1)[len(overlay_records):]:
+        axis.set_visible(False)
+    axes[0, 0].legend(fontsize=8)
+    figure.suptitle("PhononDB PBE Spectrum Comparison", fontsize=14)
+    figure.tight_layout()
+    overlay_path = output_directory / "phonondb_dos_overlays.png"
+    figure.savefig(overlay_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+    material_ids = [str(record["material_id"]) for record in valid]
+    e3_values = np.asarray([float(record["e3_w1_THz"]) for record in valid])
+    sevennet_values = np.asarray(
+        [float(record["sevennet_w1_THz"]) for record in valid]
+    )
+    x_values = np.arange(len(valid), dtype=float)
+    figure, axis = plt.subplots(figsize=(max(9.0, 0.62 * len(valid)), 5.2))
+    width = 0.38
+    axis.bar(x_values - width / 2.0, e3_values, width, label="E3-miu-GNN", color="#2563eb")
+    axis.bar(x_values + width / 2.0, sevennet_values, width, label="SevenNet-Omni-i12", color="#d97706")
+    axis.set_xticks(x_values)
+    axis.set_xticklabels(material_ids, rotation=45, ha="right")
+    axis.set_ylabel("DOS Wasserstein-1 (THz, lower is better)")
+    axis.set_title("Distance to Independent PhononDB PBE Reference")
+    axis.grid(axis="y", alpha=0.22)
+    axis.legend()
+    figure.tight_layout()
+    comparison_path = output_directory / "phonondb_w1_comparison.png"
+    figure.savefig(comparison_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    return {
+        "dos_overlays": str(overlay_path),
+        "w1_comparison": str(comparison_path),
+    }
+
+
+def run_phonondb_benchmark(
+    *,
+    model_ckpt: str,
+    output_dir: str,
+    device: str = "auto",
+    model_mode: str = "full_coupled",
+    reference_source: str = PHONONDB_REFERENCE_URL,
+    sevennet_source: str = PHONONDB_SEVENNET_URL,
+    material_ids: Optional[Sequence[str]] = DEFAULT_PHONONDB_BENCHMARK_IDS,
+    excluded_material_ids: Sequence[str] = (),
+    material_limit: int = 0,
+    proxy: Optional[str] = None,
+    supercell_matrix: Sequence[Sequence[int]] = ((2, 0, 0), (0, 2, 0), (0, 0, 2)),
+    displacement_amplitude_A: float = 0.01,
+    dos_mesh: Tuple[int, int, int] = (10, 10, 10),
+    dos_sigma_THz: Optional[float] = None,
+    band_npoints: int = 31,
+    subtract_equilibrium_forces: bool = True,
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """Compare a checkpoint with published DFT and SevenNet PhononDB spectra."""
+    output = Path(output_dir).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    cache = output / "reference"
+    reference, reference_sha, reference_name = _load_json_resource(
+        reference_source,
+        cache_path=cache / "phonondb_pbe_reference.json.gz",
+        proxy=proxy,
+    )
+    sevennet_payload, sevennet_sha, sevennet_name = _load_json_resource(
+        sevennet_source,
+        cache_path=cache / "sevennet_omni_i12.json.gz",
+        proxy=proxy,
+    )
+    sevennet = sevennet_payload.get("model", sevennet_payload)
+    structures = reference.get("structures")
+    dft_dos = reference.get("dft_dos")
+    sevennet_dos = sevennet.get("ml_dos") if isinstance(sevennet, Mapping) else None
+    reference_ids = [str(value) for value in reference.get("material_ids", [])]
+    if not isinstance(structures, Mapping) or not isinstance(dft_dos, Mapping):
+        raise ValueError("PhononDB reference package is missing structures or DFT DOS")
+    if not isinstance(sevennet_dos, Mapping):
+        raise ValueError("SevenNet package is missing model.ml_dos")
+    excluded = {str(value) for value in excluded_material_ids}
+    selected = (
+        [str(value) for value in material_ids]
+        if material_ids is not None
+        else list(reference_ids)
+    )
+    selected = [value for value in selected if value not in excluded]
+    if int(material_limit) > 0:
+        selected = selected[: int(material_limit)]
+    if not selected:
+        raise ValueError("The PhononDB benchmark selection is empty")
+    if len(selected) != len(set(selected)):
+        raise ValueError("The PhononDB benchmark selection contains duplicate IDs")
+    missing = [
+        value
+        for value in selected
+        if value not in structures or value not in dft_dos or value not in sevennet_dos
+    ]
+    if missing:
+        raise ValueError(f"PhononDB resources are missing selected IDs: {missing}")
+
+    checkpoint = Path(model_ckpt).expanduser().resolve()
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    protocol = {
+        "model_mode": str(model_mode),
+        "supercell_matrix": np.asarray(supercell_matrix, dtype=int).tolist(),
+        "displacement_amplitude_A": float(displacement_amplitude_A),
+        "dos_mesh": [int(value) for value in dos_mesh],
+        "dos_sigma_THz": dos_sigma_THz,
+        "band_npoints": int(band_npoints),
+        "subtract_equilibrium_forces": bool(subtract_equilibrium_forces),
+        "metric": "density-weighted Wasserstein-1 on published DOS grids",
+    }
+    record_dir = output / "records"
+    structure_dir = output / "structures"
+    record_dir.mkdir(parents=True, exist_ok=True)
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    formula_by_id = dict(zip(reference_ids, reference.get("formulas", [])))
+    records: List[Dict[str, Any]] = []
+
+    for index, material_id in enumerate(selected, start=1):
+        record_path = record_dir / f"{material_id}.json"
+        record: Optional[Dict[str, Any]] = None
+        if record_path.exists():
+            try:
+                candidate = json.loads(record_path.read_text(encoding="utf-8"))
+                if (
+                    candidate.get("checkpoint_sha256") == checkpoint_sha
+                    and candidate.get("protocol") == protocol
+                    and candidate.get("material_id") == material_id
+                ):
+                    record = candidate
+                    log(f"[{_now()}] PhononDB {index}/{len(selected)} {material_id}: resumed")
+            except Exception:
+                record = None
+        if record is None:
+            log(f"[{_now()}] PhononDB {index}/{len(selected)} {material_id}: computing")
+            structure_path = structure_dir / f"{material_id}.extxyz"
+            structure_path.write_text(str(structures[material_id]), encoding="utf-8")
+            base_record: Dict[str, Any] = {
+                "material_id": material_id,
+                "formula": str(formula_by_id.get(material_id, "")),
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": checkpoint_sha,
+                "protocol": protocol,
+                "dft_dos": dft_dos[material_id],
+                "sevennet_dos": sevennet_dos[material_id],
+            }
+            try:
+                calculation = compute_phonon_thermo_phonopy(
+                    model_ckpt=str(checkpoint),
+                    structure_path=str(structure_path),
+                    device=device,
+                    model_mode=model_mode,
+                    spin_policy="off",
+                    supercell_matrix=supercell_matrix,
+                    displacement_amplitude_A=displacement_amplitude_A,
+                    subtract_equilibrium_forces=subtract_equilibrium_forces,
+                    dos_mesh=dos_mesh,
+                    dos_sigma_THz=dos_sigma_THz,
+                    band_npoints=band_npoints,
+                    thermal_temperatures_K=None,
+                    log=log,
+                )
+                e3_dos = calculation["dos"]
+                e3_w1 = phonon_dos_wasserstein_1(e3_dos, dft_dos[material_id])
+                sevennet_w1 = phonon_dos_wasserstein_1(
+                    sevennet_dos[material_id], dft_dos[material_id]
+                )
+                record = {
+                    **base_record,
+                    "status": "ok",
+                    "e3_w1_THz": e3_w1,
+                    "sevennet_w1_THz": sevennet_w1,
+                    "e3_better": bool(e3_w1 < sevennet_w1),
+                    "e3_dos": e3_dos,
+                    "calculation": calculation,
+                }
+            except Exception as exc:
+                record = {
+                    **base_record,
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(),
+                }
+            _write_json_atomic(record_path, record)
+        records.append(record)
+
+    valid = [record for record in records if record.get("status") == "ok"]
+    e3_values = np.asarray([float(record["e3_w1_THz"]) for record in valid])
+    sevennet_values = np.asarray(
+        [float(record["sevennet_w1_THz"]) for record in valid]
+    )
+    differences = e3_values - sevennet_values
+    if differences.size:
+        generator = np.random.default_rng(20260721)
+        samples = generator.choice(
+            differences, size=(5000, int(differences.size)), replace=True
+        ).mean(axis=1)
+        confidence_interval = [
+            float(np.quantile(samples, 0.025)),
+            float(np.quantile(samples, 0.975)),
+        ]
+    else:
+        confidence_interval = [None, None]
+    complete = len(valid) == len(selected)
+    e3_mean = float(np.mean(e3_values)) if e3_values.size else None
+    sevennet_mean = float(np.mean(sevennet_values)) if sevennet_values.size else None
+    accepted = bool(
+        complete
+        and e3_mean is not None
+        and sevennet_mean is not None
+        and e3_mean < sevennet_mean
+    )
+    plots: Dict[str, str] = {}
+    plot_error: Optional[str] = None
+    try:
+        plots = _write_phonondb_plots(valid, output)
+    except Exception as exc:
+        plot_error = f"{type(exc).__name__}: {exc}"
+    report: Dict[str, Any] = {
+        "schema": "e3mu-phonondb-sevennet-comparison-v1",
+        "created_at": _now(),
+        "status": "accepted" if accepted else "rejected",
+        "accepted": accepted,
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": checkpoint_sha,
+        "reference": {
+            "source": reference_name,
+            "sha256": reference_sha,
+            "scope": "PhononDB PBE-103 DFT DOS",
+        },
+        "baseline": {
+            "source": sevennet_name,
+            "sha256": sevennet_sha,
+            "model": str(sevennet.get("model_label", "SevenNet-Omni-i12")),
+        },
+        "protocol": protocol,
+        "selected_material_ids": selected,
+        "excluded_material_ids": sorted(excluded),
+        "successful_materials": len(valid),
+        "failed_materials": len(selected) - len(valid),
+        "aggregate": {
+            "e3_mean_w1_THz": e3_mean,
+            "sevennet_mean_w1_THz": sevennet_mean,
+            "mean_paired_delta_e3_minus_sevennet_THz": (
+                float(np.mean(differences)) if differences.size else None
+            ),
+            "paired_delta_bootstrap_95pct_THz": confidence_interval,
+            "e3_wins": int(np.count_nonzero(differences < 0.0)),
+            "ties": int(np.count_nonzero(differences == 0.0)),
+            "sevennet_wins": int(np.count_nonzero(differences > 0.0)),
+        },
+        "gate": {
+            "requires_all_materials": True,
+            "criterion": "mean E3 DOS W1 < mean SevenNet DOS W1",
+            "passed": accepted,
+        },
+        "plots": plots,
+        "plot_error": plot_error,
+        "materials": [
+            {
+                key: record.get(key)
+                for key in (
+                    "material_id", "formula", "status", "e3_w1_THz",
+                    "sevennet_w1_THz", "e3_better", "error",
+                )
+                if key in record
+            }
+            for record in records
+        ],
+    }
+    _write_json_atomic(output / "phonondb_benchmark_report.json", report)
+    _write_json_atomic(
+        output / "phonon_gate.json",
+        {
+            "status": report["status"],
+            "accepted": accepted,
+            "checkpoint_sha256": checkpoint_sha,
+            "aggregate": report["aggregate"],
+            "report": str(output / "phonondb_benchmark_report.json"),
+        },
+    )
+    return report
 
 
 @dataclass
@@ -1568,5 +2045,115 @@ class App(tk.Tk):
         self.after(100, self._tick)
 
 
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Native E3-miu-GNN phonon calculation and PhononDB benchmark."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    single = subparsers.add_parser("single", help="Run one finite-displacement calculation")
+    single.add_argument("--model", required=True)
+    single.add_argument("--structure", required=True)
+    single.add_argument("--output", required=True)
+    single.add_argument("--device", default="auto")
+    single.add_argument("--model-mode", choices=_MODEL_MODES, default="full_coupled")
+    single.add_argument("--supercell", nargs=3, type=int, default=(2, 2, 2), metavar=("A", "B", "C"))
+    single.add_argument("--dos-mesh", nargs=3, type=int, default=(10, 10, 10), metavar=("A", "B", "C"))
+    single.add_argument("--dos-sigma", type=float)
+    single.add_argument("--displacement", type=float, default=0.01)
+    single.add_argument("--band-npoints", type=int, default=101)
+    single.add_argument("--no-equilibrium-force-correction", action="store_true")
+
+    benchmark = subparsers.add_parser(
+        "benchmark", help="Compare E3-miu-GNN against DFT and SevenNet PhononDB DOS"
+    )
+    benchmark.add_argument("--model", required=True)
+    benchmark.add_argument("--output-dir", required=True)
+    benchmark.add_argument("--device", default="auto")
+    benchmark.add_argument("--model-mode", choices=_MODEL_MODES, default="full_coupled")
+    benchmark.add_argument("--reference", default=PHONONDB_REFERENCE_URL)
+    benchmark.add_argument("--sevennet", default=PHONONDB_SEVENNET_URL)
+    benchmark.add_argument("--proxy")
+    benchmark.add_argument("--material-id", action="append", default=[])
+    benchmark.add_argument("--exclude-material-id", action="append", default=[])
+    benchmark.add_argument("--all-materials", action="store_true")
+    benchmark.add_argument("--material-limit", type=int, default=0)
+    benchmark.add_argument("--supercell", nargs=3, type=int, default=(2, 2, 2), metavar=("A", "B", "C"))
+    benchmark.add_argument("--dos-mesh", nargs=3, type=int, default=(10, 10, 10), metavar=("A", "B", "C"))
+    benchmark.add_argument("--dos-sigma", type=float)
+    benchmark.add_argument("--displacement", type=float, default=0.01)
+    benchmark.add_argument("--band-npoints", type=int, default=31)
+    benchmark.add_argument("--no-equilibrium-force-correction", action="store_true")
+    benchmark.add_argument(
+        "--require-better",
+        action="store_true",
+        help="Return a non-zero exit status unless E3 mean W1 is below SevenNet",
+    )
+    return parser
+
+
+def _run_cli(arguments: Sequence[str]) -> int:
+    args = _build_cli_parser().parse_args(list(arguments))
+    diagonal = np.diag(np.asarray(args.supercell, dtype=int)).tolist()
+    if args.command == "single":
+        result = compute_phonon_thermo_phonopy(
+            model_ckpt=args.model,
+            structure_path=args.structure,
+            device=args.device,
+            model_mode=args.model_mode,
+            supercell_matrix=diagonal,
+            displacement_amplitude_A=args.displacement,
+            subtract_equilibrium_forces=not args.no_equilibrium_force_correction,
+            dos_mesh=tuple(int(value) for value in args.dos_mesh),
+            dos_sigma_THz=args.dos_sigma,
+            band_npoints=args.band_npoints,
+            thermal_temperatures_K=None,
+        )
+        output = Path(args.output).expanduser().resolve()
+        _write_json_atomic(output, result)
+        print(json.dumps({"output": str(output), "ok": bool(result.get("ok"))}, indent=2))
+        return 0
+
+    selected: Optional[Sequence[str]]
+    if args.all_materials:
+        selected = None
+    elif args.material_id:
+        selected = tuple(args.material_id)
+    else:
+        selected = DEFAULT_PHONONDB_BENCHMARK_IDS
+    report = run_phonondb_benchmark(
+        model_ckpt=args.model,
+        output_dir=args.output_dir,
+        device=args.device,
+        model_mode=args.model_mode,
+        reference_source=args.reference,
+        sevennet_source=args.sevennet,
+        material_ids=selected,
+        excluded_material_ids=tuple(args.exclude_material_id),
+        material_limit=args.material_limit,
+        proxy=args.proxy,
+        supercell_matrix=diagonal,
+        displacement_amplitude_A=args.displacement,
+        dos_mesh=tuple(int(value) for value in args.dos_mesh),
+        dos_sigma_THz=args.dos_sigma,
+        band_npoints=args.band_npoints,
+        subtract_equilibrium_forces=not args.no_equilibrium_force_correction,
+    )
+    print(
+        json.dumps(
+            {
+                "report": str(Path(args.output_dir).expanduser().resolve() / "phonondb_benchmark_report.json"),
+                "accepted": bool(report["accepted"]),
+                "aggregate": report["aggregate"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 3 if args.require_better and not bool(report["accepted"]) else 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        raise SystemExit(_run_cli(sys.argv[1:]))
     App().mainloop()

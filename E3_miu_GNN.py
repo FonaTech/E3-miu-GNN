@@ -9914,6 +9914,13 @@ class TrainConfig:
     # Write per-epoch .pt checkpoints + scatter/MAE plots to ./train/.
     # Set to False during AutoSearch trials to avoid I/O overhead.
     save_epoch_artifacts: bool = True
+    # Keep restart checkpoints and metric histories while allowing long
+    # unattended runs to disable memory-intensive matplotlib rendering.
+    save_epoch_plots: bool = True
+    # Stop after this many validation epochs without a material improvement.
+    # Zero disables early stopping.
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
 
 
 # Characteristic scales make the AutoSearch score dimensionless without letting
@@ -11071,6 +11078,29 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         model.unfreeze_ground()
         model.unfreeze_response()
         z_table = AtomicNumberTable(model.z_table_zs)
+    elif cfg.mode == "base" and cfg.base_ckpt:
+        # Base-mode continuation is used by restartable production curricula.
+        # The checkpoint already contains the fitted atomic reference energies,
+        # so re-fitting them after an interrupted run would change the objective.
+        model = DualLayerFieldModel.load(
+            cfg.base_ckpt, map_location="cpu", allow_unsafe_legacy=True
+        )
+        if isinstance(model, MixedGranularityE3GNN):
+            raise ValueError(
+                "A mixed-granularity checkpoint cannot resume mode='base'; "
+                "use mode='joint' for coupled fine-tuning"
+            )
+        missing_elements = sorted(set(zs) - set(int(z) for z in model.z_table_zs))
+        if missing_elements:
+            raise ValueError(
+                "Base checkpoint is missing dataset elements: "
+                f"{missing_elements}"
+            )
+        model.cfg = cfg.model
+        model.unfreeze_ground()
+        model.freeze_response()
+        z_table = AtomicNumberTable(model.z_table_zs)
+        log(f"[{_now()}] Resuming base branch from: {cfg.base_ckpt}")
     else:
         if progress is not None:
             progress({"type": "prep", "task": "Fit atomic energies", "overall_frac": 0.01, "current": 0, "total": 1, "stage": "start"})
@@ -11355,6 +11385,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     _best_validation_score: float = float("inf")
     _best_epoch: int = 0
     _best_state: Optional[Dict[str, torch.Tensor]] = None
+    _epochs_without_improvement = 0
     t0 = time.time()
 
     # ------------------------------------------------------------------
@@ -11380,6 +11411,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     if cfg.save_epoch_artifacts:
         _train_dir.mkdir(parents=True, exist_ok=True)
         _plots_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.save_epoch_artifacts and bool(getattr(cfg, "save_epoch_plots", True)):
         try:
             import matplotlib                          # type: ignore[import]
             matplotlib.use("Agg")
@@ -11571,7 +11603,9 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     out["energy"] / _npa_tr, y_e / _npa_tr, w_e
                 )
                 with torch.no_grad():
-                    _sum, _count = _masked_mae_statistics(out["energy"], y_e, w_e)
+                    _sum, _count = _masked_mae_statistics(
+                        out["energy"] / _npa_tr, y_e / _npa_tr, w_e
+                    )
                     train_emae_sum += _sum
                     train_emae_n += _count
             if need_forces:
@@ -11758,7 +11792,9 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     l = l + float(cfg.w_energy) * _weighted_mse(
                         out["energy"] / _npa_val, y_e / _npa_val, w_e
                     )
-                    _sum, _count = _masked_mae_statistics(out["energy"], y_e, w_e)
+                    _sum, _count = _masked_mae_statistics(
+                        out["energy"] / _npa_val, y_e / _npa_val, w_e
+                    )
                     val_emae_sum += _sum
                     val_emae_n += _count
                     if _HAS_MPL:
@@ -11889,6 +11925,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             )
         # Select checkpoints with the same normalized multi-task metric used by
         # AutoSearch; raw weighted loss is not comparable across task weights.
+        _early_stopping_delta = max(
+            0.0, float(getattr(cfg, "early_stopping_min_delta", 0.0))
+        )
+        _previous_best_validation_score = _best_validation_score
         if _epoch_validation_score < _best_validation_score:
             _best_val_loss = _final_val_loss
             _best_validation_score = _epoch_validation_score
@@ -11896,13 +11936,20 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             _best_state = {
                 name: value.detach().cpu().clone() for name, value in model.state_dict().items()
             }
+        if (
+            _epoch_validation_score
+            < _previous_best_validation_score - _early_stopping_delta
+        ):
+            _epochs_without_improvement = 0
+        else:
+            _epochs_without_improvement += 1
         _ep_str = (f"Epoch {epoch}: Train={train_loss/max(1,len(loader)):.4f} "
                    f"Val={_final_val_loss:.4f}")
         if val_emae_n > 0 or val_fmae_n > 0:
             _ep_str += "  |"
         if val_emae_n > 0:
-            _ep_str += (f"  E-MAE  tr={train_emae_sum/max(1,train_emae_n):.4f}"
-                        f"  val={_final_val_emae:.4f}  eV")
+            _ep_str += (f"  E/atom-MAE  tr={train_emae_sum/max(1,train_emae_n):.4f}"
+                        f"  val={_final_val_emae:.4f}  eV/atom")
         if val_fmae_n > 0:
             _ep_str += (f"  F-MAE  tr={train_fmae_sum/max(1,train_fmae_n):.4f}"
                         f"  val={_final_val_fmae:.4f}  eV/Å")
@@ -12010,7 +12057,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 color=_energy_color,
                 xlabel="Actual E/atom (eV)",
                 ylabel="Predicted E/atom (eV)",
-                title=f"Energy/atom  full range  E-MAE={_final_val_emae:.4f} eV",
+                title=f"Energy/atom  full range  E-MAE={_final_val_emae:.4f} eV/atom",
                 point_size=10.0,
                 point_alpha=0.50,
             )
@@ -12146,7 +12193,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 _lines.append(_line_f)
                 _labels.append(_line_f.get_label())
             _ax_e.set_xlabel("Epoch")
-            _ax_e.set_ylabel("Energy MAE (eV)", color=_energy_color)
+            _ax_e.set_ylabel("Energy/atom MAE (eV/atom)", color=_energy_color)
             _ax_f.set_ylabel("Force MAE (eV/Å)", color=_force_color)
             _ax_e.tick_params(axis="y", colors=_energy_color)
             _ax_f.tick_params(axis="y", colors=_force_color)
@@ -12260,6 +12307,28 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 "artifact_dir": str(_train_dir),
                 "plots_dir": str(_plots_dir),
             })
+        _early_stopping_patience = max(
+            0, int(getattr(cfg, "early_stopping_patience", 0))
+        )
+        if (
+            _early_stopping_patience > 0
+            and _epochs_without_improvement >= _early_stopping_patience
+        ):
+            log(
+                f"[{_now()}] Early stopping at epoch {epoch}: no validation "
+                f"improvement greater than {_early_stopping_delta:g} for "
+                f"{_epochs_without_improvement} epochs; best epoch={_best_epoch}."
+            )
+            if progress is not None:
+                progress(
+                    {
+                        "type": "early_stopping",
+                        "epoch": int(epoch),
+                        "best_epoch": int(_best_epoch),
+                        "patience": int(_early_stopping_patience),
+                    }
+                )
+            break
 
     if stopped and _best_state is None:
         opt.zero_grad(set_to_none=True)
