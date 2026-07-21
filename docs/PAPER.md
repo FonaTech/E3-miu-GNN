@@ -46,7 +46,6 @@ The many-electron problem is reduced in Kohn-Sham density-functional theory
 \phi_i(\mathbf r)=\epsilon_i\phi_i(\mathbf r),
 \qquad
 n(\mathbf r)=\sum_i\left|\phi_i(\mathbf r)\right|^2,
-\tag{1}
 ```
 
 where
@@ -58,7 +57,6 @@ V_{\mathrm{eff}}(\mathbf r)
 \qquad
 V_{\mathrm{xc}}(\mathbf r)
 =\frac{\delta E_{\mathrm{xc}}[n]}{\delta n(\mathbf r)}.
-\tag{2}
 ```
 
 The exchange-correlation approximation controls a major part of the accuracy
@@ -67,7 +65,6 @@ the Kohn-Sham and quasiparticle gap,
 
 ```math
 E_g^{\mathrm{QP}}=I-A=E_g^{\mathrm{KS}}+\Delta_{\mathrm{xc}}.
-\tag{3}
 ```
 
 Strongly localized states are often treated with an additional on-site
@@ -80,10 +77,9 @@ E_{\mathrm{DFT}+U}
 \mathrm{Tr}\!\left[\mathbf n_\sigma
 \left(\mathbf I-\mathbf n_\sigma\right)\right],
 \qquad U_{\mathrm{eff}}=U-J.
-\tag{4}
 ```
 
-Equations (1)-(4) provide physical background but are not embedded as an explicit
+These equations provide physical background but are not embedded as an explicit
 DFT or DFT+U solver in E(3)-mu-GNN. The implemented model instead learns an
 effective atomistic Hamiltonian from labelled calculations while enforcing
 geometric and physical structure in its representation and solver layers.
@@ -97,7 +93,6 @@ local decomposition,
 ```math
 E_{\mathrm{local}}(\mathbf R)=\sum_i \varepsilon_i
 \left(\mathcal N_i^{r_c}\right),
-\tag{5}
 ```
 
 is effective when interactions outside the cutoff $`r_c`$ are screened or can be
@@ -162,7 +157,6 @@ vectors $`\mathbf S_i`$. Directed edges connect neighbors inside a cutoff,
 r_{ij}=\|\mathbf r_{ij}\|,
 \qquad
 \widehat{\mathbf r}_{ij}=\frac{\mathbf r_{ij}}{r_{ij}},
-\tag{6}
 ```
 
 where $`\mathbf t_{ij}`$ is the periodic image shift. Translation invariance
@@ -203,18 +197,16 @@ W_{L_{\mathrm{in}},L_{\mathrm{edge}}\rightarrow L_{\mathrm{out}}}
 \mathbf h_j^{L_{\mathrm{in}}}\otimes
 \mathbf Y^{L_{\mathrm{edge}}}(\widehat{\mathbf r}_{ij})
 \right]_{L_{\mathrm{out}}}.
-\tag{7}
 ```
 
 The implementation realizes the selected products directly in a real
 Cartesian basis. Node state contains
 
 ```math
-\mathbf h_i=\left(
-\mathbf s_i,\mathbf v_i,\mathbf a_i,\mathbf T_i^{(2)},
-\mathbf T_i^{(3)}
-\right),
-\tag{8}
+\mathbf{h}_i=\bigl(
+\mathbf{s}_i,\mathbf{v}_i,\mathbf{a}_i,
+\mathbf{T}_i^{(2)},\mathbf{T}_i^{(3)}
+\bigr).
 ```
 
 with scalar $`\mathbf s_i`$, polar vector $`\mathbf v_i`$, axial vector
@@ -233,7 +225,6 @@ are
 \mathrm{ST}\!\left(
 \mathbf v_j\otimes\widehat{\mathbf r}_{ij}
 \right)\rightarrow 2e.
-\tag{9}
 ```
 
 Radial filters use fixed Gaussian, trainable Gaussian, or Bessel bases and a
@@ -247,7 +238,6 @@ The short-range energy is
 E_{\mathrm{short}}
 =\sum_i\left[E_{z_i}^{\mathrm{ref}}
 +f_E(\mathbf s_i)\right].
-\tag{10}
 ```
 
 The reference atomic energies are obtained from a regularized least-squares
@@ -263,10 +253,10 @@ D_{\alpha\beta}^{ab}(\mathbf q)
 =\frac{1}{\sqrt{m_a m_b}}
 \sum_{\mathbf T}H_{0a\alpha,\mathbf T b\beta}
 e^{i\mathbf q\cdot\mathbf T}.
-\tag{11}
 ```
 
-Equation (11) states the automatic-differentiation interface. The current
+These Hessian and dynamical-matrix expressions state the
+automatic-differentiation interface. The current
 validation suite tests first-derivative force consistency; it does not report a
 converged phonon benchmark.
 
@@ -284,7 +274,6 @@ E(\mathbf R,\boldsymbol{\mathcal E})
 -\frac{1}{2}\boldsymbol{\mathcal E}^{\mathsf T}
 \boldsymbol\alpha(\mathbf R)\boldsymbol{\mathcal E}
 +\mathcal O(\|\boldsymbol{\mathcal E}\|^3).
-\tag{12}
 ```
 
 The response network reads scalar, polar, and $`L=2`$ features. It predicts raw
@@ -298,7 +287,6 @@ isotropic and symmetric-traceless part,
 +\sum_{k=1}^{5}c_{ik}\mathbf B_k^{(2)},
 \qquad
 \boldsymbol\alpha=\sum_i\boldsymbol\alpha_i.
-\tag{13}
 ```
 
 The total dipole combines permanent, charge-displacement, and induced terms,
@@ -308,7 +296,6 @@ The total dipole combines permanent, charge-displacement, and induced terms,
 =\sum_i\boldsymbol\mu_i^{\mathrm{perm}}
 +\sum_i q_i(\mathbf R_i-\mathbf R_c)
 +\sum_i\mathbf p_i^{\mathrm{ind}}.
-\tag{14}
 ```
 
 For non-periodic structures $`\mathbf R_c`$ is the geometric center. Periodic
@@ -321,7 +308,6 @@ The total energy separates local and domain contributions,
 
 ```math
 E_{\mathrm{tot}}=E_{\mathrm{short}}+E_{\mathrm{domain}}+E_{\mathrm{spin}}.
-\tag{15}
 ```
 
 #### Differentiable charge equilibration
@@ -336,14 +322,12 @@ E_{\mathrm{QEq}}(\mathbf q)
 +\boldsymbol\phi_{\mathrm{ext}}^{\mathsf T}\mathbf q,
 \qquad
 \mathbf 1^{\mathsf T}\mathbf q=Q.
-\tag{16}
 ```
 
 The direct non-periodic kernel is softened at short range,
 
 ```math
 K_{ij}=\frac{k_e}{\sqrt{r_{ij}^2+\sigma^2}},\qquad i\ne j.
-\tag{17}
 ```
 
 Periodic graphs obtain $`\mathbf K`$ from an Ewald calculator. The reciprocal
@@ -355,7 +339,6 @@ E_{\mathrm{rec}}
 \frac{4\pi k_e}{\|\mathbf k\|^2}
 e^{-\|\mathbf k\|^2/(4\alpha_E^2)}
 \left|S(\mathbf k)\right|^2.
-\tag{18}
 ```
 
 Rather than solve an indefinite KKT system, the implementation eliminates the
@@ -370,7 +353,6 @@ $`\mathbf 1^{\mathsf T}\mathbf q_0=Q`$,
 =-\mathbf B^{\mathsf T}\left(\mathbf H\mathbf q_0+\mathbf b\right),
 \qquad
 \mathbf H=\mathrm{diag}(\boldsymbol\eta)+\mathbf K.
-\tag{19}
 ```
 
 A differentiable stability shift makes the reduced Hessian positive definite;
@@ -387,7 +369,6 @@ u_{ij}=\frac{r_{ij}}{(\alpha_i\alpha_j)^{1/6}},
 f_3=1-e^{-a u_{ij}^3},
 \quad
 f_5=1-(1+a u_{ij}^3)e^{-a u_{ij}^3},
-\tag{20}
 ```
 
 and
@@ -397,7 +378,6 @@ and
 =\frac{k_e}{r_{ij}^3}
 \left(3f_5\widehat{\mathbf r}_{ij}
 \widehat{\mathbf r}_{ij}^{\mathsf T}-f_3\mathbf I\right).
-\tag{21}
 ```
 
 The fixed point $`\mathbf p=\mathbf A(\mathbf E_{\mathrm{drv}}+\mathbf T\mathbf p)`$
@@ -408,7 +388,6 @@ is linear. The implementation solves its symmetric transformed system exactly,
 =\mathbf A^{1/2}\mathbf E_{\mathrm{drv}},
 \qquad
 \mathbf p=\mathbf A^{1/2}\mathbf x,
-\tag{22}
 ```
 
 with a reported positive-definiteness shift. This is the implemented
@@ -426,7 +405,6 @@ E_{\mathrm{D4}}^{(2)}
 =-\frac{1}{2}\sum_{A\ne B}\sum_{n\in\{6,8\}}
 s_n\frac{C_n^{AB}}
 {R_{AB}^{n}+\left(a_1R_0^{AB}+a_2\right)^n}.
-\tag{23}
 ```
 
 The current backend is molecular. Periodic structures receive no D4 energy,
@@ -438,7 +416,6 @@ A spin is an axial vector: under an orthogonal spatial transform $`\mathbf Q`$,
 
 ```math
 \mathbf S_i\mapsto \det(\mathbf Q)\mathbf Q\mathbf S_i,
-\tag{24}
 ```
 
 while time reversal maps $`\mathbf S_i\mapsto-\mathbf S_i`$. The implemented
@@ -446,22 +423,20 @@ spin energy is
 
 ```math
 E_{\mathrm{spin}}
-=-\sum_{i<j}J_{ij}\mathbf S_i\cdot\mathbf S_j
-+\sum_i\mathbf S_i^{\mathsf T}\mathbf D_i\mathbf S_i
-+\sum_{i<j}\mathbf D_{ij}^{\mathrm{DMI}}\cdot
-\left(\mathbf S_i\times\mathbf S_j\right).
-\tag{25}
+=-\sum_{i\lt j}J_{ij}\,\mathbf{S}_i\cdot\mathbf{S}_j
++\sum_i\mathbf{S}_i^{\mathsf{T}}\mathbf{D}_i\mathbf{S}_i
++\sum_{i\lt j}\mathbf{D}_{ij}^{\mathrm{DMI}}\cdot
+\bigl(\mathbf{S}_i\times\mathbf{S}_j\bigr).
 ```
 
 $`J_{ij}`$ is a scalar pair readout. $`\mathbf D_i`$ is symmetric and explicitly
 made traceless. $`\mathbf D_{ij}^{\mathrm{DMI}}`$ is an axial vector assembled
-from axial features and cross products of polar channels. Every term in
-Equation (25) is even under simultaneous spin reversal. The predicted magnetic
+from axial features and cross products of polar channels. Every spin-energy
+term is even under simultaneous spin reversal. The predicted magnetic
 moment is
 
 ```math
 \mathbf m_i=\mathrm{softplus}(f_m(\mathbf s_i))\mathbf S_i,
-\tag{26}
 ```
 
 and the effective field is the energy derivative
@@ -469,7 +444,6 @@ and the effective field is the energy derivative
 ```math
 \mathbf H_i^{\mathrm{eff}}
 =-\frac{\partial E_{\mathrm{spin}}}{\partial\mathbf S_i}.
-\tag{27}
 ```
 
 ### 3.6 Cross-granularity FiLM coupling
@@ -484,7 +458,6 @@ The first domain/spin pass produces a four-component condition at every atom,
 \underset{j\in\mathcal N(i)}{\mathrm{mean}}
 (\mathbf S_i\cdot\mathbf S_j)
 \right].
-\tag{28}
 ```
 
 Each atomic interaction block maps $`\mathbf c_i`$ to scalar scale, scalar bias,
@@ -494,7 +467,6 @@ and tensor scale. The actual bounded modulation is
 \mathbf s_i\leftarrow
 \left[1+0.25\tanh\boldsymbol\gamma_i^{(s)}\right]\odot\mathbf s_i
 +\boldsymbol\beta_i^{(s)},
-\tag{29}
 ```
 
 ```math
@@ -504,7 +476,6 @@ and tensor scale. The actual bounded modulation is
 \quad
 \mathbf X^{(L)}\in
 \{\mathbf v,\mathbf a,\mathbf T^{(2)},\mathbf T^{(3)}\}.
-\tag{30}
 ```
 
 The coupled forward pass recomputes atomic, response, QEq, and spin quantities
@@ -535,12 +506,11 @@ The complete implemented Hamiltonian is
 E_{\mathrm{tot}}
 =E_{\mathrm{short}}+E_{\mathrm{QEq}}+E_{\mathrm{PME}}
 +E_{\mathrm{D4}}+E_{\mathrm{spin}}+E_{\mathrm{resp}}.
-\tag{31}
 ```
 
 The dipole-field term is not double-counted: when QEq is active, the charge
 coupling to the field is already contained in the QEq linear potential.
-Observables are differentiated after Equation (31):
+Observables are differentiated after assembling this total energy:
 
 ```math
 \mathbf F_i=-\frac{\partial E_{\mathrm{tot}}}{\partial\mathbf R_i},
@@ -550,7 +520,6 @@ Z^{*}_{i,\alpha\beta}
 \qquad
 \mathbf H_i^{\mathrm{eff}}
 =-\frac{\partial E_{\mathrm{spin}}}{\partial\mathbf S_i}.
-\tag{32}
 ```
 
 ## 4. Data generation and training strategy
@@ -588,6 +557,9 @@ active-label counts are:
 
 Direct $`J`$, $`D_i`$, and DMI aggregate labels are absent from the portable tiers;
 their masks remain false. This is not interpreted as a zero physical value.
+The repository includes the Tiny tier, while Small, Standard, Large, and
+release metadata are distributed through the
+[project dataset on Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN).
 
 ![Dataset tiers](assets/generated/dataset-tiers.png)
 
@@ -612,7 +584,6 @@ reference $`\mathbf{y}_{t,k}`$, the training objective is
 \frac{\sum_k m_{t,k}
 \left\|\widehat{\mathbf y}_{t,k}-\mathbf y_{t,k}\right\|_2^2}
 {\sum_k m_{t,k}\,d_t},
-\tag{33}
 ```
 
 where $`d_t`$ is the number of components per labelled item. The implemented
@@ -629,7 +600,6 @@ S_{\mathrm{val}}
 =\frac{1}{|\mathcal T_{\mathrm{active}}|}
 \sum_{t\in\mathcal T_{\mathrm{active}}}
 \frac{\mathrm{MAE}_t}{s_t},
-\tag{34}
 ```
 
 with fixed characteristic scales $`s_t`$. A candidate cannot improve its ranking
@@ -743,10 +713,11 @@ claims.
 The implementation is in `E3_miu_GNN.py` and is released under
 MIT terms. Neo dataset binaries are not covered by the software license.
 MPtrj, JARVIS-DFT, QM7-X, SO3LR, SCFNN, and DeepSPIN retain their respective
-upstream terms. Public redistribution of the current aggregate remains blocked
-until the standalone rights of the supplied BEC archive are confirmed or its
-records are removed. Exact source declarations and transformations are in
-`Datasets/Neo/SOURCES_AND_PROCESSING.md`.
+upstream terms. The binaries are hosted in the project Hugging Face dataset;
+the standalone redistribution terms of the supplied BEC archive remain under
+review. Large-scale pretraining is in progress, and validated pretrained
+checkpoints are planned for a later project release. Exact source declarations
+and transformations are in `Datasets/Neo/SOURCES_AND_PROCESSING.md`.
 
 ## References
 

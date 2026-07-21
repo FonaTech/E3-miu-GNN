@@ -192,9 +192,9 @@ The Layer-3 energy is
 
 ```math
 E_{\mathrm{spin}}
-=-\sum_{i<j}J_{ij}S_i\cdot S_j
+=-\sum_{i\lt j}J_{ij}S_i\cdot S_j
 +\sum_iS_i^{\mathsf T}D_iS_i
-+\sum_{i<j}D_{ij}^{\mathrm{DMI}}\cdot(S_i\times S_j).
++\sum_{i\lt j}D_{ij}^{\mathrm{DMI}}\cdot(S_i\times S_j).
 ```
 
 ### Heisenberg exchange

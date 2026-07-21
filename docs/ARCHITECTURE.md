@@ -113,7 +113,7 @@ The radial envelope is
 
 ```math
 f_c(r)=\frac{1}{2}\left[\cos\left(\frac{\pi r}{r_c}\right)+1\right],
-\qquad 0\le r<r_c.
+\qquad 0\le r\lt r_c.
 ```
 
 Available radial bases are fixed Gaussian, trainable Gaussian, and spherical

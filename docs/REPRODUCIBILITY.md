@@ -71,9 +71,19 @@ last few digits.
 
 ## Canonical dataset validation
 
-Large HDF5 files are intentionally excluded from GitHub. Place an authorized
-canonical file at the path used by the chosen config, then validate it before
-training:
+The Tiny file is available from the GitHub repository. Download the larger
+tiers from the Hugging Face dataset before validation or training:
+
+```bash
+python -m pip install --upgrade huggingface_hub
+hf download FonaTech/E3-miu-GNN \
+  canonical/neo_small_l1_l2_l3.h5 \
+  canonical/neo_mixed_l1_l2_l3.h5 \
+  canonical/neo_large_l1_l2_l3.h5 \
+  --repo-type dataset --local-dir Datasets/Neo
+```
+
+Then validate the canonical file used by the chosen config:
 
 ```bash
 python E3_miu_GNN.py dataset-summary \
@@ -222,11 +232,13 @@ complete Layer-2/Layer-3 solver system.
 
 ## Dataset release reproducibility
 
+The published dataset is
+[FonaTech/E3-miu-GNN](https://huggingface.co/datasets/FonaTech/E3-miu-GNN).
 The local Hugging Face staging command is documented in
 [`Datasets/Neo/HUGGINGFACE_UPLOAD.md`](../Datasets/Neo/HUGGINGFACE_UPLOAD.md).
 It validates checksums and strips workstation metadata, but it does not grant
-redistribution rights or upload automatically. The current binaries remain
-blocked pending resolution or removal of the supplied BEC archive rows.
+redistribution rights or upload automatically. The supplied BEC archive rows
+retain an unresolved archive-level rights review.
 
 ## Publication checklist
 

@@ -159,25 +159,31 @@ same conservative energy used for forces. The interface also provides a
 frozen ASE/VASP spin states, equilibrium-force subtraction, and CPU/MPS/CUDA
 device selection. SevenNet TorchScript exports remain ground-only by design.
 
-## Dataset policy
+## Dataset access and policy
 
-Large data files are intentionally excluded from this GitHub repository. Neo
-uses the `e3mu-hdf5-v1` schema with explicit label masks, units, provenance,
+The GitHub repository includes the Tiny file for a quick start. Small,
+Standard, Large, and the complete release metadata are hosted in the
+[FonaTech/E3-miu-GNN Hugging Face dataset](https://huggingface.co/datasets/FonaTech/E3-miu-GNN).
+Neo uses the `e3mu-hdf5-v1` schema with explicit label masks, units, provenance,
 physical parent groups, and fixed train/validation/test splits. Missing labels
 are never fabricated, and incompatible absolute energy references are not
 silently mixed.
 
-| Neo tier | Structures | Approximate size | Intended use |
-| --- | ---: | ---: | --- |
-| Tiny | 5,575 | 21.3 MB | Fast functional checks |
-| Small | 15,221 | 52.8 MB | Intermediate experiments |
-| Standard | 46,414 | 135.1 MB | Portable mixed-granularity training |
-| Large | 613,267 | 1.23 GB | Trajectory-rich training |
+| Neo tier | Structures | Approximate size | Intended use | Download |
+| --- | ---: | ---: | --- | --- |
+| Tiny | 5,575 | 21.3 MB | Fast functional checks | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
+| Small | 15,221 | 52.8 MB | Intermediate experiments | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
+| Standard | 46,414 | 135.1 MB | Portable mixed-granularity training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
+| Large | 613,267 | 1.23 GB | Trajectory-rich training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
 
-Public redistribution of the current Neo binaries is **not yet authorized**:
-the transformed `BEC/H2O`, `BEC/MAPbI3`, and `BEC/dimer` records require
-archive-level rights confirmation or removal. See
-[Dataset and licensing](docs/DATASETS.md) before publishing any binary.
+Large-scale pretraining is currently in progress. The present release provides
+the architecture, training system, datasets, and validation tools; validated
+pretrained checkpoints will be published in a later project version.
+
+The software MIT license does not relicense dataset components. In particular,
+the archive-level redistribution terms for the transformed `BEC/H2O`,
+`BEC/MAPbI3`, and `BEC/dimer` records remain under review. Read
+[Dataset and licensing](docs/DATASETS.md) before redistributing a binary.
 
 ## Verified behavior
 

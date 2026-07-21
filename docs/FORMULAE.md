@@ -357,9 +357,9 @@ explicit tensor contraction, and an optional DMI extension:
 
 ```math
 E_{\mathrm{spin}}
-=-\sum_{i<j}J_{ij}\mathbf S_i\cdot\mathbf S_j
+=-\sum_{i\lt j}J_{ij}\mathbf S_i\cdot\mathbf S_j
 +\sum_i\mathbf S_i^{\mathsf T}\mathbf D_i\mathbf S_i
-+\sum_{i<j}\mathbf D_{ij}^{\mathrm{DMI}}\cdot
++\sum_{i\lt j}\mathbf D_{ij}^{\mathrm{DMI}}\cdot
 (\mathbf S_i\times\mathbf S_j).
 ```
 

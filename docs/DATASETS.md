@@ -7,6 +7,12 @@ records remain the Neo [Dataset Card](../Datasets/Neo/README.md),
 [schema](../Datasets/Neo/DATA_SCHEMA.md), and
 [license ledger](../Datasets/Neo/LICENSES_AND_ATTRIBUTION.md).
 
+The repository carries the
+[Tiny HDF5 file](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5)
+for quick checks. The complete dataset release, including Small, Standard, and
+Large, is hosted at
+[FonaTech/E3-miu-GNN on Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN).
+
 ## Design objective
 
 No single upstream source labels every Layer-1, Layer-2, and Layer-3 target.
@@ -143,12 +149,12 @@ sampled.
 
 ![Neo dataset tiers](assets/generated/dataset-tiers.png)
 
-| Tier | Structures | Atoms | Elements | Periodic structures | File size |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Tiny | 5,575 | 371,803 | 85 | 3,978 | 21.3 MB |
-| Small | 15,221 | 964,550 | 85 | 9,660 | 52.8 MB |
-| Standard | 46,414 | 2,316,736 | 85 | 28,284 | 135.1 MB |
-| Large | 613,267 | 17,760,024 | 89 | 511,274 | 1.23 GB |
+| Tier | Structures | Atoms | Elements | Periodic structures | File size | Distribution |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Tiny | 5,575 | 371,803 | 85 | 3,978 | 21.3 MB | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
+| Small | 15,221 | 964,550 | 85 | 9,660 | 52.8 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
+| Standard | 46,414 | 2,316,736 | 85 | 28,284 | 135.1 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
+| Large | 613,267 | 17,760,024 | 89 | 511,274 | 1.23 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
 
 The fixed split counts are:
 
@@ -216,13 +222,13 @@ rewriting the source tensor.
 
 ## Redistribution boundary
 
-The repository's MIT license does not cover Neo binaries. Public release of
-the current Tiny, Small, Standard, and Large files is blocked because each tier
-contains transformed `BEC/H2O`, `BEC/MAPbI3`, or `BEC/dimer` records whose
-archive-level redistribution terms have not been confirmed. The associated
-article license is not assumed to license a separately supplied archive.
+The repository's MIT license does not cover Neo binaries. The binaries are
+currently hosted on Hugging Face, but hosting does not replace the component
+licenses or resolve the archive-level terms for transformed `BEC/H2O`,
+`BEC/MAPbI3`, and `BEC/dimer` records. The associated article license is not
+assumed to license a separately supplied archive.
 
-Before publication, either obtain durable permission or rebuild every tier
-without those records, regenerate manifests and checksums, rerun the hierarchy
-audit, and repeat model smoke tests. See the
+For a fully cleared redistribution record, obtain durable permission or rebuild
+every tier without those records, regenerate manifests and checksums, rerun the
+hierarchy audit, and repeat model smoke tests. See the
 [Hugging Face release procedure](../Datasets/Neo/HUGGINGFACE_UPLOAD.md).
