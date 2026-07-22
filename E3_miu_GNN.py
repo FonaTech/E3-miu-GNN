@@ -51,6 +51,7 @@ from __future__ import annotations
 import ast
 import argparse
 import collections
+import copy
 import decimal
 import gc
 import hashlib
@@ -72,7 +73,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -318,6 +319,95 @@ def resolve_device(name: Optional[str], *, dtype: str = "float32") -> Tuple[torc
     if requested == "mps" and runtime_dtype == "float64":
         runtime_dtype = "float32"
     return torch.device(requested), runtime_dtype
+
+
+def _available_cpu_threads() -> int:
+    """Return the CPU concurrency available to this process."""
+    try:
+        affinity = getattr(os, "sched_getaffinity", None)
+        if callable(affinity):
+            allowed = len(affinity(0))
+            if allowed > 0:
+                return int(allowed)
+    except (OSError, TypeError, ValueError):
+        pass
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _parse_cpu_threads(value: Any) -> Any:
+    """Normalize a CPU-thread request to ``"auto"`` or a positive integer."""
+    if value is None:
+        return "auto"
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text or text == "auto":
+            return "auto"
+        try:
+            value = int(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"cpu_threads must be 'auto' or a positive integer, got {value!r}"
+            ) from exc
+    if isinstance(value, bool):
+        raise ValueError("cpu_threads must be 'auto' or a positive integer")
+    try:
+        threads = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"cpu_threads must be 'auto' or a positive integer, got {value!r}"
+        ) from exc
+    if threads < 1:
+        raise ValueError(f"cpu_threads must be at least 1, got {threads}")
+    return threads
+
+
+def _resolve_cpu_thread_policy(requested: Any, device: torch.device) -> Dict[str, Any]:
+    """Resolve CPU threading without mutating the process-wide PyTorch runtime."""
+    normalized = _parse_cpu_threads(requested)
+    available = _available_cpu_threads()
+    source = "user"
+    if normalized == "auto":
+        environment_override = os.environ.get("E3MU_NUM_THREADS", "").strip()
+        if environment_override:
+            effective = int(_parse_cpu_threads(environment_override))
+            source = "E3MU_NUM_THREADS"
+        elif device.type == "cpu":
+            effective = available
+            source = "auto-cpu-all"
+        else:
+            # Accelerator execution needs only a bounded CPU helper pool. Four
+            # threads overlap small fallbacks and preparation without competing
+            # heavily with MPS/CUDA driver work.
+            effective = min(4, available)
+            source = f"auto-{device.type}-helper"
+    else:
+        effective = min(int(normalized), available)
+        if int(normalized) > available:
+            source = "user-clamped-to-available"
+    return {
+        "requested": normalized,
+        "effective": max(1, int(effective)),
+        "available": int(available),
+        "source": source,
+        "inherited_omp": os.environ.get("OMP_NUM_THREADS"),
+    }
+
+
+def _configure_torch_cpu_threads(requested: Any, device: torch.device) -> Dict[str, Any]:
+    """Apply the process-wide PyTorch intra-op thread policy.
+
+    PyTorch reads ``OMP_NUM_THREADS`` during import. Some macOS/Conda launch
+    environments set it to one, so relying on the inherited value can silently
+    serialize CPU training. An explicit ``torch.set_num_threads`` call remains
+    effective after import and behaves consistently on macOS, Linux, and Windows.
+    """
+    policy = _resolve_cpu_thread_policy(requested, device)
+    torch.set_num_threads(int(policy["effective"]))
+    return {
+        **policy,
+        "effective": int(torch.get_num_threads()),
+        "interop": int(torch.get_num_interop_threads()),
+    }
 
 
 def parse_vector3(v: Any, *, name: str = "vector") -> np.ndarray:
@@ -1590,21 +1680,21 @@ def write_hdf5_dataset_stream(
         structure_label_ds = {
             name: labels.create_dataset(
                 name, shape=(0,) + shape, maxshape=(None,) + shape,
-                dtype=np.float64, chunks=True, compression="gzip",
+                dtype=np.float64, chunks=True, compression="gzip", fillvalue=np.nan,
             )
             for name, shape in HDF5_STRUCTURE_LABELS.items()
         }
         atom_label_ds = {
             name: labels.create_dataset(
                 name, shape=(0,) + shape, maxshape=(None,) + shape,
-                dtype=np.float64, chunks=True, compression="gzip",
+                dtype=np.float64, chunks=True, compression="gzip", fillvalue=np.nan,
             )
             for name, shape in HDF5_ATOM_LABELS.items()
         }
         mask_ds = {
             name: masks.create_dataset(
                 name, shape=(0,), maxshape=(None,), dtype=np.bool_,
-                chunks=True, compression="gzip",
+                chunks=True, compression="gzip", fillvalue=False,
             )
             for name in itertools.chain(HDF5_STRUCTURE_LABELS, HDF5_ATOM_LABELS)
         }
@@ -1624,6 +1714,20 @@ def write_hdf5_dataset_stream(
                 break
             for offset, cfg in enumerate(batch):
                 _validate_configuration(cfg, context=f"HDF5 stream structure {structure_count + offset}")
+            active_structure_labels = {
+                name
+                for cfg in batch
+                for name in HDF5_STRUCTURE_LABELS
+                if name in (cfg.properties or {})
+                and float(cfg.property_weights.get(name, 1.0)) > 0.0
+            }
+            active_atom_labels = {
+                name
+                for cfg in batch
+                for name in HDF5_ATOM_LABELS
+                if name in (cfg.properties or {})
+                and float(cfg.property_weights.get(name, 1.0)) > 0.0
+            }
             batch_structures = len(batch)
             batch_atoms = sum(len(np.asarray(cfg.atomic_numbers).reshape(-1)) for cfg in batch)
             structure_start, structure_end = structure_count, structure_count + batch_structures
@@ -1652,14 +1756,16 @@ def write_hdf5_dataset_stream(
             batch_structure_values = {
                 name: np.full((batch_structures,) + shape, np.nan, dtype=np.float64)
                 for name, shape in HDF5_STRUCTURE_LABELS.items()
+                if name in active_structure_labels
             }
             batch_atom_values = {
                 name: np.full((batch_atoms,) + shape, np.nan, dtype=np.float64)
                 for name, shape in HDF5_ATOM_LABELS.items()
+                if name in active_atom_labels
             }
             batch_masks = {
                 name: np.zeros((batch_structures,), dtype=np.bool_)
-                for name in itertools.chain(HDF5_STRUCTURE_LABELS, HDF5_ATOM_LABELS)
+                for name in active_structure_labels | active_atom_labels
             }
             metadata_values = {name: [] for name in HDF5_METADATA_FIELDS}
             for local_index, cfg in enumerate(batch):
@@ -7069,6 +7175,95 @@ def _parameter_value(values: Any, name: str, default: Any) -> Any:
     return getattr(values, name, default)
 
 
+def _live_numeric_parameter(
+    values: Any,
+    name: str,
+    default: Any,
+    converter: Callable[[Any], Any] = float,
+) -> Any:
+    """Read transient GUI numeric text without raising during editing.
+
+    Live tooltips and search previews run on every ``textChanged`` signal. An
+    empty or partially typed value is therefore expected; strict validation is
+    still performed when a training/search action is started.
+    """
+    value = _parameter_value(values, name, default)
+    try:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise ValueError
+        converted = converter(value)
+        if isinstance(converted, float) and not math.isfinite(converted):
+            raise ValueError
+        return converted
+    except (TypeError, ValueError, OverflowError):
+        return converter(default)
+
+
+def _plan_structure_batches(
+    item_loads: Sequence[int],
+    batch_size: int,
+    *,
+    max_load: Optional[int] = None,
+) -> Tuple[List[List[int]], List[int]]:
+    """Best-fit deterministic packing used by the MPS edge safety policy."""
+    limit = max(1, int(batch_size))
+    loads = [max(0, int(value)) for value in item_loads]
+    ranked = sorted(range(len(loads)), key=lambda index: loads[index], reverse=True)
+    batches: List[List[int]] = []
+    batch_loads: List[int] = []
+    for index in ranked:
+        item_load = loads[index]
+        candidates = [
+            batch_index
+            for batch_index, indices in enumerate(batches)
+            if len(indices) < limit
+            and (max_load is None or batch_loads[batch_index] + item_load <= max_load)
+        ]
+        if candidates:
+            target = max(candidates, key=lambda batch_index: batch_loads[batch_index])
+            batches[target].append(index)
+            batch_loads[target] += item_load
+        else:
+            batches.append([index])
+            batch_loads.append(item_load)
+    return batches, batch_loads
+
+
+def batch_plan_summary(
+    item_loads: Sequence[int],
+    batch_size: int,
+    *,
+    device_type: str,
+    max_edges: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return backend-specific batch counts without loading graph tensors."""
+    count = len(item_loads)
+    requested = max(1, int(batch_size))
+    effective = max(1, min(requested, count if count else 1))
+    if str(device_type).lower() != "mps":
+        return {
+            "device": str(device_type).lower(),
+            "requested_batch_size": requested,
+            "steps": int(math.ceil(count / effective)) if count else 0,
+            "structure_loads": [
+                min(effective, count - start) for start in range(0, count, effective)
+            ],
+            "edge_loads": None,
+            "edge_budget": None,
+        }
+    batches, edge_loads = _plan_structure_batches(
+        item_loads, effective, max_load=max_edges
+    )
+    return {
+        "device": "mps",
+        "requested_batch_size": requested,
+        "steps": len(batches),
+        "structure_loads": [len(indices) for indices in batches],
+        "edge_loads": edge_loads,
+        "edge_budget": max_edges,
+    }
+
+
 def architecture_parameter_relevance(values: Any) -> Dict[str, Tuple[bool, str]]:
     """Resolve which controls are meaningful for a fixed architecture.
 
@@ -7218,15 +7413,22 @@ def dynamic_parameter_reference_ranges(
 ) -> Dict[str, str]:
     """Describe reference ranges that depend on the current model and dataset."""
     capability = capability or {"ready": False}
-    structures = max(0, int(capability.get("structures", 0)))
-    periodic = int(capability.get("periodic_structures", 0)) > 0
-    elements = [int(value) for value in capability.get("elements", [])]
-    r_max = max(0.5, float(_parameter_value(values, "r_max", 5.0)))
+    structures = max(0, int(capability.get("structures", 0) or 0))
+    periodic = int(capability.get("periodic_structures", 0) or 0) > 0
+    elements = []
+    for value in capability.get("elements", []):
+        try:
+            elements.append(int(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    r_max = max(0.5, _live_numeric_parameter(values, "r_max", 5.0))
     hardness = max(
-        1e-4, float(_parameter_value(values, "qeq_hardness_min", 0.25))
+        1e-4, _live_numeric_parameter(values, "qeq_hardness_min", 0.25)
     )
-    deq_tol = max(1e-10, float(_parameter_value(values, "deq_tol", 1e-6)))
-    channels = max(1, int(float(_parameter_value(values, "num_channels", 64))))
+    deq_tol = max(1e-10, _live_numeric_parameter(values, "deq_tol", 1e-6))
+    channels = max(
+        1, _live_numeric_parameter(values, "num_channels", 64, lambda x: int(float(x)))
+    )
     active_physics = sum(
         int(_architecture_value(values, name))
         for name in (
@@ -7237,7 +7439,7 @@ def dynamic_parameter_reference_ranges(
     r_low, r_high = ((5.0, 10.0) if periodic else (4.0, 8.0))
     if _architecture_value(values, "enable_spin"):
         spin_value = _compatible_spin_cutoff(
-            r_max, _parameter_value(values, "spin_cutoff", r_max)
+            r_max, _live_numeric_parameter(values, "spin_cutoff", r_max)
         )
         r_low = max(r_low, min(spin_value, 8.0))
         r_high = max(r_high, r_low)
@@ -7295,7 +7497,7 @@ def dynamic_architecture_search_space(
 ) -> Dict[str, tuple]:
     """Build data- and architecture-aware overrides for AutoSearch samplers."""
     capability = capability or {"ready": False}
-    periodic = int(capability.get("periodic_structures", 0)) > 0
+    periodic = int(capability.get("periodic_structures", 0) or 0) > 0
     r_choices = (
         [5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
         if periodic
@@ -7309,16 +7511,16 @@ def dynamic_architecture_search_space(
         )
     )
     channel_choices = [64, 96, 128] if active_physics >= 4 else [32, 48, 64, 96]
-    r_max = max(0.5, float(_parameter_value(values, "r_max", 5.0)))
+    r_max = max(0.5, _live_numeric_parameter(values, "r_max", 5.0))
     r_choices = sorted({*r_choices, round(r_max, 6)})
     hardness = max(
-        1e-4, float(_parameter_value(values, "qeq_hardness_min", 0.25))
+        1e-4, _live_numeric_parameter(values, "qeq_hardness_min", 0.25)
     )
     qeq_low = max(0.10, 0.03 * r_max)
     qeq_high = min(1.20, max(0.35, 0.16 * r_max))
     spin_low = min(r_max, max(0.5, min(4.0, 0.65 * r_max)))
     current_spin = _compatible_spin_cutoff(
-        r_max, _parameter_value(values, "spin_cutoff", r_max)
+        r_max, _live_numeric_parameter(values, "spin_cutoff", r_max)
     )
     spin_choices = sorted(
         {
@@ -11213,6 +11415,9 @@ class TrainConfig:
     """Training configuration shared by base, response, and joint modes."""
     mode: str
     device: str = "auto"
+    # ``auto`` uses all available CPU threads for CPU training and a bounded
+    # four-thread helper pool for MPS/CUDA. A positive integer is honored exactly.
+    cpu_threads: Any = "auto"
     dataset: str = ""
     static_data: str = ""
     response_data: str = ""
@@ -12223,6 +12428,7 @@ class AutoSearchEngine:
         return TrainConfig(
             mode                   = _mode,
             device                 = self.base_cfg.device,
+            cpu_threads            = self.base_cfg.cpu_threads,
             dataset                = self.base_cfg.dataset,
             static_data            = self.base_cfg.static_data,
             response_data          = self.base_cfg.response_data if _has_resp else "",
@@ -12467,6 +12673,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         raise ValueError("nonfinite_lr_decay must be finite and strictly between 0 and 1")
 
     device, runtime_dtype = resolve_device(getattr(cfg, "device", "auto"), dtype=cfg.model.dtype)
+    thread_runtime = _configure_torch_cpu_threads(
+        getattr(cfg, "cpu_threads", "auto"), device
+    )
+    cfg.cpu_threads = thread_runtime["requested"]
     cfg.model.dtype = runtime_dtype
     with _TORCH_RUNTIME_LOCK:
         torch.manual_seed(cfg.seed)
@@ -12474,6 +12684,18 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         set_default_dtype(runtime_dtype)
 
     log(f"[{_now()}] Device: {device}, dtype={runtime_dtype}")
+    log(
+        f"[{_now()}] CPU threads: requested={thread_runtime['requested']} "
+        f"effective={thread_runtime['effective']}/{thread_runtime['available']} "
+        f"interop={thread_runtime['interop']} policy={thread_runtime['source']}"
+        + (
+            f" inherited_OMP_NUM_THREADS={thread_runtime['inherited_omp']} "
+            "(overridden for PyTorch)"
+            if thread_runtime["inherited_omp"]
+            and str(thread_runtime["inherited_omp"]) != str(thread_runtime["effective"])
+            else ""
+        )
+    )
     log(f"[{_now()}] Neighborhood: {'mace' if HAS_MACE_NEIGHBORHOOD else 'ase'}")
     log(f"[{_now()}] CWD: {os.getcwd()}")
     log(f"[{_now()}] Script: {Path(__file__).resolve()}")
@@ -12944,7 +13166,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         return _TGBatch.from_data_list(lst)
 
     class _FixedGraphBatchSampler:
-        """Reuse edge-balanced batch shapes while randomizing batch order."""
+        """Reuse memory-bounded MPS batch shapes while randomizing batch order."""
 
         def __init__(
             self,
@@ -12952,49 +13174,37 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             batch_size: int,
             seed: int,
             max_edges: Optional[int] = None,
+            shuffle: bool = True,
         ) -> None:
             edge_counts = getattr(ds, "edge_counts", None)
-            ranked = sorted(
-                range(len(ds)),
-                key=(
-                    (lambda index: int(edge_counts[index]))
-                    if edge_counts is not None
-                    else (lambda index: int(ds[index].edge_index.shape[1]))
-                ),
-                reverse=True,
+            item_edge_loads = (
+                [int(value) for value in edge_counts]
+                if edge_counts is not None
+                else [int(ds[index].edge_index.shape[1]) for index in range(len(ds))]
             )
-            batches: List[List[int]] = []
-            edge_loads: List[int] = []
-            for index in ranked:
-                edges = (
-                    int(edge_counts[index])
-                    if edge_counts is not None
-                    else int(ds[index].edge_index.shape[1])
-                )
-                candidates = [
-                    bin_index
-                    for bin_index, batch_indices in enumerate(batches)
-                    if len(batch_indices) < batch_size
-                    and (max_edges is None or edge_loads[bin_index] + edges <= max_edges)
-                ]
-                if candidates:
-                    # Best-fit packing keeps the number of compiled MPS shapes low.
-                    target = max(candidates, key=lambda bin_index: edge_loads[bin_index])
-                    batches[target].append(index)
-                    edge_loads[target] += edges
-                else:
-                    batches.append([index])
-                    edge_loads.append(edges)
+            batches, edge_loads = _plan_structure_batches(
+                item_edge_loads, batch_size, max_load=max_edges
+            )
             self.batches = batches
             self.edge_loads = edge_loads
+            self.structure_loads = [len(indices) for indices in batches]
+            self.requested_batch_size = int(batch_size)
+            self.edge_budget = int(max_edges) if max_edges is not None else None
+            self.oversized_structures = sum(
+                int(load > max_edges) for load in edge_loads
+            ) if max_edges is not None else 0
             self.seed = int(seed)
+            self.shuffle = bool(shuffle)
             self.epoch = 0
 
         def __iter__(self) -> Iterable[List[int]]:
-            order = np.random.default_rng(self.seed + self.epoch).permutation(
-                len(self.batches)
-            )
-            self.epoch += 1
+            if self.shuffle:
+                order = np.random.default_rng(self.seed + self.epoch).permutation(
+                    len(self.batches)
+                )
+                self.epoch += 1
+            else:
+                order = np.arange(len(self.batches), dtype=np.int64)
             return iter([self.batches[int(index)] for index in order])
 
         def __len__(self) -> int:
@@ -13008,12 +13218,18 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             num_workers=int(_dl_num_workers),
             pin_memory=bool(_dl_pin_memory),
         )
-        if shuffle and device.type == "mps":
+        if device.type == "mps":
             # Force/BEC training differentiates through positions twice. Bound
             # edges rather than only structures because edge count drives memory.
+            # Apply the same policy to validation, where conservative forces
+            # still construct the higher-order graph; only training shuffles.
             edge_budget = 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
             kwargs["batch_sampler"] = _FixedGraphBatchSampler(
-                ds, _eff_bs, int(cfg.seed), max_edges=edge_budget
+                ds,
+                _eff_bs,
+                int(cfg.seed),
+                max_edges=edge_budget,
+                shuffle=shuffle,
             )
         else:
             kwargs["batch_size"] = _eff_bs
@@ -13230,13 +13446,48 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     else:
         loader = _make_loader([], shuffle=True)
         v_loader = _make_loader([], shuffle=False)
-    if device.type == "mps" and hasattr(loader, "batch_sampler"):
-        edge_loads = getattr(loader.batch_sampler, "edge_loads", None)
-        if edge_loads:
-            log(
-                f"[{_now()}] MPS edge-balanced batches: count={len(edge_loads)} "
-                f"max_edges={max(edge_loads)} mean_edges={np.mean(edge_loads):.0f}"
-            )
+    def _log_mps_batch_plan(name: str, selected_loader: Any, count: int) -> None:
+        sampler = getattr(selected_loader, "batch_sampler", None)
+        edge_loads = getattr(sampler, "edge_loads", None)
+        structure_loads = getattr(sampler, "structure_loads", None)
+        if not edge_loads or not structure_loads:
+            return
+        requested_bs = int(getattr(sampler, "requested_batch_size", cfg.batch_size))
+        edge_budget = int(getattr(sampler, "edge_budget", 0))
+        structure_only_steps = int(math.ceil(count / requested_bs)) if count else 0
+        extra_edge_steps = max(0, len(structure_loads) - structure_only_steps)
+        full_steps = sum(int(size >= requested_bs) for size in structure_loads)
+        underfilled_steps = len(structure_loads) - full_steps
+        oversized = int(getattr(sampler, "oversized_structures", 0))
+        log(
+            f"[{_now()}] Batch plan [mps/{name}]: requested_structures={requested_bs} "
+            f"steps={len(structure_loads)} structure_only_steps={structure_only_steps} "
+            f"extra_edge_budget_steps={extra_edge_steps}; "
+            f"structures/step mean={np.mean(structure_loads):.2f} "
+            f"min={min(structure_loads)} max={max(structure_loads)}; "
+            f"edge_budget={edge_budget} edges/step mean={np.mean(edge_loads):.0f} "
+            f"max={max(edge_loads)}; full_steps={full_steps} "
+            f"underfilled_steps={underfilled_steps} "
+            f"oversized_single_structures={oversized}."
+        )
+
+    if device.type == "mps":
+        _log_mps_batch_plan("train", loader, len(train_data))
+        _log_mps_batch_plan("validation", v_loader, len(val_data))
+        log(
+            f"[{_now()}] MPS batching uses exact graphs and all structures; "
+            "the edge budget only bounds unified-memory work per step."
+        )
+    else:
+        _effective_bs = max(
+            1, min(int(cfg.batch_size), len(train_data) if train_data else 1)
+        )
+        log(
+            f"[{_now()}] Batch plan [{device.type}]: "
+            f"requested_structures={int(cfg.batch_size)} "
+            f"effective_structures={_effective_bs} steps={len(loader)}; "
+            "standard structure-count batching (no edge-budget split)."
+        )
 
     for epoch in range(1, int(cfg.epochs) + 1):
         if stop_flag and stop_flag():
@@ -14031,6 +14282,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 "epoch": int(epoch),
                 "artifact_dir": str(_train_dir),
                 "plots_dir": str(_plots_dir),
+                "plots_updated": bool(
+                    cfg.save_epoch_artifacts
+                    and bool(getattr(cfg, "save_epoch_plots", True))
+                    and _HAS_MPL
+                ),
             })
             progress({"type": "epoch", "epoch": int(epoch), "epochs": int(cfg.epochs)})
         if _sched is not None:
@@ -14198,17 +14454,220 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     return out_path, _best_validation_score
 
 
+def _coerce_config_bool(value: Any) -> bool:
+    """Parse JSON/legacy GUI booleans without treating ``"false"`` as true."""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "disabled", ""}:
+            return False
+        raise ValueError(f"Invalid boolean value: {value!r}")
+    return bool(value)
+
+
+def _coerce_like_default(value: Any, default: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(default, bool):
+        return _coerce_config_bool(value)
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(value)
+    if isinstance(default, float):
+        return float(value)
+    if isinstance(default, tuple):
+        return tuple(value) if not isinstance(value, str) else (value,)
+    return value
+
+
+def _deep_merge_config(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge generated config values while retaining unknown future fields."""
+    result = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_config(dict(result[key]), value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+_GUI_TRAIN_DIRECT_FIELDS: Tuple[str, ...] = (
+    "device", "cpu_threads", "dataset", "static_data", "response_data",
+    "base_ckpt", "out_ckpt", "epochs", "lr", "batch_size", "val_fraction",
+    "seed", "w_energy", "w_forces", "force_loss", "force_huber_delta",
+    "w_dipole", "w_polarizability", "w_charges", "w_atomic_dipoles",
+    "w_atomic_polarizability", "w_c6", "w_bec", "w_magnetic_moments",
+    "w_effective_field", "w_j", "w_di", "w_dmi", "lr_scheduler",
+    "export_sevennet", "save_epoch_artifacts", "stream_hdf5",
+    "cache_neighbor_graphs",
+)
+
+
+def _legacy_vars_to_gui_values(raw_vars: Dict[str, Any]) -> Dict[str, Any]:
+    mapping = globals().get("LEGACY_TK_VARIABLES", {})
+    reverse = {str(variable): str(key) for key, variable in dict(mapping).items()}
+    # These aliases predate the shared Qt/Tk variable map.
+    reverse.update({"var_out": "out_ckpt"})
+    return {
+        reverse[str(name)]: value
+        for name, value in raw_vars.items()
+        if str(name) in reverse
+    }
+
+
+def _train_payload_from_gui_values(
+    values: Dict[str, Any], training_mode: str = "joint"
+) -> Dict[str, Any]:
+    """Convert GUI-shaped values into a typed, canonical TrainConfig payload."""
+    selected_mode = str(training_mode or "joint").strip().lower()
+    if selected_mode == "full_chain":
+        selected_mode = "joint"
+    if selected_mode not in {"base", "response", "joint"}:
+        selected_mode = "joint"
+    train_defaults = TrainConfig(mode=selected_mode)
+    model_defaults = ModelConfig()
+    payload: Dict[str, Any] = {"mode": selected_mode}
+    for name in _GUI_TRAIN_DIRECT_FIELDS:
+        if name not in values:
+            continue
+        default = getattr(train_defaults, name)
+        payload[name] = (
+            _parse_cpu_threads(values[name])
+            if name == "cpu_threads"
+            else _coerce_like_default(values[name], default)
+        )
+    model_payload: Dict[str, Any] = {}
+    for name in ModelConfig.__dataclass_fields__:
+        if name in values:
+            model_payload[name] = _coerce_like_default(
+                values[name], getattr(model_defaults, name)
+            )
+    if model_payload:
+        if bool(model_payload.get("enable_pme")):
+            model_payload["enable_qeq"] = True
+        if bool(model_payload.get("e3mu_use_l3")) or bool(
+            model_payload.get("enable_film")
+        ):
+            model_payload["e3mu_use_parity"] = True
+        if bool(model_payload.get("enable_dmi")):
+            model_payload["enable_spin"] = True
+            model_payload["e3mu_use_parity"] = True
+        payload["model"] = model_payload
+    aliases = {
+        "warmup_epochs": "warmup_freeze_epochs",
+        "w_alpha_final": "w_polarizability_final",
+    }
+    for gui_name, config_name in aliases.items():
+        if gui_name in values:
+            payload[config_name] = _coerce_like_default(
+                values[gui_name], getattr(train_defaults, config_name)
+            )
+    if selected_mode == "joint" and "lr" in payload:
+        learning_rate = float(payload["lr"])
+        if "lr_ground_scale" in values:
+            payload["lr_ground"] = learning_rate * float(values["lr_ground_scale"])
+        if "lr_response_scale" in values:
+            payload["lr_response"] = learning_rate * float(values["lr_response_scale"])
+    return payload
+
+
+def _extract_train_config_payload(values: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept canonical, modern GUI, and legacy Tk JSON configuration shapes."""
+    if not isinstance(values, dict):
+        raise TypeError("Training configuration must be a JSON object")
+    if isinstance(values.get("train_config"), dict):
+        canonical = copy.deepcopy(dict(values["train_config"]))
+        if isinstance(values.get("values"), dict):
+            # GUI values are the most recently visible/edited state. Overlay
+            # them onto hidden TrainConfig fields while retaining the latter.
+            gui_payload = _train_payload_from_gui_values(
+                dict(values["values"]),
+                str(values.get("training_mode", canonical.get("mode", "joint"))),
+            )
+            canonical = _deep_merge_config(canonical, gui_payload)
+        return canonical
+    if isinstance(values.get("values"), dict):
+        return _train_payload_from_gui_values(
+            dict(values["values"]), str(values.get("training_mode", "joint"))
+        )
+    raw_vars = values.get("vars")
+    if isinstance(raw_vars, dict):
+        return _train_payload_from_gui_values(
+            _legacy_vars_to_gui_values(raw_vars),
+            str(values.get("training_mode", "joint")),
+        )
+    return copy.deepcopy(values)
+
+
+def _extract_gui_values_from_config(values: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten any supported configuration shape into modern GUI keys."""
+    payload = _extract_train_config_payload(values)
+    flattened: Dict[str, Any] = {
+        key: value
+        for key, value in payload.items()
+        if key in _GUI_TRAIN_DIRECT_FIELDS
+    }
+    model_values = payload.get("model", payload.get("model_config", {}))
+    if isinstance(model_values, dict):
+        flattened.update(
+            (key, value)
+            for key, value in model_values.items()
+            if key in ModelConfig.__dataclass_fields__
+        )
+    if "warmup_freeze_epochs" in payload:
+        flattened["warmup_epochs"] = payload["warmup_freeze_epochs"]
+    if "w_polarizability_final" in payload:
+        flattened["w_alpha_final"] = payload["w_polarizability_final"]
+    try:
+        learning_rate = float(payload.get("lr", 0.0))
+        if learning_rate != 0.0 and payload.get("lr_ground") is not None:
+            flattened["lr_ground_scale"] = float(payload["lr_ground"]) / learning_rate
+        if learning_rate != 0.0 and payload.get("lr_response") is not None:
+            flattened["lr_response_scale"] = float(payload["lr_response"]) / learning_rate
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    raw_vars = values.get("vars")
+    if isinstance(raw_vars, dict):
+        flattened.update(_legacy_vars_to_gui_values(raw_vars))
+    if isinstance(values.get("values"), dict):
+        flattened.update(copy.deepcopy(dict(values["values"])))
+    return flattened
+
+
 def train_config_from_dict(values: Dict[str, Any]) -> TrainConfig:
-    payload = dict(values)
+    """Load a TrainConfig with schema migration and unknown-field tolerance."""
+    payload = _extract_train_config_payload(values)
+    if "model" not in payload and isinstance(payload.get("model_config"), dict):
+        payload["model"] = payload.pop("model_config")
+    payload.setdefault("mode", "joint")
     model_values = payload.pop("model", {})
     key_values = payload.pop("keys", {})
-    model = ModelConfig(
-        **{key: value for key, value in dict(model_values).items() if key in ModelConfig.__dataclass_fields__}
-    )
+
+    model_defaults = ModelConfig()
+    typed_model = {
+        key: _coerce_like_default(value, getattr(model_defaults, key))
+        for key, value in dict(model_values).items()
+        if key in ModelConfig.__dataclass_fields__
+    }
+    model = ModelConfig(**typed_model)
+    key_defaults = DatasetKeys()
     keys = DatasetKeys(
-        **{key: value for key, value in dict(key_values).items() if key in DatasetKeys.__dataclass_fields__}
+        **{
+            key: _coerce_like_default(value, getattr(key_defaults, key))
+            for key, value in dict(key_values).items()
+            if key in DatasetKeys.__dataclass_fields__
+        }
     )
-    allowed = {key: value for key, value in payload.items() if key in TrainConfig.__dataclass_fields__}
+    train_defaults = TrainConfig(mode=str(payload.get("mode", "joint")))
+    allowed = {
+        key: (
+            _parse_cpu_threads(value)
+            if key == "cpu_threads"
+            else _coerce_like_default(value, getattr(train_defaults, key))
+        )
+        for key, value in payload.items()
+        if key in TrainConfig.__dataclass_fields__ and key not in {"model", "keys"}
+    }
     allowed["model"] = model
     allowed["keys"] = keys
     return TrainConfig(**allowed)
@@ -14798,6 +15257,7 @@ class App(tk.Tk):
         
         # Core training hyperparameters.
         self.var_device = tk.StringVar(value="auto")
+        self.var_cpu_threads = tk.StringVar(value="auto")
         self.var_dtype = tk.StringVar(value="float32")
         self.var_epochs = tk.StringVar(value="50")
         self.var_bs = tk.StringVar(value="4")
@@ -15825,6 +16285,12 @@ class App(tk.Tk):
                 ("Force loss", self.var_force_loss, "combo", ["mse", "huber"]),
                 ("Huber delta", self.var_force_huber_delta, "entry", None),
                 ("Device", self.var_device, "combo", ["auto", "cpu", "mps", "cuda"]),
+                (
+                    "CPU threads",
+                    self.var_cpu_threads,
+                    "combo",
+                    ["auto", *[str(value) for value in range(1, _available_cpu_threads() + 1)]],
+                ),
                 ("Dtype", self.var_dtype, "combo", ["float32", "float64"]),
                 ("Cutoff r_max", self.var_rmax, "entry", None),
                 ("Channels", self.var_channels, "entry", None),
@@ -16797,6 +17263,7 @@ class App(tk.Tk):
             raise ValueError("Canonical dataset must be an HDF5 file (.h5/.hdf5).")
         return {
             "device": str(self.var_device.get()),
+            "cpu_threads": _parse_cpu_threads(self.var_cpu_threads.get()),
             "dataset": dataset,
             "static_data": self.var_static.get().strip(),
             "response_data": self.var_response.get().strip(),
@@ -17460,9 +17927,9 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
     ),
     "batch_size": _p(
         "Batch size",
-        "Sets the number of structures differentiated together.",
-        "Force, BEC, QEq, PME, and spin derivatives raise memory cost nonlinearly with atom count.",
-        "Typical 2-16; use 1-4 for large periodic or heavily coupled models.",
+        "Sets the maximum number of structures differentiated in one optimizer step.",
+        "CPU/CUDA use this limit directly. MPS additionally caps graph edges per step because force and BEC derivatives can exhaust unified memory.",
+        "Typical 2-16. On MPS, dense structures can reach the edge safety budget first, so the realized mean can be lower.",
     ),
     "lr": _p(
         "Learning rate",
@@ -17481,6 +17948,12 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "Selects CPU, Apple MPS, CUDA, or automatic detection.",
         "The backend preserves differentiability when QEq/D4 require CPU sub-operations on MPS.",
         "auto is recommended; use CPU for numerical diagnosis.",
+    ),
+    "cpu_threads": _p(
+        "CPU compute threads",
+        "Controls PyTorch intra-op parallelism for tensor kernels and CPU training.",
+        "CPU auto uses every CPU visible to the process; MPS/CUDA auto reserves a bounded helper pool to avoid driver contention.",
+        "Use auto first. Choose 1 for reproducible performance diagnosis or a specific positive count for shared machines.",
     ),
     "dtype": _p(
         "Floating-point dtype",
@@ -17933,6 +18406,7 @@ GUI_DEFAULTS = {
     "base_ckpt": "",
     "out_ckpt": "model.pt",
     "device": "auto",
+    "cpu_threads": "auto",
     "dtype": "float32",
     "epochs": "50",
     "batch_size": "4",
@@ -18007,6 +18481,130 @@ GUI_DEFAULTS = {
 }
 
 
+@dataclass(frozen=True)
+class GUINumericRule:
+    """Strict action-time rule paired with a permissive live Qt editor."""
+
+    kind: str
+    minimum: Optional[float] = None
+    maximum: Optional[float] = None
+    minimum_inclusive: bool = True
+    maximum_inclusive: bool = True
+
+
+def _int_rule(
+    minimum: Optional[int] = None, maximum: Optional[int] = None
+) -> GUINumericRule:
+    return GUINumericRule("int", minimum, maximum)
+
+
+def _float_rule(
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+    *,
+    minimum_inclusive: bool = True,
+    maximum_inclusive: bool = True,
+) -> GUINumericRule:
+    return GUINumericRule(
+        "float", minimum, maximum, minimum_inclusive, maximum_inclusive
+    )
+
+
+# QLineEdit validators prevent accidental suffixes such as ``48s``. These
+# rules are also checked independently before an action, because setText(),
+# imported JSON, and old defaults can bypass a Qt validator.
+GUI_NUMERIC_RULES: Dict[str, GUINumericRule] = {
+    "epochs": _int_rule(1),
+    "batch_size": _int_rule(1),
+    "lr": _float_rule(0.0, minimum_inclusive=False),
+    "force_huber_delta": _float_rule(0.0, minimum_inclusive=False),
+    "r_max": _float_rule(0.0, minimum_inclusive=False),
+    "num_channels": _int_rule(1),
+    "num_interactions": _int_rule(1),
+    "num_radial_basis": _int_rule(1),
+    "field_scale": _float_rule(0.0),
+    "val_fraction": _float_rule(
+        0.0, 1.0, minimum_inclusive=False, maximum_inclusive=False
+    ),
+    "seed": _int_rule(0),
+    "joint_stages": _int_rule(1),
+    "warmup_epochs": _int_rule(0),
+    "lr_ground_scale": _float_rule(0.0),
+    "lr_response_scale": _float_rule(0.0),
+    "w_dipole_final": _float_rule(0.0),
+    "w_alpha_final": _float_rule(0.0),
+    "w_energy": _float_rule(0.0),
+    "w_forces": _float_rule(0.0),
+    "w_dipole": _float_rule(0.0),
+    "w_polarizability": _float_rule(0.0),
+    "w_charges": _float_rule(0.0),
+    "w_atomic_dipoles": _float_rule(0.0),
+    "w_atomic_polarizability": _float_rule(0.0),
+    "w_c6": _float_rule(0.0),
+    "w_bec": _float_rule(0.0),
+    "w_magnetic_moments": _float_rule(0.0),
+    "w_effective_field": _float_rule(0.0),
+    "w_j": _float_rule(0.0),
+    "w_di": _float_rule(0.0),
+    "w_dmi": _float_rule(0.0),
+    "chem_max_z": _int_rule(1, 118),
+    "chem_aug_prob": _float_rule(0.0, 1.0),
+    "chem_aug_noise_std": _float_rule(0.0),
+    "chem_aug_mix_max": _float_rule(0.0, 1.0),
+    "qeq_smearing": _float_rule(0.0, minimum_inclusive=False),
+    "qeq_hardness_min": _float_rule(0.0, minimum_inclusive=False),
+    "qeq_pme_smearing": _float_rule(0.0, minimum_inclusive=False),
+    "qeq_pme_lr_wavelength": _float_rule(0.0, minimum_inclusive=False),
+    "qeq_stability_floor": _float_rule(0.0),
+    "deq_max_iter": _int_rule(1),
+    "deq_tol": _float_rule(0.0, minimum_inclusive=False),
+    "deq_damping": _float_rule(0.0, minimum_inclusive=False),
+    "deq_alpha_max": _float_rule(0.0, minimum_inclusive=False),
+    "spin_cutoff": _float_rule(0.0, minimum_inclusive=False),
+    "coupling_iterations": _int_rule(1),
+    "coupling_tol": _float_rule(0.0, minimum_inclusive=False),
+    "auto_trials": _int_rule(1),
+    "auto_trial_epochs": _int_rule(1),
+    "auto_subset": _float_rule(
+        0.0, 100.0, minimum_inclusive=False, maximum_inclusive=True
+    ),
+}
+
+
+def _parse_gui_numeric_value(
+    name: str, value: Any, rule: Optional[GUINumericRule] = None
+) -> Any:
+    """Parse one GUI number exactly and reject empty, malformed, or non-finite input."""
+    selected = rule or GUI_NUMERIC_RULES[name]
+    text = str(value).strip()
+    if not text:
+        raise ValueError("a value is required")
+    try:
+        parsed: Any = int(text, 10) if selected.kind == "int" else float(text)
+    except (TypeError, ValueError, OverflowError) as exc:
+        expected = "an integer" if selected.kind == "int" else "a number"
+        raise ValueError(f"expected {expected}, got {text!r}") from exc
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        raise ValueError("NaN and infinity are not allowed")
+    if selected.minimum is not None:
+        below = parsed < selected.minimum
+        on_excluded_minimum = (
+            not selected.minimum_inclusive and parsed == selected.minimum
+        )
+        if below or on_excluded_minimum:
+            relation = ">=" if selected.minimum_inclusive else ">"
+            raise ValueError(f"must be {relation} {selected.minimum:g}")
+    if selected.maximum is not None:
+        above = parsed > selected.maximum
+        on_excluded_maximum = (
+            not selected.maximum_inclusive and parsed == selected.maximum
+        )
+        if above or on_excluded_maximum:
+            relation = "<=" if selected.maximum_inclusive else "<"
+            raise ValueError(f"must be {relation} {selected.maximum:g}")
+    return parsed
+
+
 LEGACY_TK_VARIABLES = {
     "dataset": "var_dataset",
     "static_data": "var_static",
@@ -18014,6 +18612,7 @@ LEGACY_TK_VARIABLES = {
     "base_ckpt": "var_base_ckpt",
     "out_ckpt": "var_out_ckpt",
     "device": "var_device",
+    "cpu_threads": "var_cpu_threads",
     "dtype": "var_dtype",
     "epochs": "var_epochs",
     "batch_size": "var_bs",
@@ -18506,8 +19105,17 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._search_space_customized = False
         self._metric_history: List[Dict[str, Any]] = []
         self._artifact_dir: Optional[Path] = None
+        self._stage_histories: Dict[str, List[Dict[str, Any]]] = {}
+        self._stage_artifacts: Dict[str, Path] = {}
+        self._stage_latest_artifact_epoch: Dict[str, int] = {}
+        self._stage_info: Dict[str, Dict[str, Any]] = {}
+        self._stage_order: List[str] = []
+        self._active_stage_id = ""
         self._default_path = Path.home() / ".dual_layer_field_gui.defaults.json"
         self._factory_values = dict(GUI_DEFAULTS)
+        self._config_passthrough: Dict[str, Any] = {}
+        self._imported_train_payload: Dict[str, Any] = {}
+        self._last_config_warnings: List[str] = []
         self._signal_guard = False
         self._tooltip_filter = ParameterToolTipFilter(self)
 
@@ -18547,6 +19155,9 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 selection-background-color: #B8A8E2;
             }}
             QLineEdit:focus, QComboBox:focus {{ border: 1.5px solid {PALETTE['purple']}; background: #FFFFFF; }}
+            QLineEdit[invalidInput="true"] {{
+                color: #8C3048; background: #FCE9EE; border: 1.5px solid {PALETTE['danger']};
+            }}
             QLineEdit:disabled, QComboBox:disabled {{ color: #847D8B; background: #F1EDF3; border-color: #DDD6E2; }}
             QComboBox::drop-down {{ border: 0; width: 25px; }}
             QComboBox QAbstractItemView {{
@@ -18767,6 +19378,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 ("force_loss", "Force loss", ("mse", "huber")),
                 ("force_huber_delta", "Huber delta", None),
                 ("device", "Device", ("auto", "cpu", "mps", "cuda")),
+                (
+                    "cpu_threads",
+                    "CPU threads",
+                    ("auto", *tuple(str(value) for value in range(1, _available_cpu_threads() + 1))),
+                ),
                 ("dtype", "Dtype", ("float32", "float64")),
                 ("r_max", "Cutoff r_max", None),
                 ("num_channels", "Channels", None),
@@ -18781,6 +19397,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self.model_size_label.setWordWrap(True)
         self.model_size_label.setStyleSheet("color:#4F6C60; font-weight:650;")
         card.body_layout.addWidget(self.model_size_label)
+        self.thread_policy_label = QtWidgets.QLabel()
+        self.thread_policy_label.setWordWrap(True)
+        self.thread_policy_label.setStyleSheet("color:#4F6C60;")
+        card.body_layout.addWidget(self.thread_policy_label)
+        self._update_thread_policy_label()
         toggle_row = QtWidgets.QHBoxLayout()
         toggle_row.addWidget(self._make_toggle_tile("export_sevennet", "SevenNet export"))
         toggle_row.addWidget(self._make_toggle_tile("save_epoch_artifacts", "Live plots + artifacts"))
@@ -19161,11 +19782,27 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         )
         live_view.setMaximumWidth(210)
         toolbar.addWidget(live_view)
+        toolbar.addWidget(QtWidgets.QLabel("Stage"))
+        self.analysis_stage_selector = QtWidgets.QComboBox()
+        self.analysis_stage_selector.addItem("All Stages", "")
+        self.analysis_stage_selector.setMinimumWidth(150)
+        self.analysis_stage_selector.setMaximumWidth(220)
+        self.analysis_stage_selector.currentIndexChanged.connect(
+            lambda _index: self._render_live_dashboard()
+        )
+        toolbar.addWidget(self.analysis_stage_selector)
         toolbar.addStretch(1)
         hint = QtWidgets.QLabel("Updates after every validation epoch")
         hint.setStyleSheet("color:#8A8391;")
         toolbar.addWidget(hint)
         analysis_layout.addLayout(toolbar)
+        self.analysis_stage_summary = QtWidgets.QLabel("Stage: current run")
+        self.analysis_stage_summary.setWordWrap(True)
+        self.analysis_stage_summary.setStyleSheet(
+            "color:#665E70; background:#F5F0F8; border-radius:9px; "
+            "padding:6px 9px; font-size:10px;"
+        )
+        analysis_layout.addWidget(self.analysis_stage_summary)
         try:
             from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
             from matplotlib.figure import Figure
@@ -19265,6 +19902,23 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
     def _make_line_edit(self, key: str) -> QtWidgets.QLineEdit:
         control = QtWidgets.QLineEdit(str(GUI_DEFAULTS[key]))
+        rule = GUI_NUMERIC_RULES.get(key)
+        if rule is not None:
+            if rule.kind == "int":
+                lower = int(rule.minimum) if rule.minimum is not None else -2147483648
+                upper = int(rule.maximum) if rule.maximum is not None else 2147483647
+                validator: QtGui.QValidator = QtGui.QIntValidator(
+                    lower, upper, control
+                )
+            else:
+                validator = QtGui.QDoubleValidator(control)
+                validator.setNotation(
+                    QtGui.QDoubleValidator.Notation.ScientificNotation
+                )
+                # Range enforcement remains in the strict preflight so users
+                # can naturally replace a value via intermediate text states.
+            control.setValidator(validator)
+            control.setProperty("numericParameter", True)
         self.controls[key] = control
         return control
 
@@ -19313,9 +19967,20 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             index = control.findText(text)
             if index >= 0:
                 control.setCurrentIndex(index)
+            else:
+                if key == "cpu_threads":
+                    control.setCurrentText("auto")
+                    raise ValueError(
+                        f"requested {value!r} exceeds this machine's selectable "
+                        f"range (1-{self.backend._available_cpu_threads()}); using auto"
+                    )
+                raise ValueError(
+                    f"Unsupported value {value!r} for {key}; "
+                    f"expected one of {[control.itemText(i) for i in range(control.count())]}"
+                )
         elif isinstance(control, ToggleTile):
             switch_blocker = QtCore.QSignalBlocker(control.switch)
-            control.setChecked(bool(value))
+            control.setChecked(self.backend._coerce_config_bool(value))
         del blocker
         if switch_blocker is not None:
             del switch_blocker
@@ -19391,6 +20056,33 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
     def current_values(self) -> Dict[str, Any]:
         return {key: self.value(key) for key in self.controls}
 
+    def _update_thread_policy_label(self) -> None:
+        if not hasattr(self, "thread_policy_label"):
+            return
+        requested_device = str(self.value("device") or "auto").strip().lower()
+        resolved_device = (
+            self.backend._default_device_name()
+            if requested_device == "auto"
+            else requested_device
+        )
+        try:
+            policy = self.backend._resolve_cpu_thread_policy(
+                self.value("cpu_threads"), torch.device(resolved_device)
+            )
+            suffix = (
+                "all available CPU threads"
+                if policy["source"] == "auto-cpu-all"
+                else "bounded accelerator helper pool"
+                if str(policy["source"]).endswith("-helper")
+                else str(policy["source"])
+            )
+            self.thread_policy_label.setText(
+                f"Runtime thread policy: {policy['effective']} / "
+                f"{policy['available']} CPU threads ({suffix})."
+            )
+        except Exception as exc:
+            self.thread_policy_label.setText(f"Runtime thread policy is invalid: {exc}")
+
     def _connect_reactivity(self) -> None:
         dataset_keys = {"dataset", "static_data", "response_data"}
         architecture_keys = set(self.architecture_tiles)
@@ -19412,39 +20104,118 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
     def _parameter_changed(self, key: str) -> None:
         if self._signal_guard:
             return
-        if key in {
-            "r_max", "num_channels", "num_interactions", "num_radial_basis",
-            "dtype", "rbf_type", "field_scale", "spin_cutoff",
-        }:
-            self.estimate_timer.start()
-        search_dependencies = {
-            "r_max", "num_channels", "num_interactions", "num_radial_basis",
-            "field_scale", "lr", "batch_size", "force_loss", "force_huber_delta",
-            "qeq_smearing",
-            "qeq_hardness_min", "qeq_pme_smearing",
-            "qeq_pme_lr_wavelength", "qeq_stability_floor",
-            "deq_alpha_max", "d4_functional", "spin_cutoff",
-            "coupling_iterations", "coupling_tol", "chem_aug_prob",
-            "chem_aug_noise_std", "chem_aug_mix_max", "auto_level",
-            "auto_trials", "auto_trial_epochs", "auto_subset",
-        }
-        if key in search_dependencies or key.startswith("w_"):
-            self._refresh_tooltips()
-            self._refresh_search_table()
-        if key == "force_loss":
-            row = self.field_rows.get("force_huber_delta")
-            if row is not None:
-                enabled = str(self.value("force_loss")).lower() == "huber"
-                row.setEnabled(enabled)
-                if enabled:
-                    self._control_disabled_reasons.pop("force_huber_delta", None)
-                else:
-                    self._control_disabled_reasons["force_huber_delta"] = (
-                        "Huber delta is used only when Force loss is huber."
-                    )
-            self._refresh_tooltips()
-        if key == "live_plot":
-            self._render_live_dashboard()
+        self._update_numeric_control_state(key)
+        try:
+            if key in {"device", "cpu_threads"} and hasattr(self, "thread_policy_label"):
+                self._update_thread_policy_label()
+            if key in {
+                "r_max", "num_channels", "num_interactions", "num_radial_basis",
+                "dtype", "rbf_type", "field_scale", "spin_cutoff",
+            }:
+                self.estimate_timer.start()
+            search_dependencies = {
+                "r_max", "num_channels", "num_interactions", "num_radial_basis",
+                "field_scale", "lr", "batch_size", "force_loss", "force_huber_delta",
+                "qeq_smearing",
+                "qeq_hardness_min", "qeq_pme_smearing",
+                "qeq_pme_lr_wavelength", "qeq_stability_floor",
+                "deq_alpha_max", "d4_functional", "spin_cutoff",
+                "coupling_iterations", "coupling_tol", "chem_aug_prob",
+                "chem_aug_noise_std", "chem_aug_mix_max", "auto_level",
+                "auto_trials", "auto_trial_epochs", "auto_subset",
+            }
+            if key in search_dependencies or key.startswith("w_"):
+                self._refresh_tooltips()
+                self._refresh_search_table()
+            if key == "force_loss":
+                row = self.field_rows.get("force_huber_delta")
+                if row is not None:
+                    enabled = str(self.value("force_loss")).lower() == "huber"
+                    row.setEnabled(enabled)
+                    if enabled:
+                        self._control_disabled_reasons.pop("force_huber_delta", None)
+                    else:
+                        self._control_disabled_reasons["force_huber_delta"] = (
+                            "Huber delta is used only when Force loss is huber."
+                        )
+                self._refresh_tooltips()
+            if key == "live_plot":
+                self._render_live_dashboard()
+        except (TypeError, ValueError, OverflowError, ArithmeticError) as exc:
+            # TextChanged emits expected intermediate values such as "" and
+            # "1e". Keep the editor responsive; action handlers remain strict.
+            self._append_log(
+                f"[{self.backend._now()}] Waiting for a valid {key} value: {exc}"
+            )
+
+    def _numeric_validation_errors(
+        self, keys: Optional[Iterable[str]] = None
+    ) -> Dict[str, str]:
+        selected = set(GUI_NUMERIC_RULES if keys is None else keys)
+        errors: Dict[str, str] = {}
+        for name in GUI_NUMERIC_RULES:
+            if name not in selected or name not in self.controls:
+                continue
+            control = self.controls[name]
+            # Disabled architecture-dependent values cannot affect the run.
+            if not control.isEnabled():
+                continue
+            try:
+                _parse_gui_numeric_value(name, self.value(name))
+            except (TypeError, ValueError, OverflowError) as exc:
+                errors[name] = str(exc)
+
+        # This dependency is clearer as a field-level validation than as the
+        # silent clamp retained solely for old imported configurations.
+        if not ({"r_max", "spin_cutoff"} & set(errors)):
+            try:
+                if bool(self.value("enable_spin")):
+                    local_cutoff = float(self.value("r_max"))
+                    magnetic_cutoff = float(self.value("spin_cutoff"))
+                    if magnetic_cutoff > local_cutoff:
+                        errors["spin_cutoff"] = (
+                            f"must be <= r_max ({local_cutoff:g})"
+                        )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+        return errors
+
+    def _update_numeric_control_state(self, key: str) -> None:
+        control = self.controls.get(key)
+        if key not in GUI_NUMERIC_RULES or not isinstance(
+            control, QtWidgets.QLineEdit
+        ):
+            return
+        invalid = False
+        if control.text().strip():
+            try:
+                _parse_gui_numeric_value(key, control.text())
+            except (TypeError, ValueError, OverflowError):
+                invalid = True
+        control.setProperty("invalidInput", invalid)
+        control.style().unpolish(control)
+        control.style().polish(control)
+
+    def _validate_numeric_preflight(self, action: str) -> bool:
+        errors = self._numeric_validation_errors()
+        for name in GUI_NUMERIC_RULES:
+            self._update_numeric_control_state(name)
+        if not errors:
+            return True
+        first = next(iter(errors))
+        control = self.controls.get(first)
+        if control is not None:
+            control.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        details = "\n".join(
+            f"- {PARAMETER_INFO.get(name).title if name in PARAMETER_INFO else name}: {message}"
+            for name, message in errors.items()
+        )
+        QtWidgets.QMessageBox.critical(
+            self,
+            f"{action} configuration",
+            "Correct the following numeric fields before continuing:\n\n" + details,
+        )
+        return False
 
     def _architecture_changed(self, key: str) -> None:
         if self._signal_guard:
@@ -19584,9 +20355,12 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         info = PARAMETER_INFO.get(key)
         if info is None:
             return key
-        ranges = self.backend.dynamic_parameter_reference_ranges(
-            self.current_values(), self._capability
-        )
+        try:
+            ranges = self.backend.dynamic_parameter_reference_ranges(
+                self.current_values(), self._capability
+            )
+        except (TypeError, ValueError, OverflowError, ArithmeticError):
+            ranges = {}
         reference = ranges.get(key, info.reference)
         reason = self._control_disabled_reasons.get(
             key, self._architecture_disabled_reasons.get(key, "")
@@ -19797,6 +20571,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             raise ValueError("Canonical dataset must be HDF5 (.h5/.hdf5).")
         return {
             "device": str(values["device"]),
+            "cpu_threads": self.backend._parse_cpu_threads(values["cpu_threads"]),
             "dataset": dataset,
             "static_data": str(values["static_data"]).strip(),
             "response_data": str(values["response_data"]).strip(),
@@ -19864,7 +20639,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         lr: Optional[float] = None,
     ) -> Any:
         values = self.current_values()
-        return self.backend.TrainConfig(
+        generated = self.backend.TrainConfig(
             mode=mode,
             base_ckpt=str(values["base_ckpt"] if base_ckpt is None else base_ckpt),
             out_ckpt=str(values["out_ckpt"] if out_ckpt is None else out_ckpt),
@@ -19872,6 +20647,31 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             lr=float(values["lr"] if lr is None else lr),
             **self._train_kwargs_for_mode(mode),
         )
+        if not self._imported_train_payload:
+            return generated
+        # Preserve valid TrainConfig fields that do not currently have a GUI
+        # control (for example early stopping and non-finite recovery), while
+        # every visible setting remains authoritative.
+        imported = self.backend.train_config_from_dict(self._imported_train_payload)
+        visible_fields = set(self.backend._GUI_TRAIN_DIRECT_FIELDS) | {
+            "mode", "base_ckpt", "out_ckpt", "epochs", "lr",
+            "lr_ground", "lr_response", "warmup_freeze_epochs",
+            "w_dipole_final", "w_polarizability_final",
+        }
+        for field_name in self.backend.TrainConfig.__dataclass_fields__:
+            if field_name not in visible_fields:
+                setattr(generated, field_name, copy.deepcopy(getattr(imported, field_name)))
+        visible_model_fields = set(self.controls) & set(
+            self.backend.ModelConfig.__dataclass_fields__
+        )
+        for field_name in self.backend.ModelConfig.__dataclass_fields__:
+            if field_name not in visible_model_fields:
+                setattr(
+                    generated.model,
+                    field_name,
+                    copy.deepcopy(getattr(imported.model, field_name)),
+                )
+        return generated
 
     def _set_running(self, running: bool, label: str = "") -> None:
         self._training_running = bool(running)
@@ -19888,6 +20688,18 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
     def _reset_dashboard(self, checkpoint: str, state: str = "Preparing") -> None:
         self._metric_history.clear()
+        self._stage_histories.clear()
+        self._stage_artifacts.clear()
+        self._stage_latest_artifact_epoch.clear()
+        self._stage_info.clear()
+        self._stage_order.clear()
+        self._active_stage_id = ""
+        selector = getattr(self, "analysis_stage_selector", None)
+        if selector is not None:
+            blocker = QtCore.QSignalBlocker(selector)
+            selector.clear()
+            selector.addItem("All Stages", "")
+            del blocker
         self._artifact_dir = self._artifact_dir_for_checkpoint(checkpoint)
         self.progress_bar.setValue(0)
         self.header_status.setText(state)
@@ -19895,7 +20707,69 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self.state_value.setText(state)
         self.epoch_value.setText("Epoch 0 / --")
         self.score_value.setText("Score --")
+        if hasattr(self, "analysis_stage_summary"):
+            self.analysis_stage_summary.setText("Stage: current run")
         self._render_live_dashboard()
+
+    @staticmethod
+    def _stage_progress_callback(
+        callback: Callable[[Dict[str, Any]], None],
+        *,
+        stage_id: str,
+        stage_label: str,
+        stage_index: int,
+        stage_total: int,
+        checkpoint: str,
+    ) -> Callable[[Dict[str, Any]], None]:
+        """Attach immutable workflow-stage identity to every backend event."""
+        def emit(payload: Dict[str, Any]) -> None:
+            event = dict(payload)
+            event.update(
+                {
+                    "stage_id": str(stage_id),
+                    "stage_label": str(stage_label),
+                    "stage_index": int(stage_index),
+                    "stage_total": int(stage_total),
+                    "stage_checkpoint": str(checkpoint),
+                }
+            )
+            callback(event)
+
+        return emit
+
+    def _activate_stage(self, event: Dict[str, Any]) -> str:
+        stage_id = str(event.get("stage_id", "")).strip()
+        if not stage_id:
+            return ""
+        if stage_id not in self._stage_order:
+            self._stage_order.append(stage_id)
+            selector = getattr(self, "analysis_stage_selector", None)
+            if selector is not None:
+                label = str(event.get("stage_label", stage_id))
+                index = int(event.get("stage_index", len(self._stage_order)))
+                total = int(event.get("stage_total", len(self._stage_order)))
+                blocker = QtCore.QSignalBlocker(selector)
+                selector.addItem(f"{index}/{total} {label}", stage_id)
+                del blocker
+        info = self._stage_info.setdefault(stage_id, {})
+        info.update(
+            {
+                key: event[key]
+                for key in (
+                    "stage_label", "stage_index", "stage_total", "stage_checkpoint"
+                )
+                if key in event
+            }
+        )
+        self._stage_histories.setdefault(stage_id, [])
+        self._active_stage_id = stage_id
+        return stage_id
+
+    def _selected_analysis_stage(self) -> str:
+        selector = getattr(self, "analysis_stage_selector", None)
+        if selector is None:
+            return ""
+        return str(selector.currentData() or "")
 
     def _launch_worker(self, target: Any, state: str) -> None:
         if self._training_running:
@@ -19916,6 +20790,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
     def _start_training(self, mode: str) -> None:
         if self._training_running:
+            return
+        if not self._validate_numeric_preflight("Training"):
             return
         if mode == "response" and not str(self.value("base_ckpt")).strip():
             answer = QtWidgets.QMessageBox.question(
@@ -19938,10 +20814,18 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._reset_dashboard(cfg.out_ckpt)
 
         def work() -> None:
+            progress = self._stage_progress_callback(
+                self.bus.event.emit,
+                stage_id=f"single-{mode}",
+                stage_label=mode.title(),
+                stage_index=1,
+                stage_total=1,
+                checkpoint=cfg.out_ckpt,
+            )
             self.backend.train_dual_layer(
                 cfg,
                 self.bus.log.emit,
-                self.bus.event.emit,
+                progress,
                 self._stop_event.is_set,
             )
             self.bus.event.emit(
@@ -19951,6 +20835,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._launch_worker(work, "Training")
 
     def _run_chained(self) -> None:
+        if not self._validate_numeric_preflight("Chained training"):
+            return
         try:
             self._validate_paths("joint")
             out_ckpt = str(self.value("out_ckpt"))
@@ -19969,8 +20855,16 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             self.bus.log.emit(
                 f"[{self.backend._now()}] === Chain 1/2: Base -> {base_out} ==="
             )
+            base_progress = self._stage_progress_callback(
+                self.bus.event.emit,
+                stage_id="chain-base",
+                stage_label="Base",
+                stage_index=1,
+                stage_total=2,
+                checkpoint=base_cfg.out_ckpt,
+            )
             self.backend.train_dual_layer(
-                base_cfg, self.bus.log.emit, self.bus.event.emit, self._stop_event.is_set
+                base_cfg, self.bus.log.emit, base_progress, self._stop_event.is_set
             )
             if self._stop_event.is_set():
                 self.bus.event.emit({"type": "run_complete", "stopped": True})
@@ -19979,10 +20873,18 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             self.bus.log.emit(
                 f"[{self.backend._now()}] === Chain 2/2: Response -> {out_ckpt} ==="
             )
+            response_progress = self._stage_progress_callback(
+                self.bus.event.emit,
+                stage_id="chain-response",
+                stage_label="Response",
+                stage_index=2,
+                stage_total=2,
+                checkpoint=response_cfg.out_ckpt,
+            )
             self.backend.train_dual_layer(
                 response_cfg,
                 self.bus.log.emit,
-                self.bus.event.emit,
+                response_progress,
                 self._stop_event.is_set,
             )
             self.bus.event.emit(
@@ -19992,6 +20894,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._launch_worker(work, "Chained")
 
     def _run_full_chain(self) -> None:
+        if not self._validate_numeric_preflight("Full chain"):
+            return
         try:
             self._validate_paths("joint")
             values = self.current_values()
@@ -20055,10 +20959,23 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     f"[{self.backend._now()}] === Full Chain {index}/{total}: "
                     f"{cfg.mode} -> {cfg.out_ckpt} ==="
                 )
+                stage_label = (
+                    "Base" if index == 1
+                    else "Response" if index == 2
+                    else f"Joint FT {index - 2}"
+                )
+                stage_progress = self._stage_progress_callback(
+                    self.bus.event.emit,
+                    stage_id=f"full-chain-{index:02d}-{cfg.mode}",
+                    stage_label=stage_label,
+                    stage_index=index,
+                    stage_total=total,
+                    checkpoint=cfg.out_ckpt,
+                )
                 self.backend.train_dual_layer(
                     cfg,
                     self.bus.log.emit,
-                    self.bus.event.emit,
+                    stage_progress,
                     self._stop_event.is_set,
                 )
                 if index == 1:
@@ -20275,6 +21192,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
     def _run_auto_search(self) -> None:
         if self._training_running:
             return
+        if not self._validate_numeric_preflight("Auto Research"):
+            return
         try:
             self._sync_search_space_editor(
                 mark_custom=self._search_space_customized
@@ -20403,6 +21322,13 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             return
         event = dict(payload)
         kind = str(event.get("type", ""))
+        stage_id = self._activate_stage(event)
+        stage_prefix = ""
+        if stage_id:
+            label = str(self._stage_info[stage_id].get("stage_label", stage_id))
+            index = int(self._stage_info[stage_id].get("stage_index", 1))
+            total = int(self._stage_info[stage_id].get("stage_total", 1))
+            stage_prefix = f"{label} ({index}/{total})  "
         if kind == "train":
             fraction = max(0.0, min(1.0, float(event.get("overall_frac", 0.0))))
             self.progress_bar.setValue(int(round(1000.0 * fraction)))
@@ -20411,9 +21337,9 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             step = int(event.get("step", 0))
             steps = int(event.get("steps", 0))
             eta = self._format_eta(float(event.get("eta_s", float("nan"))))
-            text = f"Epoch {epoch}/{epochs}  Batch {step}/{steps}  {eta}"
+            text = f"{stage_prefix}Epoch {epoch}/{epochs}  Batch {step}/{steps}  {eta}"
             self.header_progress.setText(text)
-            self.epoch_value.setText(f"Epoch {epoch} / {epochs}")
+            self.epoch_value.setText(f"{stage_prefix}Epoch {epoch} / {epochs}")
         elif kind == "prep":
             task = str(event.get("task", "Preparing"))
             current = event.get("current")
@@ -20421,7 +21347,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             text = task
             if current is not None and total is not None:
                 text += f"  {int(current)}/{int(total)}"
-            self.header_progress.setText(text)
+            self.header_progress.setText(stage_prefix + text)
             self.progress_bar.setValue(
                 int(1000.0 * max(0.0, min(1.0, float(event.get("overall_frac", 0.0)))))
             )
@@ -20431,7 +21357,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             step = int(event.get("step", 0))
             steps = int(event.get("steps", 0))
             self.header_progress.setText(
-                f"Epoch {epoch}/{epochs}  Validating {step}/{steps}"
+                f"{stage_prefix}Epoch {epoch}/{epochs}  Validating {step}/{steps}"
             )
         elif kind == "metrics":
             self._consume_metrics(event)
@@ -20439,6 +21365,12 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             artifact = event.get("artifact_dir")
             if artifact:
                 self._artifact_dir = Path(str(artifact))
+                if stage_id:
+                    self._stage_artifacts[stage_id] = self._artifact_dir
+                    if bool(event.get("plots_updated", False)):
+                        self._stage_latest_artifact_epoch[stage_id] = int(
+                            event.get("epoch", 0)
+                        )
             self._render_live_dashboard()
         elif kind == "epoch":
             epoch = int(event.get("epoch", 0))
@@ -20529,23 +21461,40 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         scrollbar.setValue(scrollbar.maximum())
 
     def _consume_metrics(self, event: Dict[str, Any]) -> None:
-        self._metric_history.append(dict(event))
+        metric = dict(event)
+        self._metric_history.append(metric)
+        stage_id = self._activate_stage(metric)
+        if stage_id:
+            self._stage_histories.setdefault(stage_id, []).append(metric)
         artifact = event.get("artifact_dir")
         if artifact:
             self._artifact_dir = Path(str(artifact))
+            if stage_id:
+                self._stage_artifacts[stage_id] = self._artifact_dir
         epoch = int(event.get("epoch", 0))
         epochs = int(event.get("epochs", 0))
         score = float(event.get("validation_score", float("nan")))
         self.header_status.setText("Training")
         self.state_value.setText("Training")
-        self.epoch_value.setText(f"Epoch {epoch} / {epochs}")
+        stage_label = ""
+        if stage_id:
+            info = self._stage_info[stage_id]
+            stage_label = str(info.get("stage_label", stage_id))
+            stage_index = int(info.get("stage_index", 1))
+            stage_total = int(info.get("stage_total", 1))
+            self.epoch_value.setText(
+                f"{stage_label} {stage_index}/{stage_total}  Epoch {epoch}/{epochs}"
+            )
+        else:
+            self.epoch_value.setText(f"Epoch {epoch} / {epochs}")
         self.score_value.setText(
             f"Score {score:.4g}" if math.isfinite(score) else "Score --"
         )
         memory = event.get("memory")
         if isinstance(memory, dict):
             self.header_progress.setText(
-                f"Epoch {epoch}/{epochs}  RSS {float(memory.get('rss_mib', 0.0)):.0f} MiB  "
+                (f"{stage_label}  " if stage_label else "")
+                + f"Epoch {epoch}/{epochs}  RSS {float(memory.get('rss_mib', 0.0)):.0f} MiB  "
                 f"MPS {float(memory.get('mps_driver_mib', 0.0)):.0f} MiB"
                 + ("  MEMORY GROWTH WARNING" if event.get("memory_leak_warning") else "")
             )
@@ -20577,7 +21526,31 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         for spine in axis.spines.values():
             spine.set_color("#DED7E3")
 
-    def _latest_regression_image(self) -> Optional[Path]:
+    def _latest_regression_image(
+        self, stage_id: Optional[str] = None
+    ) -> Optional[Path]:
+        selected_stage = str(stage_id or self._active_stage_id).strip()
+        if selected_stage:
+            directory = self._stage_artifacts.get(selected_stage)
+            if directory is None:
+                checkpoint = self._stage_info.get(selected_stage, {}).get(
+                    "stage_checkpoint"
+                )
+                if checkpoint:
+                    directory = self._artifact_dir_for_checkpoint(str(checkpoint))
+            if directory is None:
+                return None
+            expected_epoch = self._stage_latest_artifact_epoch.get(selected_stage)
+            if expected_epoch is None:
+                return None
+            if expected_epoch > 0:
+                candidate = (
+                    directory
+                    / "plots"
+                    / f"regression_full_epoch_{expected_epoch:04d}.png"
+                )
+                return candidate if candidate.is_file() else None
+            return None
         directory = self._artifact_dir or self._artifact_dir_for_checkpoint(
             str(self.value("out_ckpt"))
         )
@@ -20589,7 +21562,36 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             return
         figure = self.figure
         figure.clear()
-        history = list(self._metric_history)
+        selected_stage = self._selected_analysis_stage()
+        history = list(
+            self._stage_histories.get(selected_stage, [])
+            if selected_stage
+            else self._metric_history
+        )
+        stage_groups = [
+            (stage_id, list(self._stage_histories.get(stage_id, [])))
+            for stage_id in self._stage_order
+            if self._stage_histories.get(stage_id)
+            and (not selected_stage or stage_id == selected_stage)
+        ]
+        if not stage_groups and history:
+            stage_groups = [("", history)]
+        stage_text = "All stages (independent epoch axes)"
+        if selected_stage:
+            info = self._stage_info.get(selected_stage, {})
+            stage_text = (
+                f"Stage {int(info.get('stage_index', 1))}/"
+                f"{int(info.get('stage_total', 1))}: "
+                f"{info.get('stage_label', selected_stage)}"
+            )
+        elif self._stage_order:
+            labels = [
+                str(self._stage_info.get(stage_id, {}).get("stage_label", stage_id))
+                for stage_id in self._stage_order
+            ]
+            stage_text += " - " + " | ".join(labels)
+        if hasattr(self, "analysis_stage_summary"):
+            self.analysis_stage_summary.setText(stage_text)
         view = str(self.value("live_plot")) if "live_plot" in self.controls else "Regression"
         if not history:
             axis = figure.add_subplot(111)
@@ -20607,102 +21609,181 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             self.canvas.draw_idle()
             return
         if view == "Regression":
-            image_path = self._latest_regression_image()
-            if image_path is not None:
+            regression_stages = (
+                [selected_stage]
+                if selected_stage
+                else [
+                    stage_id
+                    for stage_id in self._stage_order
+                    if self._stage_histories.get(stage_id)
+                ]
+            )
+            regression_images = [
+                (stage_id, self._latest_regression_image(stage_id))
+                for stage_id in regression_stages
+            ]
+            regression_images = [
+                (stage_id, path)
+                for stage_id, path in regression_images
+                if path is not None
+            ]
+            if regression_images:
                 from matplotlib import image as mpl_image
-
-                axis = figure.add_subplot(111)
-                axis.imshow(mpl_image.imread(str(image_path)))
-                axis.set_axis_off()
-                axis.set_title(
-                    f"Latest validation parity  /  {image_path.name}", loc="left",
-                    fontsize=11, fontweight="bold", color="#302C3C", pad=8,
-                )
+                columns = 2 if len(regression_images) > 1 else 1
+                rows = int(math.ceil(len(regression_images) / columns))
+                for index, (stage_id, image_path) in enumerate(regression_images):
+                    axis = figure.add_subplot(rows, columns, index + 1)
+                    axis.imshow(mpl_image.imread(str(image_path)))
+                    axis.set_axis_off()
+                    info = self._stage_info.get(stage_id, {})
+                    label = str(info.get("stage_label", stage_id or "Current run"))
+                    epoch = self._stage_latest_artifact_epoch.get(
+                        stage_id,
+                        int(self._stage_histories.get(stage_id, [{}])[-1].get("epoch", 0)),
+                    )
+                    axis.set_title(
+                        f"{label} - epoch {epoch}", loc="left",
+                        fontsize=10, fontweight="bold", color="#302C3C", pad=6,
+                    )
             else:
-                view = "MAE History"
+                axis = figure.add_subplot(111)
+                axis.set_axis_off()
+                axis.text(
+                    0.5, 0.54,
+                    "Waiting for a current-stage regression image",
+                    ha="center", va="center", fontsize=14, fontweight="bold",
+                    color="#302C3C", transform=axis.transAxes,
+                )
+                axis.text(
+                    0.5, 0.44,
+                    "Stale images already present in the output directory are intentionally ignored.",
+                    ha="center", va="center", fontsize=9, color="#797386",
+                    transform=axis.transAxes,
+                )
         if view == "MAE History":
             left = figure.add_subplot(121)
             right = figure.add_subplot(122)
-            for key, label, color in (
-                ("train_loss", "Train loss", "#7D7488"),
-                ("val_loss", "Validation loss", "#8F7AC8"),
-            ):
-                x, y = self._finite_history(history, key)
+            colors = ("#4A7FC1", "#D48851", "#4A9478", "#8F7AC8", "#C35F79", "#76869B")
+            for index, (stage_id, stage_history) in enumerate(stage_groups):
+                info = self._stage_info.get(stage_id, {})
+                label = str(info.get("stage_label", stage_id or "Current run"))
+                color = colors[index % len(colors)]
+                x, y = self._finite_history(stage_history, "train_loss")
                 if y:
-                    left.plot(x, y, marker="o", markersize=3, linewidth=1.8, label=label, color=color)
-            self._style_axis(left, "Objective history", "Loss")
+                    left.plot(x, y, marker="o", markersize=3, linewidth=1.6,
+                              linestyle="--", label=f"{label} train", color=color, alpha=0.7)
+                x, y = self._finite_history(stage_history, "val_loss")
+                if y:
+                    left.plot(x, y, marker="o", markersize=3, linewidth=2.0,
+                              label=f"{label} val", color=color)
+            self._style_axis(left, "Objective by stage", "Loss")
             if left.lines:
                 left.legend(frameon=False, fontsize=8)
-            for key, label, color in (
-                ("energy_mae", "Energy MAE", "#4A7FC1"),
-                ("force_mae", "Force MAE", "#D48851"),
-                ("validation_score", "Normalized score", "#8F7AC8"),
-            ):
-                x, y = self._finite_history(history, key)
-                if y:
-                    right.plot(x, y, marker="o", markersize=3, linewidth=1.8, label=label, color=color)
-            self._style_axis(right, "Validation quality", "MAE / score")
+            metric_styles = (
+                ("energy_mae", "E-MAE", "-"),
+                ("force_mae", "F-MAE", "--"),
+                ("validation_score", "Score", ":"),
+            )
+            for index, (stage_id, stage_history) in enumerate(stage_groups):
+                info = self._stage_info.get(stage_id, {})
+                label = str(info.get("stage_label", stage_id or "Current run"))
+                color = colors[index % len(colors)]
+                for key, metric_label, line_style in metric_styles:
+                    x, y = self._finite_history(stage_history, key)
+                    if y:
+                        right.plot(
+                            x, y, marker="o", markersize=3, linewidth=1.8,
+                            linestyle=line_style,
+                            label=f"{label} {metric_label}", color=color,
+                        )
+            self._style_axis(right, "Validation metrics by stage", "MAE / score")
             if right.lines:
                 right.legend(frameon=False, fontsize=8)
         elif view == "Multi-Task":
             axis = figure.add_subplot(111)
-            names = sorted({name for item in history for name in item.get("multitask_mae", {})})
             colors = ("#4A7FC1", "#D48851", "#4A9478", "#8F7AC8", "#C35F79", "#76869B")
-            for index, name in enumerate(names):
-                x, y = [], []
-                for item in history:
-                    value = item.get("multitask_mae", {}).get(name)
-                    if value is not None and math.isfinite(float(value)):
-                        x.append(int(item.get("epoch", len(x) + 1)))
-                        y.append(float(value))
-                if y:
-                    axis.plot(x, y, marker="o", markersize=3, linewidth=1.6,
-                              label=name, color=colors[index % len(colors)])
-            self._style_axis(axis, "Active multi-task validation MAE", "MAE")
+            line_index = 0
+            for stage_id, stage_history in stage_groups:
+                stage_label = str(
+                    self._stage_info.get(stage_id, {}).get(
+                        "stage_label", stage_id or "Current run"
+                    )
+                )
+                names = sorted({
+                    name for item in stage_history
+                    for name in item.get("multitask_mae", {})
+                })
+                for name in names:
+                    x, y = [], []
+                    for item in stage_history:
+                        value = item.get("multitask_mae", {}).get(name)
+                        if value is not None and math.isfinite(float(value)):
+                            x.append(int(item.get("epoch", len(x) + 1)))
+                            y.append(float(value))
+                    if y:
+                        axis.plot(x, y, marker="o", markersize=3, linewidth=1.6,
+                                  label=f"{stage_label}: {name}",
+                                  color=colors[line_index % len(colors)])
+                        line_index += 1
+            self._style_axis(axis, "Multi-task MAE by stage", "MAE")
             if axis.lines:
-                axis.legend(frameon=False, fontsize=8, ncol=min(3, max(1, len(names))))
+                axis.legend(frameon=False, fontsize=8, ncol=min(3, max(1, line_index)))
             else:
                 axis.text(0.5, 0.5, "No auxiliary targets are active", ha="center", va="center",
                           color="#797386", transform=axis.transAxes)
         elif view == "Physics Residuals":
             axis = figure.add_subplot(111)
-            names = sorted({name for item in history for name in item.get("physics_residual_max", {})})
             colors = ("#4A9478", "#4A7FC1", "#D48851", "#8F7AC8", "#C35F79")
-            for index, name in enumerate(names):
-                x, y = [], []
-                for item in history:
-                    value = item.get("physics_residual_max", {}).get(name)
-                    if value is not None and math.isfinite(float(value)):
-                        x.append(int(item.get("epoch", len(x) + 1)))
-                        y.append(max(float(value), 1e-16))
-                if y:
-                    axis.semilogy(x, y, marker="o", markersize=3, linewidth=1.6,
-                                  label=name, color=colors[index % len(colors)])
-            self._style_axis(axis, "Physics solver diagnostics", "Validation maximum")
+            line_index = 0
+            for stage_id, stage_history in stage_groups:
+                stage_label = str(
+                    self._stage_info.get(stage_id, {}).get(
+                        "stage_label", stage_id or "Current run"
+                    )
+                )
+                names = sorted({
+                    name for item in stage_history
+                    for name in item.get("physics_residual_max", {})
+                })
+                for name in names:
+                    x, y = [], []
+                    for item in stage_history:
+                        value = item.get("physics_residual_max", {}).get(name)
+                        if value is not None and math.isfinite(float(value)):
+                            x.append(int(item.get("epoch", len(x) + 1)))
+                            y.append(max(float(value), 1e-16))
+                    if y:
+                        axis.semilogy(x, y, marker="o", markersize=3, linewidth=1.6,
+                                      label=f"{stage_label}: {name}",
+                                      color=colors[line_index % len(colors)])
+                        line_index += 1
+            self._style_axis(axis, "Physics diagnostics by stage", "Validation maximum")
             if axis.lines:
-                axis.legend(frameon=False, fontsize=8, ncol=min(3, max(1, len(names))))
+                axis.legend(frameon=False, fontsize=8, ncol=min(3, max(1, line_index)))
             else:
                 axis.text(0.5, 0.5, "No iterative physics solver is active", ha="center", va="center",
                           color="#797386", transform=axis.transAxes)
         elif view == "Memory":
             axis = figure.add_subplot(111)
-            memory_history = [
-                item for item in history if isinstance(item.get("memory"), dict)
-            ]
-            for key, label, color in (
-                ("rss_mib", "Process RSS", "#8F7AC8"),
-                ("mps_driver_mib", "MPS driver", "#4A7FC1"),
-                ("mps_active_mib", "MPS active tensors", "#4A9478"),
-                ("mps_cache_mib", "MPS cache", "#D48851"),
-            ):
-                x_values = [int(item.get("epoch", index + 1)) for index, item in enumerate(memory_history)]
-                y_values = [float(item["memory"].get(key, 0.0)) for item in memory_history]
-                if y_values and (key == "rss_mib" or any(value > 0.0 for value in y_values)):
-                    axis.plot(
-                        x_values, y_values, marker="o", markersize=3,
-                        linewidth=1.7, label=label, color=color,
+            colors = ("#8F7AC8", "#4A7FC1", "#4A9478", "#D48851", "#C35F79", "#76869B")
+            for index, (stage_id, stage_history) in enumerate(stage_groups):
+                memory_history = [
+                    item for item in stage_history
+                    if isinstance(item.get("memory"), dict)
+                ]
+                if not memory_history:
+                    continue
+                stage_label = str(
+                    self._stage_info.get(stage_id, {}).get(
+                        "stage_label", stage_id or "Current run"
                     )
-            self._style_axis(axis, "Cross-epoch memory after cache cleanup", "MiB")
+                )
+                x_values = [int(item.get("epoch", position + 1)) for position, item in enumerate(memory_history)]
+                y_values = [float(item["memory"].get("rss_mib", 0.0)) for item in memory_history]
+                axis.plot(x_values, y_values, marker="o", markersize=3,
+                          linewidth=1.7, label=f"{stage_label}: RSS",
+                          color=colors[index % len(colors)])
+            self._style_axis(axis, "Process memory by stage", "MiB")
             if axis.lines:
                 axis.legend(frameon=False, fontsize=8)
             else:
@@ -20737,37 +21818,47 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
     def _collect_config(self) -> Dict[str, Any]:
         self._enforce_spin_cutoff_bound()
-        return {
-            "version": 4,
+        current = self.current_values()
+        generated_train = self.backend._train_payload_from_gui_values(
+            current, self._selected_training_mode
+        )
+        train_payload = self.backend._deep_merge_config(
+            self._imported_train_payload, generated_train
+        )
+        managed = {
+            "schema": "e3mu-gui-config-v5",
+            "version": 5,
             "gui": "pyqt6",
             "training_mode": self._selected_training_mode,
             "saved_at": self.backend._now(),
-            "values": self.current_values(),
+            "values": current,
+            "train_config": train_payload,
             "auto_research_space": {
                 name: list(spec)
                 for name, spec in self._custom_search_specs.items()
             } if self._search_space_customized else None,
             "vars": {
                 LEGACY_TK_VARIABLES[key]: value
-                for key, value in self.current_values().items()
+                for key, value in current.items()
                 if key in LEGACY_TK_VARIABLES
             },
         }
+        return self.backend._deep_merge_config(self._config_passthrough, managed)
 
     def _apply_config(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             raise TypeError("Configuration must be a JSON object.")
-        values = payload.get("values")
-        if not isinstance(values, dict):
-            legacy = payload.get("vars", payload)
-            if not isinstance(legacy, dict):
-                raise TypeError("Configuration does not contain values or vars.")
-            reverse = {value: key for key, value in LEGACY_TK_VARIABLES.items()}
-            values = {
-                reverse[name]: value
-                for name, value in legacy.items()
-                if name in reverse
-            }
+        values = self.backend._extract_gui_values_from_config(payload)
+        if not values and not any(
+            isinstance(payload.get(name), dict)
+            for name in ("values", "vars", "train_config")
+        ):
+            raise TypeError(
+                "Configuration does not contain recognized GUI or TrainConfig values."
+            )
+        self._config_passthrough = copy.deepcopy(payload)
+        self._imported_train_payload = self.backend._extract_train_config_payload(payload)
+        self._last_config_warnings = []
         raw_search_space = payload.get("auto_research_space")
         if raw_search_space is None:
             custom_search_space: Dict[str, tuple] = {}
@@ -20784,13 +21875,19 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         try:
             for key, value in values.items():
                 if key in self.controls:
-                    self.set_value(key, value)
+                    try:
+                        self.set_value(key, value)
+                    except (TypeError, ValueError) as exc:
+                        self._last_config_warnings.append(f"{key}: {exc}")
         finally:
             self._signal_guard = False
         self._enforce_spin_cutoff_bound()
-        self._set_selected_training_mode(
-            str(payload.get("training_mode", self._selected_training_mode))
-        )
+        imported_mode = payload.get("training_mode")
+        if imported_mode is None:
+            imported_mode = self._imported_train_payload.get(
+                "mode", self._selected_training_mode
+            )
+        self._set_selected_training_mode(str(imported_mode))
         self._custom_search_specs = custom_search_space
         self._search_space_customized = search_space_customized
         self._dataset_revision += 1
@@ -20800,6 +21897,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._refresh_search_table()
         self.dataset_timer.start()
         self.estimate_timer.start()
+        self._update_thread_policy_label()
 
     def _import_config(self) -> None:
         path, _filter = QtWidgets.QFileDialog.getOpenFileName(
@@ -20810,6 +21908,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         try:
             self._apply_config(json.loads(Path(path).read_text(encoding="utf-8")))
             self._append_log(f"[{self.backend._now()}] Imported GUI config: {path}")
+            if self._last_config_warnings:
+                self._append_log(
+                    f"[{self.backend._now()}] Config migration warnings: "
+                    + "; ".join(self._last_config_warnings)
+                )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Import configuration", str(exc))
 
@@ -20867,6 +21970,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         if result != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         self._apply_config({"values": self._factory_values})
+        self._config_passthrough.clear()
+        self._imported_train_payload.clear()
 
     def _browse(self, key: str, mode: str) -> None:
         current = str(self.value(key)).strip()
@@ -21152,6 +22257,10 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--base-ckpt")
     train_parser.add_argument("--out-ckpt")
     train_parser.add_argument("--device")
+    train_parser.add_argument(
+        "--cpu-threads",
+        help="PyTorch CPU threads: 'auto' or a positive integer",
+    )
     train_parser.add_argument("--dtype", choices=("float32", "float64"))
     train_parser.add_argument("--epochs", type=int)
     train_parser.add_argument("--batch-size", type=int)
@@ -21207,12 +22316,15 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 def _cli_train(args: argparse.Namespace) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
     if args.config:
-        payload = json.loads(Path(args.config).expanduser().read_text(encoding="utf-8"))
+        raw_payload = json.loads(
+            Path(args.config).expanduser().read_text(encoding="utf-8")
+        )
+        payload = _extract_train_config_payload(raw_payload)
     payload.setdefault("mode", "joint")
     direct_names = (
         "dataset", "static_data", "response_data", "mode", "base_ckpt", "out_ckpt",
-        "device", "epochs", "batch_size", "lr", "force_loss", "force_huber_delta",
-        "val_fraction", "seed",
+        "device", "cpu_threads", "epochs", "batch_size", "lr", "force_loss",
+        "force_huber_delta", "val_fraction", "seed",
     )
     for name in direct_names:
         value = getattr(args, name, None)
