@@ -1881,18 +1881,18 @@ def load_hdf5_configurations(
 HDF5_TOPOLOGY_CACHE_VERSION = "e3mu-topology-cache-v5-shift-dictionary"
 
 
-def _compact_unsigned_dtype_for_count(count: int) -> np.dtype:
-    """Return the smallest unsigned dtype that can index ``count`` values."""
-    value_count = max(0, int(count))
-    if value_count <= np.iinfo(np.uint8).max:
+def _compact_unsigned_dtype_for_upper_bound(upper_bound: int) -> np.dtype:
+    """Return an unsigned dtype that safely represents a declared upper bound."""
+    maximum = max(0, int(upper_bound))
+    if maximum <= np.iinfo(np.uint8).max:
         return np.dtype(np.uint8)
-    if value_count <= np.iinfo(np.uint16).max:
+    if maximum <= np.iinfo(np.uint16).max:
         return np.dtype(np.uint16)
-    if value_count <= np.iinfo(np.uint32).max:
+    if maximum <= np.iinfo(np.uint32).max:
         return np.dtype(np.uint32)
-    if value_count <= np.iinfo(np.uint64).max:
+    if maximum <= np.iinfo(np.uint64).max:
         return np.dtype(np.uint64)
-    raise OverflowError(f"Cannot represent {value_count} values with uint64 indices")
+    raise OverflowError(f"Cannot represent upper bound {maximum} with uint64")
 
 
 def _encode_bitwise_shift_dictionary(
@@ -2590,7 +2590,7 @@ def build_hdf5_topology_cache(
                 output.create_dataset(name, data=source[name][:])
             copy_edges = 1_000_000
             max_atoms = int(np.max(source["atom_counts"][:], initial=0))
-            compact_edge_dtype = _compact_unsigned_dtype_for_count(max_atoms)
+            compact_edge_dtype = _compact_unsigned_dtype_for_upper_bound(max_atoms)
             output.attrs["edge_index_storage_dtype"] = compact_edge_dtype.name
             input_edges = source["edge_index"]
             output_edges = output.create_dataset(
@@ -2602,7 +2602,7 @@ def build_hdf5_topology_cache(
             edge_counts = source["edge_counts"][:]
             max_edges = int(np.max(edge_counts, initial=0))
             output.attrs["max_edges_per_structure"] = max_edges
-            compact_index_dtype = _compact_unsigned_dtype_for_count(max_edges)
+            compact_index_dtype = _compact_unsigned_dtype_for_upper_bound(max_edges)
             output.attrs["shift_index_storage_dtype"] = compact_index_dtype.name
             input_indices = source["shift_nonzero_local_indices"]
             output_indices = output.create_dataset(
@@ -2618,7 +2618,9 @@ def build_hdf5_topology_cache(
                 np.max(np.diff(shift_value_ptr), initial=0)
             )
             output.attrs["max_unique_shifts_per_structure"] = max_unique_shifts
-            compact_code_dtype = _compact_unsigned_dtype_for_count(max_unique_shifts)
+            compact_code_dtype = _compact_unsigned_dtype_for_upper_bound(
+                max_unique_shifts
+            )
             output.attrs["shift_code_storage_dtype"] = compact_code_dtype.name
             input_codes = source["shift_codes"]
             output_codes = output.create_dataset(
