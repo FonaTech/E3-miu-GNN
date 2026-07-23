@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import hashlib
 import os
@@ -16,7 +17,7 @@ import traceback
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -1130,12 +1131,17 @@ def compute_phonon_thermo_phonopy(
 
     thermal_out = None
     pretend_real_used = False
-    if thermal_temperatures_K:
+    thermal_temperature_values = (
+        np.asarray(list(thermal_temperatures_K), dtype=float).reshape(-1)
+        if thermal_temperatures_K is not None
+        else np.empty((0,), dtype=float)
+    )
+    if thermal_temperature_values.size:
         if stop_flag is not None and stop_flag():
             raise RuntimeError("Stopped")
         if progress is not None:
             progress({"type": "prop", "task": "Phonon/Thermo", "overall_frac": 0.85, "current": 0, "total": 1, "stage": "thermal"})
-        temps = np.sort(np.asarray(list(thermal_temperatures_K), dtype=float))
+        temps = np.sort(thermal_temperature_values)
         if temps.size >= 2:
             t_min = float(temps[0])
             t_max = float(temps[-1])
@@ -1294,6 +1300,236 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _csv_cell(value: Any) -> Any:
+    if isinstance(value, (float, np.floating)) and not np.isfinite(float(value)):
+        return ""
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _write_csv_atomic(
+    path: Path,
+    header: Sequence[str],
+    rows: Iterable[Sequence[Any]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(list(header))
+        for row in rows:
+            writer.writerow([_csv_cell(value) for value in row])
+    temporary.replace(path)
+
+
+def _result_segments(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if not isinstance(value, list):
+        return [value]
+    if not value:
+        return []
+    return [value] if isinstance(value[0], (int, float, np.number)) else value
+
+
+def export_phonon_result_data(
+    result: Mapping[str, Any],
+    json_path: str,
+) -> Dict[str, str]:
+    """Write the complete result plus analysis-ready long-table CSV files."""
+    output = Path(json_path).expanduser().resolve()
+    if output.suffix.lower() != ".json":
+        output = output.with_suffix(".json")
+    _write_json_atomic(output, result)
+    artifacts: Dict[str, str] = {"json": str(output)}
+    stem = output.with_suffix("")
+
+    band = result.get("band", {})
+    if isinstance(band, Mapping):
+        distance_segments = _result_segments(band.get("distances"))
+        qpoint_segments = _result_segments(band.get("qpoints"))
+        frequency_segments = _result_segments(band.get("frequencies_THz"))
+        if frequency_segments:
+            band_path = stem.with_name(stem.name + "_band.csv")
+
+            def _band_rows() -> Iterable[Sequence[Any]]:
+                for segment_index, frequencies in enumerate(frequency_segments):
+                    frequency_array = np.asarray(frequencies, dtype=float)
+                    if frequency_array.ndim == 1:
+                        frequency_array = frequency_array.reshape(-1, 1)
+                    if frequency_array.ndim != 2:
+                        continue
+                    distances = (
+                        np.asarray(distance_segments[segment_index], dtype=float).reshape(-1)
+                        if segment_index < len(distance_segments)
+                        else np.arange(frequency_array.shape[0], dtype=float)
+                    )
+                    qpoints = (
+                        np.asarray(qpoint_segments[segment_index], dtype=float).reshape(-1, 3)
+                        if segment_index < len(qpoint_segments)
+                        else np.full((frequency_array.shape[0], 3), np.nan)
+                    )
+                    point_count = min(
+                        int(frequency_array.shape[0]),
+                        int(distances.size),
+                        int(qpoints.shape[0]),
+                    )
+                    for point_index in range(point_count):
+                        for branch_index in range(int(frequency_array.shape[1])):
+                            yield (
+                                segment_index,
+                                point_index,
+                                float(distances[point_index]),
+                                float(qpoints[point_index, 0]),
+                                float(qpoints[point_index, 1]),
+                                float(qpoints[point_index, 2]),
+                                branch_index,
+                                float(frequency_array[point_index, branch_index]),
+                            )
+
+            _write_csv_atomic(
+                band_path,
+                (
+                    "segment",
+                    "point",
+                    "distance",
+                    "q_fractional_x",
+                    "q_fractional_y",
+                    "q_fractional_z",
+                    "branch",
+                    "frequency_THz",
+                ),
+                _band_rows(),
+            )
+            artifacts["band_csv"] = str(band_path)
+
+    dos = result.get("dos", {})
+    if isinstance(dos, Mapping):
+        frequency_points = np.asarray(dos.get("frequency_points_THz", []), dtype=float).reshape(-1)
+        total_dos = np.asarray(dos.get("total_dos", []), dtype=float).reshape(-1)
+        count = min(int(frequency_points.size), int(total_dos.size))
+        if count:
+            dos_path = stem.with_name(stem.name + "_dos.csv")
+            _write_csv_atomic(
+                dos_path,
+                ("frequency_THz", "total_dos"),
+                (
+                    (float(frequency_points[index]), float(total_dos[index]))
+                    for index in range(count)
+                ),
+            )
+            artifacts["dos_csv"] = str(dos_path)
+
+    mesh = result.get("mesh", {})
+    if isinstance(mesh, Mapping):
+        qpoints = np.asarray(mesh.get("qpoints", []), dtype=float)
+        weights = np.asarray(mesh.get("weights", []), dtype=float).reshape(-1)
+        frequencies = np.asarray(mesh.get("frequencies_THz", []), dtype=float)
+        if frequencies.ndim == 1:
+            frequencies = frequencies.reshape(-1, 1)
+        if qpoints.ndim == 2 and qpoints.shape[1] == 3 and frequencies.ndim == 2:
+            qpoint_count = min(int(qpoints.shape[0]), int(frequencies.shape[0]))
+            if qpoint_count:
+                mesh_path = stem.with_name(stem.name + "_mesh.csv")
+
+                def _mesh_rows() -> Iterable[Sequence[Any]]:
+                    for qpoint_index in range(qpoint_count):
+                        weight = (
+                            float(weights[qpoint_index])
+                            if qpoint_index < int(weights.size)
+                            else float("nan")
+                        )
+                        for branch_index in range(int(frequencies.shape[1])):
+                            yield (
+                                qpoint_index,
+                                float(qpoints[qpoint_index, 0]),
+                                float(qpoints[qpoint_index, 1]),
+                                float(qpoints[qpoint_index, 2]),
+                                weight,
+                                branch_index,
+                                float(frequencies[qpoint_index, branch_index]),
+                            )
+
+                _write_csv_atomic(
+                    mesh_path,
+                    (
+                        "qpoint",
+                        "q_fractional_x",
+                        "q_fractional_y",
+                        "q_fractional_z",
+                        "weight",
+                        "branch",
+                        "frequency_THz",
+                    ),
+                    _mesh_rows(),
+                )
+                artifacts["mesh_csv"] = str(mesh_path)
+
+    thermal = result.get("thermal")
+    if isinstance(thermal, Mapping):
+        columns = (
+            np.asarray(thermal.get("temperatures_K", []), dtype=float).reshape(-1),
+            np.asarray(thermal.get("free_energy_kJ_per_mol", []), dtype=float).reshape(-1),
+            np.asarray(thermal.get("enthalpy_kJ_per_mol", []), dtype=float).reshape(-1),
+            np.asarray(thermal.get("entropy_J_per_K_mol", []), dtype=float).reshape(-1),
+            np.asarray(thermal.get("heat_capacity_J_per_K_mol", []), dtype=float).reshape(-1),
+        )
+        count = min((int(values.size) for values in columns), default=0)
+        if count:
+            thermal_path = stem.with_name(stem.name + "_thermal.csv")
+            _write_csv_atomic(
+                thermal_path,
+                (
+                    "temperature_K",
+                    "free_energy_kJ_per_mol",
+                    "enthalpy_kJ_per_mol",
+                    "entropy_J_per_K_mol",
+                    "heat_capacity_J_per_K_mol",
+                ),
+                (
+                    tuple(float(values[index]) for values in columns)
+                    for index in range(count)
+                ),
+            )
+            artifacts["thermal_csv"] = str(thermal_path)
+    return artifacts
+
+
+def save_phonon_figures(
+    spectrum_figure: Any,
+    thermal_figure: Any,
+    spectrum_path: str,
+) -> Dict[str, str]:
+    """Save both GUI figures using the selected spectrum path and format."""
+    spectrum = Path(spectrum_path).expanduser().resolve()
+    suffix = spectrum.suffix.lower()
+    if suffix not in (".png", ".pdf", ".svg"):
+        spectrum = spectrum.with_suffix(".png")
+        suffix = ".png"
+    base_stem = spectrum.stem
+    if base_stem.endswith("_spectrum"):
+        thermal_stem = base_stem[: -len("_spectrum")] + "_thermal"
+    else:
+        thermal_stem = base_stem + "_thermal"
+    thermal = spectrum.with_name(thermal_stem + suffix)
+    spectrum.parent.mkdir(parents=True, exist_ok=True)
+    save_options: Dict[str, Any] = {
+        "bbox_inches": "tight",
+        "pad_inches": 0.18,
+        "facecolor": "white",
+    }
+    if suffix == ".png":
+        save_options["dpi"] = 300
+    spectrum_figure.canvas.draw()
+    thermal_figure.canvas.draw()
+    spectrum_figure.savefig(spectrum, **save_options)
+    thermal_figure.savefig(thermal, **save_options)
+    return {"spectrum": str(spectrum), "thermal": str(thermal)}
 
 
 def _load_json_resource(
@@ -1784,13 +2020,20 @@ class App(tk.Tk):
 
         top = ttk.Frame(inner)
         top.pack(fill="x", padx=10, pady=(10, 0))
-        top.columnconfigure(0, weight=1)
-        top.columnconfigure(1, weight=1)
-        top.columnconfigure(2, weight=1)
+        for column in range(5):
+            top.columnconfigure(column, weight=1)
 
         ttk.Button(top, text="Load model (.pt/.pth)", command=self._pick_model).grid(row=0, column=0, sticky="ew", padx=4, pady=2)
         ttk.Button(top, text="Load structure", command=self._pick_structure).grid(row=0, column=1, sticky="ew", padx=4, pady=2)
         ttk.Button(top, text="Run", command=self._start).grid(row=0, column=2, sticky="ew", padx=4, pady=2)
+        self._save_plots_button = ttk.Button(
+            top, text="Save Plots", command=self._save_plots, state="disabled"
+        )
+        self._save_plots_button.grid(row=0, column=3, sticky="ew", padx=4, pady=2)
+        self._export_data_button = ttk.Button(
+            top, text="Export Data", command=self._export_data, state="disabled"
+        )
+        self._export_data_button.grid(row=0, column=4, sticky="ew", padx=4, pady=2)
 
         paths = ttk.Frame(inner)
         paths.pack(fill="x", padx=10, pady=(6, 0))
@@ -1879,9 +2122,12 @@ class App(tk.Tk):
             plots.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
             # Figure 1: phonon band + DOS (shared Y: Frequency (THz))
-            fig_ph = Figure(figsize=(10, 4), dpi=100)
+            fig_ph = Figure(figsize=(10.8, 5.0), dpi=100, layout="constrained")
             self._fig_ph = fig_ph
-            gs_ph = fig_ph.add_gridspec(1, 2, width_ratios=[3.0, 1.0], wspace=0.35)
+            fig_ph.set_constrained_layout_pads(
+                w_pad=0.08, h_pad=0.08, wspace=0.08, hspace=0.08
+            )
+            gs_ph = fig_ph.add_gridspec(1, 2, width_ratios=[3.4, 1.0])
             self._ax_band = fig_ph.add_subplot(gs_ph[0, 0])
             self._ax_dos = fig_ph.add_subplot(gs_ph[0, 1], sharey=self._ax_band)
             self._ax_band.set_title("Phonon Band Structure")
@@ -1894,23 +2140,27 @@ class App(tk.Tk):
             self._ax_dos.tick_params(labelleft=False)
 
             self._canvas_ph = FigureCanvasTkAgg(fig_ph, master=plots)
-            self._canvas_ph.get_tk_widget().pack(fill="both", expand=True, pady=(0, 8))
-            try:
-                fig_ph.subplots_adjust(bottom=0.20)
-            except Exception:
-                pass
+            spectrum_widget = self._canvas_ph.get_tk_widget()
+            spectrum_widget.configure(height=500)
+            spectrum_widget.pack(fill="both", expand=True, pady=(0, 12))
 
             # Figure 2: thermo summary.
-            fig_th = Figure(figsize=(10, 4), dpi=100)
+            fig_th = Figure(figsize=(10.8, 5.0), dpi=100, layout="constrained")
             self._fig_th = fig_th
+            fig_th.set_constrained_layout_pads(
+                w_pad=0.09, h_pad=0.08, wspace=0.08, hspace=0.08
+            )
             self._ax_th = fig_th.add_subplot(111)
+            self._ax_th_right = self._ax_th.twinx()
             self._ax_th.set_title("Thermal Properties Summary")
             self._ax_th.set_xlabel("Temperature (K)")
             self._ax_th.set_ylabel("Energy (kJ/mol)")
             self._ax_th.grid(True, alpha=0.3)
 
             self._canvas_th = FigureCanvasTkAgg(fig_th, master=plots)
-            self._canvas_th.get_tk_widget().pack(fill="both", expand=True)
+            thermal_widget = self._canvas_th.get_tk_widget()
+            thermal_widget.configure(height=500)
+            thermal_widget.pack(fill="both", expand=True)
             self._plot_ready = True
         except Exception:
             self._has_mpl = False
@@ -1927,6 +2177,70 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(filetypes=[("All files", "*.*")])
         if path:
             self.var_structure.set(path)
+
+    def _default_result_stem(self) -> str:
+        formula = ""
+        if isinstance(self._last, Mapping):
+            formula = str(self._last.get("formula", ""))
+        source_stem = Path(self.var_structure.get().strip() or "phonon").stem
+        raw = formula or source_stem or "phonon"
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-")
+        return safe or "phonon"
+
+    def _save_plots(self) -> None:
+        if not isinstance(self._last, Mapping):
+            return messagebox.showerror("Save Plots", "No completed calculation is available.")
+        if not (self._has_mpl and self._plot_ready):
+            return messagebox.showerror("Save Plots", "Matplotlib plotting is unavailable.")
+        default_name = f"{self._default_result_stem()}_spectrum.png"
+        selected = filedialog.asksaveasfilename(
+            title="Save spectrum and thermal plots",
+            initialfile=default_name,
+            defaultextension=".png",
+            filetypes=(
+                ("PNG image", "*.png"),
+                ("PDF document", "*.pdf"),
+                ("SVG vector image", "*.svg"),
+            ),
+        )
+        if not selected:
+            return None
+        try:
+            artifacts = save_phonon_figures(
+                self._fig_ph, self._fig_th, selected
+            )
+        except Exception as exc:
+            return messagebox.showerror("Save Plots", f"Could not save plots:\n{exc}")
+        self._status.set("Plots saved")
+        messagebox.showinfo(
+            "Save Plots",
+            "Saved:\n"
+            f"Spectrum: {artifacts['spectrum']}\n"
+            f"Thermal: {artifacts['thermal']}",
+        )
+        return None
+
+    def _export_data(self) -> None:
+        if not isinstance(self._last, Mapping):
+            return messagebox.showerror("Export Data", "No completed calculation is available.")
+        selected = filedialog.asksaveasfilename(
+            title="Export phonon result and CSV tables",
+            initialfile=f"{self._default_result_stem()}_phonon.json",
+            defaultextension=".json",
+            filetypes=(("JSON and CSV data", "*.json"),),
+        )
+        if not selected:
+            return None
+        try:
+            artifacts = export_phonon_result_data(self._last, selected)
+        except Exception as exc:
+            return messagebox.showerror("Export Data", f"Could not export data:\n{exc}")
+        self._status.set("Data exported")
+        messagebox.showinfo(
+            "Export Data",
+            "Exported files:\n" + "\n".join(artifacts.values()),
+        )
+        return None
 
     def _start(self) -> None:
         model = self.var_model.get().strip()
@@ -1956,6 +2270,8 @@ class App(tk.Tk):
         self._stop = False
         self._status.set("Running phonopy...")
         self._txt.delete("1.0", "end")
+        self._save_plots_button.configure(state="disabled")
+        self._export_data_button.configure(state="disabled")
 
         defaults = _Defaults()
         temps = _parse_float_sequence_spec(defaults.thermo_spec, name="phonopy_thermal_temperatures_K", min_len=2)
@@ -2025,6 +2341,10 @@ class App(tk.Tk):
         self._txt.insert("end", f"dos_mesh: {res.get('dos_mesh')}  dos_sigma_THz: {res.get('dos_sigma_THz')}\n")
         self._txt.insert("end", f"band_npoints: {res.get('band_npoints')}\n")
         self._txt.see("end")
+        self._export_data_button.configure(state="normal")
+        self._save_plots_button.configure(
+            state="normal" if (self._has_mpl and self._plot_ready) else "disabled"
+        )
 
         if not (self._has_mpl and self._plot_ready):
             return
@@ -2035,15 +2355,21 @@ class App(tk.Tk):
         self._ax_band.set_title(
             "Phonon Band Structure"
             if band.get("path_source") != "generic_reciprocal_basis_fallback"
-            else "Phonon Band (Generic Reciprocal Path)"
+            else "Phonon Band (Generic Reciprocal Path)",
+            fontsize=12,
+            pad=10,
         )
-        self._ax_band.set_xlabel("k-path distance")
-        self._ax_band.set_ylabel("Frequency (THz)")
-        self._ax_band.grid(True, alpha=0.3)
-        self._ax_dos.set_title("DOS")
-        self._ax_dos.set_xlabel("DOS (arb.)")
-        self._ax_dos.grid(True, alpha=0.3)
-        self._ax_dos.tick_params(labelleft=False)
+        self._ax_band.set_xlabel("Wave-vector path", fontsize=10, labelpad=8)
+        self._ax_band.set_ylabel("Frequency (THz)", fontsize=10, labelpad=8)
+        self._ax_band.grid(True, alpha=0.22, linewidth=0.7)
+        self._ax_band.axhline(0.0, color="#4b5563", linewidth=0.8, alpha=0.7)
+        self._ax_band.tick_params(axis="both", labelsize=9, pad=5)
+        self._ax_dos.set_title("Phonon DOS", fontsize=12, pad=10)
+        self._ax_dos.set_xlabel("DOS (arb. units)", fontsize=10, labelpad=8)
+        self._ax_dos.grid(True, alpha=0.22, linewidth=0.7)
+        self._ax_dos.axhline(0.0, color="#4b5563", linewidth=0.8, alpha=0.7)
+        self._ax_dos.tick_params(axis="x", labelsize=9, pad=5)
+        self._ax_dos.tick_params(axis="y", labelleft=False, left=False)
 
         def _as_segments(x: Any) -> List[Any]:
             if x is None:
@@ -2143,22 +2469,63 @@ class App(tk.Tk):
                 tick_labels = [_normalize_klabel(x) for x in labels]
             elif has_labels and len(labels) == (len(x_ticks) - 1):
                 tick_labels = [""] + [_normalize_klabel(x) for x in labels]
+            elif has_labels and len(x_ticks) == len(dsegs_np) + 1:
+                # Phonopy lists both sides of a disconnected boundary, e.g.
+                # U and K for the same x coordinate in G-X-U|K-G-L-W|X.
+                label_index = 0
+                reconstructed: List[str] = []
+                if labels:
+                    reconstructed.append(_normalize_klabel(labels[label_index]))
+                    label_index += 1
+                for segment_index in range(len(dsegs_np)):
+                    if label_index >= len(labels):
+                        break
+                    boundary_label = _normalize_klabel(labels[label_index])
+                    label_index += 1
+                    connected = True
+                    if segment_index < len(dsegs_np) - 1 and segment_index < len(path_conn):
+                        connected = bool(path_conn[segment_index])
+                    if not connected and label_index < len(labels):
+                        next_label = _normalize_klabel(labels[label_index])
+                        label_index += 1
+                        if next_label and next_label != boundary_label:
+                            boundary_label = f"{boundary_label}\n{next_label}"
+                    reconstructed.append(boundary_label)
+                if len(reconstructed) == len(x_ticks):
+                    tick_labels = reconstructed
 
             if x_ticks:
-                for bi, xv in enumerate(x_ticks[1:-1], start=0):
-                    draw = True
-                    if isinstance(path_conn, list) and bi < len(path_conn):
-                        try:
-                            draw = not bool(path_conn[bi])
-                        except Exception:
-                            draw = True
-                    if draw:
-                        self._ax_band.axvline(float(xv), color="k", lw=0.8, alpha=0.35)
+                for xv in x_ticks[1:-1]:
+                    self._ax_band.axvline(float(xv), color="k", lw=0.8, alpha=0.28)
                 if tick_labels:
+                    merged_ticks: List[float] = []
+                    merged_labels: List[str] = []
+                    for tick, label in zip(x_ticks, tick_labels):
+                        normalized = _normalize_klabel(label)
+                        if merged_ticks and abs(float(tick) - merged_ticks[-1]) <= 1e-9:
+                            if normalized and normalized not in merged_labels[-1].split("\n"):
+                                merged_labels[-1] = (
+                                    f"{merged_labels[-1]}\n{normalized}"
+                                    if merged_labels[-1]
+                                    else normalized
+                                )
+                            continue
+                        merged_ticks.append(float(tick))
+                        merged_labels.append(normalized.replace("|", "\n"))
+                    x_ticks = merged_ticks
+                    tick_labels = merged_labels
                     self._ax_band.set_xticks(x_ticks)
-                    self._ax_band.set_xticklabels(tick_labels)
+                    rotate_labels = len(tick_labels) > 7 or any(
+                        len(label.replace("\n", "")) > 7 for label in tick_labels
+                    )
+                    self._ax_band.set_xticklabels(
+                        tick_labels,
+                        fontsize=8 if rotate_labels else 9,
+                        rotation=32 if rotate_labels else 0,
+                        ha="right" if rotate_labels else "center",
+                        rotation_mode="anchor",
+                    )
                 self._ax_band.set_xlim(min(x_ticks), max(x_ticks))
-                self._ax_band.tick_params(axis="x", labelsize=10)
         except Exception:
             pass
 
@@ -2167,22 +2534,57 @@ class App(tk.Tk):
         td = np.asarray(dos.get("total_dos", []), dtype=float)
         if fpts.size and td.size:
             n = min(int(fpts.size), int(td.size))
-            self._ax_dos.plot(td[:n], fpts[:n], color="C1", lw=1.2)
+            self._ax_dos.plot(td[:n], fpts[:n], color="#d97706", lw=1.4)
+            self._ax_dos.fill_betweenx(
+                fpts[:n], 0.0, td[:n], color="#f59e0b", alpha=0.16, linewidth=0.0
+            )
 
         try:
+            self._fig_ph.canvas.draw()
+            renderer = self._fig_ph.canvas.get_renderer()
+            visible_labels = [
+                label for label in self._ax_band.get_xticklabels()
+                if label.get_visible() and label.get_text()
+            ]
+            overlap = any(
+                left.get_window_extent(renderer).overlaps(right.get_window_extent(renderer))
+                for left, right in zip(visible_labels, visible_labels[1:])
+            )
+            if overlap:
+                for label in visible_labels:
+                    label.set_rotation(52)
+                    label.set_ha("right")
+                    label.set_fontsize(7)
+                    label.set_rotation_mode("anchor")
+                self._fig_ph.canvas.draw()
             self._canvas_ph.draw_idle()
         except Exception:
             pass
         
         # Thermodynamics
         self._ax_th.cla()
+        self._ax_th_right.cla()
+        self._ax_th_right.set_visible(True)
+        self._ax_th.yaxis.set_ticks_position("left")
+        self._ax_th.yaxis.set_label_position("left")
+        self._ax_th_right.yaxis.set_ticks_position("right")
+        self._ax_th_right.yaxis.set_label_position("right")
         if formula:
-            self._ax_th.set_title(f"{formula} Thermal Properties Summary")
+            self._ax_th.set_title(
+                f"{formula} Thermal Properties", fontsize=12, pad=12
+            )
         else:
-            self._ax_th.set_title("Thermal Properties Summary")
-        self._ax_th.set_xlabel("Temperature (K)")
-        self._ax_th.set_ylabel("Energy (kJ/mol)")
-        self._ax_th.grid(True, alpha=0.3)
+            self._ax_th.set_title("Thermal Properties", fontsize=12, pad=12)
+        self._ax_th.set_xlabel("Temperature (K)", fontsize=10, labelpad=8)
+        self._ax_th.set_ylabel("F, H (kJ mol$^{-1}$)", fontsize=10, labelpad=9)
+        self._ax_th_right.set_ylabel(
+            "S, C$_V$ (J K$^{-1}$ mol$^{-1}$)",
+            fontsize=10,
+            labelpad=10,
+        )
+        self._ax_th.grid(True, alpha=0.22, linewidth=0.7)
+        self._ax_th.tick_params(axis="both", labelsize=9, pad=5)
+        self._ax_th_right.tick_params(axis="y", labelsize=9, pad=5)
 
         thermal = res.get("thermal", None)
         if isinstance(thermal, dict):
@@ -2193,24 +2595,41 @@ class App(tk.Tk):
             Cv = np.asarray(thermal.get("heat_capacity_J_per_K_mol", []), dtype=float)
             n = min(int(T.size), int(F.size), int(H.size), int(S.size), int(Cv.size))
             if n > 0:
-                self._ax_th.plot(T[:n], F[:n], color="b", lw=2.0, label="Free Energy")
-                self._ax_th.plot(T[:n], H[:n], color="r", lw=2.0, label="Enthalpy")
-                self._ax_th.plot(T[:n], S[:n], color="g", lw=2.0, ls="--", label="Entropy")
-                self._ax_th.plot(T[:n], Cv[:n], color="m", lw=2.0, ls=":", label="Heat Capacity")
-                self._ax_th.legend(loc="upper left")
+                self._ax_th.plot(
+                    T[:n], F[:n], color="#2563eb", lw=2.0, label="Free energy"
+                )
+                self._ax_th.plot(
+                    T[:n], H[:n], color="#dc2626", lw=2.0, label="Enthalpy"
+                )
+                self._ax_th_right.plot(
+                    T[:n], S[:n], color="#15803d", lw=1.8, ls="--", label="Entropy"
+                )
+                self._ax_th_right.plot(
+                    T[:n], Cv[:n], color="#7e22ce", lw=1.8, ls=":", label="Heat capacity"
+                )
+                self._ax_th.margins(x=0.015, y=0.08)
+                self._ax_th_right.margins(x=0.015, y=0.08)
+                self._ax_th.legend(
+                    loc="upper left", fontsize=8, frameon=True, framealpha=0.9
+                )
+                self._ax_th_right.legend(
+                    loc="upper right", fontsize=8, frameon=True, framealpha=0.9
+                )
+            else:
+                self._ax_th_right.set_visible(False)
                 self._ax_th.text(
-                    0.5,
-                    -0.12,
-                    "Note: Enthalpy is generated from thermal properties data (phonopy).",
-                    transform=self._ax_th.transAxes,
-                    ha="center",
-                    va="top",
-                    fontsize=9,
+                    0.5, 0.5, "No thermodynamic samples", transform=self._ax_th.transAxes,
+                    ha="center", va="center", fontsize=10, color="#4b5563"
                 )
         else:
-            self._ax_th.text(0.02, 0.98, "No thermodynamics data.\n(thermal_temperatures_K empty)", transform=self._ax_th.transAxes, va="top")
+            self._ax_th_right.set_visible(False)
+            self._ax_th.text(
+                0.5, 0.5, "No thermodynamic samples", transform=self._ax_th.transAxes,
+                ha="center", va="center", fontsize=10, color="#4b5563"
+            )
 
         try:
+            self._fig_th.canvas.draw()
             self._canvas_th.draw_idle()
         except Exception:
             pass
