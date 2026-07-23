@@ -111,8 +111,22 @@ def _phonopy_to_ase_atoms(ph_atoms: Any) -> Atoms:
     return Atoms(symbols=symbols, cell=cell, scaled_positions=scaled, pbc=True)
 
 
-_MODEL_MODES = ("full_coupled", "ground_only")
+_MODEL_MODES = ("auto", "full_coupled", "ground_only")
 _SPIN_POLICIES = ("auto", "off", "required")
+_RESPONSE_LOSS_KEYS = (
+    "w_dipole",
+    "w_polarizability",
+    "w_charges",
+    "w_atomic_dipoles",
+    "w_atomic_polarizability",
+    "w_c6",
+    "w_bec",
+    "w_magnetic_moments",
+    "w_effective_field",
+    "w_j",
+    "w_di",
+    "w_dmi",
+)
 
 
 def _normalise_choice(value: str, choices: Sequence[str], *, name: str) -> str:
@@ -127,6 +141,47 @@ def _normalise_field(field: Sequence[float]) -> np.ndarray:
     if values.size != 3 or not np.isfinite(values).all():
         raise ValueError("electric_field must contain three finite values")
     return values.reshape(3)
+
+
+def _recommended_native_model_mode(model: DualLayerFieldModel) -> Tuple[str, str]:
+    """Infer the physically trained inference surface of a native checkpoint."""
+    metadata = getattr(model, "checkpoint_metadata", {})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+
+    explicit = str(metadata.get("recommended_inference_mode", "")).strip().lower()
+    if explicit in ("full_coupled", "ground_only"):
+        return explicit, "checkpoint recommended_inference_mode"
+
+    training_mode = str(metadata.get("training_mode", "")).strip().lower()
+    if training_mode == "base":
+        return "ground_only", "checkpoint training_mode=base"
+    if training_mode in ("response", "joint"):
+        return "full_coupled", f"checkpoint training_mode={training_mode}"
+
+    checkpoint_path = str(getattr(model, "checkpoint_path", "") or "")
+    stem = Path(checkpoint_path).stem.lower() if checkpoint_path else ""
+    if re.search(r"(?:^|[_\-.])base(?:$|[_\-.])", stem):
+        return "ground_only", "legacy base-checkpoint filename"
+
+    loss_weights = metadata.get("loss_weights")
+    if isinstance(loss_weights, Mapping):
+        found_response_weight = False
+        active_response_weight = False
+        for name in _RESPONSE_LOSS_KEYS:
+            if name not in loss_weights:
+                continue
+            found_response_weight = True
+            try:
+                active_response_weight = active_response_weight or float(loss_weights[name]) > 0.0
+            except (TypeError, ValueError):
+                continue
+        if active_response_weight:
+            return "full_coupled", "checkpoint has response supervision"
+        if found_response_weight:
+            return "ground_only", "legacy checkpoint has no response supervision"
+
+    return "full_coupled", "no stage metadata; preserving complete-model behavior"
 
 
 def _spin_vectors_from_atoms(
@@ -318,7 +373,7 @@ class DualLayerPESCalculator(Calculator):
         model: DualLayerFieldModel,
         *,
         device: str = "auto",
-        model_mode: str = "full_coupled",
+        model_mode: str = "auto",
         total_charge: float = 0.0,
         electric_field: Sequence[float] = (0.0, 0.0, 0.0),
         spin_policy: str = "auto",
@@ -327,7 +382,14 @@ class DualLayerPESCalculator(Calculator):
     ):
         super().__init__()
         self.log = log
-        self.model_mode = _normalise_choice(model_mode, _MODEL_MODES, name="model_mode")
+        self.requested_model_mode = _normalise_choice(
+            model_mode, _MODEL_MODES, name="model_mode"
+        )
+        if self.requested_model_mode == "auto":
+            self.model_mode, self.model_mode_reason = _recommended_native_model_mode(model)
+        else:
+            self.model_mode = self.requested_model_mode
+            self.model_mode_reason = "explicit user selection"
         self.spin_policy = _normalise_choice(spin_policy, _SPIN_POLICIES, name="spin_policy")
         self.total_charge = float(total_charge)
         if not np.isfinite(self.total_charge):
@@ -351,6 +413,8 @@ class DualLayerPESCalculator(Calculator):
         self._source_model = model
         self.model = model
         self._z_to_index = {int(z): i for i, z in enumerate(getattr(model, "z_table_zs", []) or [])}
+        if not self._z_to_index:
+            raise ValueError("Native checkpoint has an empty atomic-number table")
         self._z_table = AtomicNumberTable(list(self._z_to_index))
         self._compiled = False
         self._compile_requested = bool(compile_inference)
@@ -379,7 +443,9 @@ class DualLayerPESCalculator(Calculator):
             if bool(getattr(model.cfg, name, False))
         ]
         self.log(
-            f"[{_now()}] Native PES: class={type(model).__name__} mode={self.model_mode} "
+            f"[{_now()}] Native PES: class={type(model).__name__} "
+            f"requested_mode={self.requested_model_mode} mode={self.model_mode} "
+            f"mode_reason={self.model_mode_reason}; "
             f"device={self.device.type} dtype={runtime_dtype} physics={flags or ['short_range']}"
         )
 
@@ -402,6 +468,9 @@ class DualLayerPESCalculator(Calculator):
 
     def summary(self) -> Dict[str, Any]:
         cfg = getattr(self._source_model, "cfg", None)
+        checkpoint_metadata = getattr(self._source_model, "checkpoint_metadata", {})
+        if not isinstance(checkpoint_metadata, Mapping):
+            checkpoint_metadata = {}
         configured = [
             name
             for name in ("qeq", "pme", "deq", "d4", "spin", "film", "dmi")
@@ -411,8 +480,17 @@ class DualLayerPESCalculator(Calculator):
             "backend": "native_e3mu",
             "model_class": type(self._source_model).__name__,
             "mode": self.model_mode,
+            "requested_mode": self.requested_model_mode,
+            "mode_reason": self.model_mode_reason,
             "device": self.device.type,
             "dtype": str(self.dtype).replace("torch.", ""),
+            "checkpoint_format": str(
+                getattr(self._source_model, "checkpoint_format", "in_memory_model")
+            ),
+            "checkpoint_schema_version": int(
+                getattr(self._source_model, "checkpoint_schema_version", 0) or 0
+            ),
+            "checkpoint_training_mode": str(checkpoint_metadata.get("training_mode", "unknown")),
             "configured_physics": configured,
             "spin_policy": self.spin_policy,
             "total_charge": self.total_charge,
@@ -586,6 +664,8 @@ class SevenNetTSCalculator(Calculator):
             "backend": "sevennet_torchscript",
             "model_class": "SevenNetTorchScript",
             "mode": "ground_only",
+            "requested_mode": str(getattr(self, "requested_model_mode", "ground_only")),
+            "mode_reason": "TorchScript export contains the ground model only",
             "device": self.device.type,
             "dtype": "float32",
             "configured_physics": ["short_range"],
@@ -654,13 +734,15 @@ def _make_pes_calculator(
     *,
     device: str,
     e3mu_compile_infer: bool = False,
-    model_mode: str = "full_coupled",
+    model_mode: str = "auto",
     total_charge: float = 0.0,
     electric_field: Sequence[float] = (0.0, 0.0, 0.0),
     spin_policy: str = "auto",
     log: Callable[[str], None] = print,
 ):
     if isinstance(model, SevenNetTSCalculator):
+        requested_mode = _normalise_choice(model_mode, _MODEL_MODES, name="model_mode")
+        model.requested_model_mode = requested_mode
         if spin_policy == "required":
             raise ValueError("SevenNet TorchScript exports do not contain the mixed spin Hamiltonian")
         if abs(float(total_charge)) > 1e-12 or np.linalg.norm(_normalise_field(electric_field)) > 1e-12:
@@ -668,7 +750,7 @@ def _make_pes_calculator(
                 "SevenNet TorchScript exports cannot apply total charge or external electric fields; "
                 "use a native mixed-granularity checkpoint"
             )
-        if model_mode != "ground_only":
+        if requested_mode == "full_coupled":
             log(
                 f"[{_now()}] WARN: SevenNet TorchScript exports contain only the "
                 "short-range ground model; using ground_only mode"
@@ -688,11 +770,21 @@ def _make_pes_calculator(
     )
 
 
-def _load_model_for_phonon(model_ckpt: str, device: str, log: Callable[[str], None] = print):
+def _load_model_for_phonon(
+    model_ckpt: str,
+    device: str,
+    log: Callable[[str], None] = print,
+    *,
+    allow_unsafe_legacy_checkpoint: bool = False,
+):
     """Load either a DualLayerFieldModel .pt checkpoint or a SevenNet TorchScript .pt model."""
     # First try loading as our native DualLayerFieldModel checkpoint
     try:
-        model = DualLayerFieldModel.load(model_ckpt, map_location="cpu")
+        model = DualLayerFieldModel.load(
+            model_ckpt,
+            map_location="cpu",
+            allow_unsafe_legacy=bool(allow_unsafe_legacy_checkpoint),
+        )
         flags = [
             name.removeprefix("enable_")
             for name in ("enable_qeq", "enable_pme", "enable_deq", "enable_d4", "enable_spin", "enable_film", "enable_dmi")
@@ -700,6 +792,8 @@ def _load_model_for_phonon(model_ckpt: str, device: str, log: Callable[[str], No
         ]
         log(
             f"[{_now()}] Loaded {type(model).__name__} from {model_ckpt}; "
+            f"format={getattr(model, 'checkpoint_format', 'unknown')} "
+            f"schema={getattr(model, 'checkpoint_schema_version', 0)} "
             f"elements={len(getattr(model, 'z_table_zs', []))} "
             f"configured_physics={flags or ['short_range']}"
         )
@@ -716,7 +810,9 @@ def _load_model_for_phonon(model_ckpt: str, device: str, log: Callable[[str], No
         raise RuntimeError(
             f"Could not load model from '{model_ckpt}'.\n"
             f"  DualLayerFieldModel error: {e_dual}\n"
-            f"  SevenNet TorchScript error: {e_sn}"
+            f"  SevenNet TorchScript error: {e_sn}\n"
+            "For a trusted local full-module checkpoint, enable the explicit "
+            "legacy-checkpoint option. Never enable it for an untrusted file."
         ) from e_sn
 
 
@@ -726,7 +822,8 @@ def compute_phonon_thermo_phonopy(
     structure_path: str,
     device: str = "auto",
     e3mu_compile_infer: bool = False,
-    model_mode: str = "full_coupled",
+    model_mode: str = "auto",
+    allow_unsafe_legacy_checkpoint: bool = False,
     total_charge: float = 0.0,
     electric_field: Sequence[float] = (0.0, 0.0, 0.0),
     spin_policy: str = "auto",
@@ -761,7 +858,12 @@ def compute_phonon_thermo_phonopy(
         raise ValueError("total_charge must be finite")
     resolved_device, _ = resolve_device(device, dtype="float32")
 
-    model = _load_model_for_phonon(model_ckpt, device=resolved_device.type, log=log)
+    model = _load_model_for_phonon(
+        model_ckpt,
+        device=resolved_device.type,
+        log=log,
+        allow_unsafe_legacy_checkpoint=allow_unsafe_legacy_checkpoint,
+    )
     atoms = _read_structure_with_metadata(structure_path, log=log)
     _ensure_periodic_box(atoms)
     unitcell_spins = _spin_vectors_from_atoms(atoms, policy=spin_policy)
@@ -1264,7 +1366,9 @@ def run_phonondb_benchmark(
     model_ckpt: str,
     output_dir: str,
     device: str = "auto",
-    model_mode: str = "full_coupled",
+    model_mode: str = "auto",
+    allow_unsafe_legacy_checkpoint: bool = False,
+    e3mu_compile_infer: bool = False,
     reference_source: str = PHONONDB_REFERENCE_URL,
     sevennet_source: str = PHONONDB_SEVENNET_URL,
     material_ids: Optional[Sequence[str]] = DEFAULT_PHONONDB_BENCHMARK_IDS,
@@ -1327,6 +1431,7 @@ def run_phonondb_benchmark(
     checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     protocol = {
         "model_mode": str(model_mode),
+        "compile_native_inference": bool(e3mu_compile_infer),
         "supercell_matrix": np.asarray(supercell_matrix, dtype=int).tolist(),
         "displacement_amplitude_A": float(displacement_amplitude_A),
         "dos_mesh": [int(value) for value in dos_mesh],
@@ -1376,6 +1481,8 @@ def run_phonondb_benchmark(
                     structure_path=str(structure_path),
                     device=device,
                     model_mode=model_mode,
+                    allow_unsafe_legacy_checkpoint=allow_unsafe_legacy_checkpoint,
+                    e3mu_compile_infer=e3mu_compile_infer,
                     spin_policy="off",
                     supercell_matrix=supercell_matrix,
                     displacement_amplitude_A=displacement_amplitude_A,
@@ -1527,13 +1634,14 @@ class App(tk.Tk):
         self.var_model = tk.StringVar(value="")
         self.var_structure = tk.StringVar(value="")
         self.var_device = tk.StringVar(value="auto")
-        self.var_model_mode = tk.StringVar(value="full_coupled")
+        self.var_model_mode = tk.StringVar(value="auto")
         self.var_total_charge = tk.StringVar(value="0.0")
         self.var_field_x = tk.StringVar(value="0.0")
         self.var_field_y = tk.StringVar(value="0.0")
         self.var_field_z = tk.StringVar(value="0.0")
         self.var_spin_policy = tk.StringVar(value="auto")
         self.var_compile = tk.BooleanVar(value=False)
+        self.var_allow_legacy = tk.BooleanVar(value=False)
         self.var_subtract_equilibrium = tk.BooleanVar(value=True)
         self._status = tk.StringVar(value="Idle")
 
@@ -1659,6 +1767,11 @@ class App(tk.Tk):
             text="Subtract equilibrium forces",
             variable=self.var_subtract_equilibrium,
         ).grid(row=2, column=2, columnspan=3, sticky="w", padx=(0, 8), pady=(2, 7))
+        ttk.Checkbutton(
+            physics,
+            text="Trust legacy full-module checkpoint",
+            variable=self.var_allow_legacy,
+        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 7))
 
         ttk.Label(inner, textvariable=self._status).pack(fill="x", padx=10, pady=(8, 6))
 
@@ -1747,6 +1860,7 @@ class App(tk.Tk):
         model_mode = self.var_model_mode.get()
         spin_policy = self.var_spin_policy.get()
         compile_inference = bool(self.var_compile.get())
+        allow_legacy = bool(self.var_allow_legacy.get())
         subtract_equilibrium = bool(self.var_subtract_equilibrium.get())
 
         self._stop = False
@@ -1764,6 +1878,7 @@ class App(tk.Tk):
                     device=device,
                     e3mu_compile_infer=compile_inference,
                     model_mode=model_mode,
+                    allow_unsafe_legacy_checkpoint=allow_legacy,
                     total_charge=total_charge,
                     electric_field=electric_field,
                     spin_policy=spin_policy,
@@ -2056,7 +2171,19 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     single.add_argument("--structure", required=True)
     single.add_argument("--output", required=True)
     single.add_argument("--device", default="auto")
-    single.add_argument("--model-mode", choices=_MODEL_MODES, default="full_coupled")
+    single.add_argument("--model-mode", choices=_MODEL_MODES, default="auto")
+    single.add_argument("--total-charge", type=float, default=0.0)
+    single.add_argument(
+        "--electric-field", nargs=3, type=float, default=(0.0, 0.0, 0.0),
+        metavar=("EX", "EY", "EZ"),
+    )
+    single.add_argument("--spin-policy", choices=_SPIN_POLICIES, default="auto")
+    single.add_argument("--compile-inference", action="store_true")
+    single.add_argument(
+        "--allow-unsafe-legacy-checkpoint",
+        action="store_true",
+        help="Allow Python pickle loading for a trusted local legacy checkpoint",
+    )
     single.add_argument("--supercell", nargs=3, type=int, default=(2, 2, 2), metavar=("A", "B", "C"))
     single.add_argument("--dos-mesh", nargs=3, type=int, default=(10, 10, 10), metavar=("A", "B", "C"))
     single.add_argument("--dos-sigma", type=float)
@@ -2070,7 +2197,13 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--model", required=True)
     benchmark.add_argument("--output-dir", required=True)
     benchmark.add_argument("--device", default="auto")
-    benchmark.add_argument("--model-mode", choices=_MODEL_MODES, default="full_coupled")
+    benchmark.add_argument("--model-mode", choices=_MODEL_MODES, default="auto")
+    benchmark.add_argument("--compile-inference", action="store_true")
+    benchmark.add_argument(
+        "--allow-unsafe-legacy-checkpoint",
+        action="store_true",
+        help="Allow Python pickle loading for a trusted local legacy checkpoint",
+    )
     benchmark.add_argument("--reference", default=PHONONDB_REFERENCE_URL)
     benchmark.add_argument("--sevennet", default=PHONONDB_SEVENNET_URL)
     benchmark.add_argument("--proxy")
@@ -2101,6 +2234,11 @@ def _run_cli(arguments: Sequence[str]) -> int:
             structure_path=args.structure,
             device=args.device,
             model_mode=args.model_mode,
+            allow_unsafe_legacy_checkpoint=args.allow_unsafe_legacy_checkpoint,
+            e3mu_compile_infer=args.compile_inference,
+            total_charge=args.total_charge,
+            electric_field=tuple(float(value) for value in args.electric_field),
+            spin_policy=args.spin_policy,
             supercell_matrix=diagonal,
             displacement_amplitude_A=args.displacement,
             subtract_equilibrium_forces=not args.no_equilibrium_force_correction,
@@ -2126,6 +2264,8 @@ def _run_cli(arguments: Sequence[str]) -> int:
         output_dir=args.output_dir,
         device=args.device,
         model_mode=args.model_mode,
+        allow_unsafe_legacy_checkpoint=args.allow_unsafe_legacy_checkpoint,
+        e3mu_compile_infer=args.compile_inference,
         reference_source=args.reference,
         sevennet_source=args.sevennet,
         material_ids=selected,

@@ -7044,6 +7044,38 @@ class DualLayerFieldModel(torch.nn.Module):
                 ) from exc
             obj = torch.load(path, map_location=map_location, weights_only=False)
 
+        def _finalize_loaded_model(model: "DualLayerFieldModel") -> "DualLayerFieldModel":
+            """Attach non-persistent checkpoint provenance used by inference tools."""
+            metadata: Dict[str, Any] = {}
+            checkpoint_format = "legacy_module"
+            schema_version = 0
+            if isinstance(obj, dict):
+                checkpoint_format = str(obj.get("format", "state_dict_bundle"))
+                try:
+                    schema_version = int(obj.get("schema_version", 0) or 0)
+                except (TypeError, ValueError):
+                    schema_version = 0
+                extra = obj.get("extra")
+                if isinstance(extra, dict):
+                    metadata.update(extra)
+                # Older dual-layer checkpoints stored these fields at top level.
+                for key in (
+                    "training_mode",
+                    "recommended_inference_mode",
+                    "loss_weights",
+                    "best_epoch",
+                    "best_val_loss",
+                    "validation_score",
+                    "split",
+                ):
+                    if key in obj and key not in metadata:
+                        metadata[key] = obj[key]
+            model.checkpoint_format = checkpoint_format
+            model.checkpoint_schema_version = schema_version
+            model.checkpoint_metadata = metadata
+            model.checkpoint_path = str(Path(path).expanduser().resolve())
+            return model
+
         if isinstance(obj, dict) and obj.get("format") == "e3mu_mixed_granularity_v1":
             cfg_values = {
                 k: v for k, v in obj["model_config"].items()
@@ -7056,7 +7088,7 @@ class DualLayerFieldModel(torch.nn.Module):
                 z_table=z_table, atomic_energies_1d=ae, cfg=cfg
             )
             model.load_state_dict(obj["state_dict"], strict=True)
-            return model
+            return _finalize_loaded_model(model)
 
         # 1) Native checkpoint dict (preferred)
         if isinstance(obj, dict) and obj.get("format") in ("e3mu_dual_layer", "e3mu_dual_layer_v2"):
@@ -7068,7 +7100,7 @@ class DualLayerFieldModel(torch.nn.Module):
             model = cls(z_table=z_table, atomic_energies_1d=ae, cfg=cfg)
             model.ground.load_state_dict(obj["ground_state_dict"])
             model.response.load_state_dict(obj["response_state_dict"])
-            return model
+            return _finalize_loaded_model(model)
 
         # 2) Backup .pth fallback: state_dict bundle
         if isinstance(obj, dict) and ("state_dict" in obj):
@@ -7076,23 +7108,45 @@ class DualLayerFieldModel(torch.nn.Module):
             if not isinstance(sd, dict):
                 raise ValueError("Invalid state_dict bundle (state_dict must be a dict).")
             cfg_d = obj.get("model_config", None)
-            cfg = ModelConfig(**cfg_d) if isinstance(cfg_d, dict) else ModelConfig()
+            cfg_values = (
+                {
+                    key: value
+                    for key, value in cfg_d.items()
+                    if key in ModelConfig.__dataclass_fields__
+                }
+                if isinstance(cfg_d, dict)
+                else {}
+            )
+            cfg = ModelConfig(**cfg_values)
             zs = obj.get("z_table_zs", None)
-            if not isinstance(zs, list) or not zs:
+            if not isinstance(zs, (list, tuple)) or not zs:
                 raise ValueError("state_dict bundle missing z_table_zs; cannot reconstruct model.")
-            ae_t = sd.get("ground.atomic_energies", None)
+            if sd and all(str(name).startswith("module.") for name in sd):
+                sd = {str(name)[7:]: value for name, value in sd.items()}
+            ae_t = sd.get("ground.atomic_energies", obj.get("atomic_energies"))
             if ae_t is None:
                 raise ValueError("state_dict bundle missing ground.atomic_energies; cannot reconstruct model.")
             ae = np.asarray(torch.as_tensor(ae_t).detach().cpu().numpy(), dtype=float).reshape(-1)
-            model = cls(z_table=AtomicNumberTable(zs), atomic_energies_1d=ae, cfg=cfg)
+            mixed_state_prefixes = (
+                "qeq.", "polarization_solver.", "d4.", "spin_layer."
+            )
+            model_class = (
+                MixedGranularityE3GNN
+                if _model_uses_mixed_granularity(cfg)
+                or any(str(name).startswith(mixed_state_prefixes) for name in sd)
+                else cls
+            )
+            model = model_class(
+                z_table=AtomicNumberTable(zs), atomic_energies_1d=ae, cfg=cfg
+            )
             model.load_state_dict(sd, strict=False)
-            return model
+            return _finalize_loaded_model(model)
 
         # 3) Pickled full model object (.pth): return directly
         if isinstance(obj, cls):
-            return obj
+            return _finalize_loaded_model(obj)
         if isinstance(obj, torch.nn.Module) and hasattr(obj, "ground") and hasattr(obj, "response"):
-            return obj
+            return _finalize_loaded_model(obj)
 
         raise ValueError(f"Unrecognized model file format: {path}")
 
@@ -11806,6 +11860,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     model.save(
         out_path,
         extra={
+            "training_mode": str(cfg.mode),
+            "recommended_inference_mode": (
+                "ground_only" if str(cfg.mode) == "base" else "full_coupled"
+            ),
             "best_epoch": int(_best_epoch),
             "best_val_loss": float(_best_val_loss),
             "validation_score": float(_best_validation_score),
