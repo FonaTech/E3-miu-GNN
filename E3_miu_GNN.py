@@ -7905,13 +7905,14 @@ class _FastEquivariantCoreO3TS(torch.nn.Module):
     def __init__(self, num_elements: int, hidden: int, num_layers: int, rbf_dim: int,
                  r_max: float, use_l3: bool, rbf_type: str,
                  type_zs: Sequence[int], enable_continuous_chem: bool,
-                 chem_max_z: int):
+                 chem_max_z: int, enable_film: bool):
         super().__init__()
         self.num_elements = int(num_elements)
         self.hidden = int(hidden)
         self.r_max = float(r_max)
         self.use_l3 = bool(use_l3)
         self.enable_continuous_chem = bool(enable_continuous_chem)
+        self.enable_film = bool(enable_film)
         self.embed = torch.nn.Linear(self.num_elements, self.hidden, bias=False)
         self.register_buffer(
             "type_zs",
@@ -7940,6 +7941,12 @@ class _FastEquivariantCoreO3TS(torch.nn.Module):
             [FastEquivariantBlockO3(self.hidden, int(rbf_dim), use_l3=self.use_l3)
              for _ in range(int(num_layers))]
         )
+        # Always materialize one FiLM layer per interaction so TorchScript can
+        # iterate over paired ModuleLists. The branch is constant-folded when
+        # FiLM is disabled, and missing weights are allowed by the exporter.
+        self.film_layers = torch.nn.ModuleList(
+            [torch.nn.Linear(4, 3 * self.hidden) for _ in range(int(num_layers))]
+        )
 
     def _rbf(self, r: torch.Tensor) -> torch.Tensor:
         if self.rbf_mode == 1:
@@ -7966,7 +7973,21 @@ class _FastEquivariantCoreO3TS(torch.nn.Module):
         a  = torch.zeros((n, self.hidden, 3), dtype=positions.dtype, device=positions.device)
         t2 = torch.zeros((n, self.hidden, 5), dtype=positions.dtype, device=positions.device)
         t3 = torch.zeros((n, self.hidden, 7), dtype=positions.dtype, device=positions.device)
-        for layer in self.layers:
+        film_condition = torch.zeros((n, 4), dtype=positions.dtype, device=positions.device)
+        for layer, film_layer in zip(self.layers, self.film_layers):
+            if self.enable_film:
+                gamma_s, beta_s, gamma_tensor = torch.chunk(
+                    film_layer(film_condition), 3, dim=-1
+                )
+                gamma_s = 0.25 * torch.tanh(gamma_s)
+                beta_s = _smooth_scalar_bound(beta_s, max_abs=5.0)
+                gamma_tensor = 0.25 * torch.tanh(gamma_tensor)
+                s = s * (1.0 + gamma_s) + beta_s
+                gate = (1.0 + gamma_tensor).unsqueeze(-1)
+                v = v * gate
+                a = a * gate
+                t2 = t2 * gate
+                t3 = t3 * gate
             s, v, a, t2, t3 = layer(s=s, v=v, a=a, t2=t2, t3=t3, edge_index=edge_index,
                                      edge_vec=edge_vec, r=r, rbf=rbf, cutoff=cutoff, num_nodes=n)
         return s
@@ -8017,6 +8038,7 @@ class _E3MUGroundModelO3TS(torch.nn.Module):
             type_zs=list(range(1, int(num_elements) + 1)),
             enable_continuous_chem=bool(getattr(cfg, "enable_continuous_chem", False)),
             chem_max_z=int(getattr(cfg, "chem_max_z", 96)),
+            enable_film=bool(getattr(cfg, "enable_film", False)),
         )
         self.energy_head = torch.nn.Sequential(
             torch.nn.Linear(int(cfg.num_channels), int(cfg.num_channels)),
@@ -8164,6 +8186,8 @@ def export_sevennet_torchscript(ckpt_path: str, log: Callable) -> None:
         allowed_missing_prefixes = list(inactive_rbf_prefixes)
         if not bool(getattr(cfg_obj, "enable_continuous_chem", False)):
             allowed_missing_prefixes.append("core.element_encoder.")
+        if not bool(getattr(cfg_obj, "enable_film", False)):
+            allowed_missing_prefixes.append("core.film_layers.")
 
         remaining_missing = [
             k for k in incompat.missing_keys

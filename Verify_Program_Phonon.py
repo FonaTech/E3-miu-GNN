@@ -143,6 +143,47 @@ def _normalise_field(field: Sequence[float]) -> np.ndarray:
     return values.reshape(3)
 
 
+def _seekpath_available() -> bool:
+    try:
+        import seekpath  # noqa: F401
+
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
+def _run_generic_reciprocal_band_structure(
+    phonon: Any,
+    *,
+    npoints: int,
+) -> None:
+    """Run a basis-defined path when conventional symmetry labels are unavailable."""
+    from phonopy.phonon.band_structure import (
+        get_band_qpoints_and_path_connections,
+    )
+
+    band_paths = [
+        [
+            [0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.5, 0.5, 0.5],
+        ]
+    ]
+    qpoints, path_connections = get_band_qpoints_and_path_connections(
+        band_paths,
+        npoints=int(max(5, npoints)),
+    )
+    phonon.run_band_structure(
+        qpoints,
+        with_eigenvectors=False,
+        with_group_velocities=False,
+        path_connections=path_connections,
+        labels=("G", "B1/2", "B12/2", "G", "B123/2"),
+    )
+
+
 def _recommended_native_model_mode(model: DualLayerFieldModel) -> Tuple[str, str]:
     """Infer the physically trained inference surface of a native checkpoint."""
     metadata = getattr(model, "checkpoint_metadata", {})
@@ -417,7 +458,17 @@ class DualLayerPESCalculator(Calculator):
             raise ValueError("Native checkpoint has an empty atomic-number table")
         self._z_table = AtomicNumberTable(list(self._z_to_index))
         self._compiled = False
-        self._compile_requested = bool(compile_inference)
+        self._compile_user_requested = bool(compile_inference)
+        self._compile_requested = self._compile_user_requested
+        self._compile_skip_reason = ""
+        if self._compile_requested and self.device.type == "mps":
+            # PyTorch AOTInductor can terminate the process inside the Metal
+            # compiler, so this cannot be recovered by the eager retry below.
+            self._compile_requested = False
+            self._compile_skip_reason = (
+                "disabled on MPS because torch.compile may abort in the Metal backend"
+            )
+            self.log(f"[{_now()}] WARN: Native inference compile {self._compile_skip_reason}; using eager inference")
         self._warned_missing_spin = False
         self.calculation_count = 0
         self.last_components: Dict[str, float] = {}
@@ -495,7 +546,9 @@ class DualLayerPESCalculator(Calculator):
             "spin_policy": self.spin_policy,
             "total_charge": self.total_charge,
             "electric_field_V_per_A": self.electric_field.tolist(),
+            "compile_requested": self._compile_user_requested,
             "compiled": self._compiled,
+            "compile_skip_reason": self._compile_skip_reason,
             "force_evaluations": self.calculation_count,
             "last_components_eV": dict(self.last_components),
         }
@@ -623,12 +676,16 @@ class SevenNetTSCalculator(Calculator):
         super().__init__()
         self.device, _runtime_dtype = resolve_device(device, dtype="float32")
         self.calculation_count = 0
+        self._model_path = str(Path(model_path).expanduser().resolve())
+        self._input_signature: Optional[Tuple[int, int]] = None
         extra_files: Dict[str, Any] = {
             "chemical_symbols_to_index": b"",
             "cutoff": b"",
             "num_species": b"",
         }
-        self._model = torch.jit.load(model_path, map_location=self.device, _extra_files=extra_files)
+        self._model = torch.jit.load(
+            self._model_path, map_location=self.device, _extra_files=extra_files
+        )
         self._model.eval()
 
         # Parse metadata from _extra_files
@@ -672,7 +729,9 @@ class SevenNetTSCalculator(Calculator):
             "spin_policy": "off",
             "total_charge": 0.0,
             "electric_field_V_per_A": [0.0, 0.0, 0.0],
+            "compile_requested": bool(getattr(self, "compile_requested", False)),
             "compiled": True,
+            "compile_skip_reason": "already stored as TorchScript",
             "force_evaluations": self.calculation_count,
             "last_components_eV": {},
         }
@@ -696,6 +755,14 @@ class SevenNetTSCalculator(Calculator):
 
         ase_atoms = Atoms(numbers=zs, positions=pos, cell=cell, pbc=pbc)
         i_idx, j_idx, S = neighbor_list("ijS", ase_atoms, cutoff=self._cutoff)
+        input_signature = (int(zs.size), int(i_idx.size))
+        if self._input_signature is not None and input_signature != self._input_signature:
+            # PyTorch 2.10 TorchScript autograd may retain symbolic reduction
+            # sizes from its first invocation. Reloading only when topology
+            # dimensions change keeps variable-size ASE workflows reliable.
+            self._model = torch.jit.load(self._model_path, map_location=self.device)
+            self._model.eval()
+        self._input_signature = input_signature
         edge_index = torch.tensor(np.stack([i_idx, j_idx], axis=0), dtype=torch.long, device=self.device)
         pbc_shift = torch.tensor(S, dtype=torch.float32, device=self.device)
         cell_t = torch.tensor(cell, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1,3,3)
@@ -756,6 +823,7 @@ def _make_pes_calculator(
                 "short-range ground model; using ground_only mode"
             )
         if bool(e3mu_compile_infer):
+            model.compile_requested = True
             log(f"[{_now()}] SevenNet input is already TorchScript compiled")
         return model  # already an ASE Calculator
     return DualLayerPESCalculator(
@@ -839,6 +907,15 @@ def compute_phonon_thermo_phonopy(
     stop_flag: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     from phonopy import Phonopy
+
+    has_seekpath = _seekpath_available()
+    if not has_seekpath:
+        log(
+            f"[{_now()}] WARN: seekpath is unavailable in {sys.executable}. "
+            "The calculation will retain force constants, DOS, and thermodynamics, "
+            "but the band plot will use a labeled generic reciprocal-basis path. "
+            "Install project requirements for a conventional high-symmetry path."
+        )
 
     P = np.asarray(supercell_matrix, dtype=int)
     if P.shape != (3, 3):
@@ -979,20 +1056,31 @@ def compute_phonon_thermo_phonopy(
     if progress is not None:
         progress({"type": "prop", "task": "Phonon/Thermo", "overall_frac": 0.65, "current": 0, "total": 1, "stage": "band_structure"})
 
-    try:
-        phonon.auto_band_structure(
-            npoints=int(max(5, band_npoints)),
-            with_eigenvectors=False,
-            with_group_velocities=False,
-            plot=False,
-            write_yaml=False,
+    band_path_source = "seekpath_high_symmetry"
+    band_path_note = "Conventional high-symmetry path generated by seekpath."
+    if has_seekpath:
+        try:
+            phonon.auto_band_structure(
+                npoints=int(max(5, band_npoints)),
+                with_eigenvectors=False,
+                with_group_velocities=False,
+                plot=False,
+                write_yaml=False,
+            )
+        except ModuleNotFoundError as exc:
+            if "seekpath" not in str(exc).lower():
+                raise
+            has_seekpath = False
+    if not has_seekpath:
+        band_path_source = "generic_reciprocal_basis_fallback"
+        band_path_note = (
+            "seekpath was unavailable; labels describe reciprocal-basis fractions, "
+            "not conventional crystallographic high-symmetry points."
         )
-    except ModuleNotFoundError as exc:
-        if "seekpath" in str(exc).lower():
-            raise RuntimeError(
-                "Automatic high-symmetry band paths require seekpath; install project requirements"
-            ) from exc
-        raise
+        _run_generic_reciprocal_band_structure(
+            phonon,
+            npoints=int(max(5, band_npoints)),
+        )
     band = phonon.get_band_structure_dict()
     bs = phonon.band_structure
     labels = list(getattr(bs, "labels", []) or [])
@@ -1129,6 +1217,8 @@ def compute_phonon_thermo_phonopy(
         "requested_dos_sigma_THz": requested_dos_sigma,
         "band_npoints": int(max(5, band_npoints)),
         "band": {
+            "path_source": band_path_source,
+            "path_note": band_path_note,
             "distances": _to_list(band.get("distances", [])),
             "qpoints": _to_list(band.get("qpoints", [])),
             "frequencies_THz": _to_list(band.get("frequencies", [])),
@@ -1926,6 +2016,11 @@ class App(tk.Tk):
             f"field: {res.get('electric_field_V_per_A')} V/Å\n",
         )
         self._txt.insert("end", f"band freq range (THz): {fmin} .. {fmax}\n")
+        self._txt.insert(
+            "end",
+            f"band path: {band.get('path_source', 'unknown')}  "
+            f"{band.get('path_note', '')}\n",
+        )
         self._txt.insert("end", f"supercell: {res.get('supercell_matrix')}\n")
         self._txt.insert("end", f"dos_mesh: {res.get('dos_mesh')}  dos_sigma_THz: {res.get('dos_sigma_THz')}\n")
         self._txt.insert("end", f"band_npoints: {res.get('band_npoints')}\n")
@@ -1937,7 +2032,11 @@ class App(tk.Tk):
         # Phonon spectrum (band + DOS)
         self._ax_band.cla()
         self._ax_dos.cla()
-        self._ax_band.set_title("Phonon Band Structure")
+        self._ax_band.set_title(
+            "Phonon Band Structure"
+            if band.get("path_source") != "generic_reciprocal_basis_fallback"
+            else "Phonon Band (Generic Reciprocal Path)"
+        )
         self._ax_band.set_xlabel("k-path distance")
         self._ax_band.set_ylabel("Frequency (THz)")
         self._ax_band.grid(True, alpha=0.3)
