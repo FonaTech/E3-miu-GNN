@@ -55,6 +55,7 @@ import copy
 import gc
 import hashlib
 import importlib.util
+import io
 import itertools
 import json
 import math
@@ -178,6 +179,9 @@ COULOMB_EV_ANGSTROM = 14.3996454784255
 MU_B_EV_PER_TESLA = 5.7883817982e-5
 HDF5_SCHEMA_VERSION = "e3mu-hdf5-v1"
 COMPOSITE_HDF5_SCHEMA_VERSION = "e3mu-composite-hdf5-v1"
+OMAT24_BYTE_SHARD_SCHEMA_VERSION = "hdf5-byte-shards-v1"
+OMAT24_MATERIALIZED_SCHEMA_VERSION = "hdf5-materialized-parquet-v1"
+OMAT24_PACKED_SCHEMA_VERSION = "hdf5-packed-structures-v1"
 HDF5_CANONICAL_ROOT_GROUPS: Tuple[str, ...] = (
     "structures",
     "labels",
@@ -1028,6 +1032,7 @@ class AtomicData(_TGData):
         props = dict(cfg.properties or {})
         wts = dict(cfg.property_weights or {})
         data.group_id = str(props.get("group_id", "unknown"))
+        data.sample_id = str(props.get("sample_id", data.group_id))
         data.dataset_role = str(props.get("dataset_role", "unknown"))
 
         has_energy = "energy" in props
@@ -1111,6 +1116,7 @@ class AtomicData(_TGData):
         data.method_id = str(props.get("method_id", "unknown"))
         data.system_id = str(props.get("system_id", "unknown"))
         data.group_id = str(props.get("group_id", "unknown"))
+        data.sample_id = str(props.get("sample_id", data.group_id))
         return data
 
 
@@ -1491,6 +1497,8 @@ _DATASET_PREPARATION_EXPORTS = frozenset({
     "validate_neo_hdf5",
     "hdf5_dataset_summary",
     "build_neo_omat24_composite",
+    "build_neo_composite_half",
+    "embed_omat24_parquet_in_composite",
     "embed_neo_large_in_composite",
     "prepare_neo_huggingface_release",
     "generate_vasp_magnetic_jobs",
@@ -1557,8 +1565,16 @@ def iter_hdf5_configurations(
         raise RuntimeError("HDF5 support requires h5py")
     with h5py.File(path, "r") as handle:
         schema = str(handle.attrs.get("schema_version", ""))
-        if schema != HDF5_SCHEMA_VERSION:
+        if schema not in {HDF5_SCHEMA_VERSION, COMPOSITE_HDF5_SCHEMA_VERSION}:
             raise ValueError(f"Unsupported HDF5 schema: {schema!r}")
+        missing_groups = [
+            name for name in HDF5_CANONICAL_ROOT_GROUPS if name not in handle
+        ]
+        if missing_groups:
+            raise ValueError(
+                "HDF5 file does not contain a canonical numerical payload: "
+                + ", ".join(missing_groups)
+            )
         structures, labels, masks, metadata_group = (
             handle["structures"], handle["labels"], handle["masks"], handle["metadata"]
         )
@@ -2913,6 +2929,57 @@ class CompositeStreamPlan:
     elements: Tuple[int, ...]
     label_counts: Dict[str, int]
     split_info: Dict[str, Any]
+    omat_embedded: bool = False
+    omat_materialized: bool = False
+    omat_packed: bool = False
+    embedded_shard_names: Tuple[str, ...] = ()
+
+
+class _HDF5ByteStream(io.RawIOBase):
+    """Seekable read-only file facade over one embedded HDF5 byte dataset."""
+
+    def __init__(self, dataset: Any) -> None:
+        super().__init__()
+        self._dataset = dataset
+        self._position = 0
+        self._size = int(dataset.shape[0])
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return int(self._position)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        value = int(offset)
+        if whence == io.SEEK_CUR:
+            value += self._position
+        elif whence == io.SEEK_END:
+            value += self._size
+        elif whence != io.SEEK_SET:
+            raise ValueError(f"Unsupported seek mode: {whence}")
+        self._position = max(0, min(self._size, value))
+        return int(self._position)
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or int(size) < 0:
+            count = self._size - self._position
+        else:
+            count = min(int(size), self._size - self._position)
+        if count <= 0:
+            return b""
+        start = int(self._position)
+        end = start + int(count)
+        self._position = end
+        return np.asarray(self._dataset[start:end], dtype=np.uint8).tobytes()
+
+    def readinto(self, buffer: Any) -> int:
+        data = self.read(len(buffer))
+        buffer[: len(data)] = data
+        return len(data)
 
 
 def _deterministic_subsample_indices(
@@ -2927,7 +2994,26 @@ def _deterministic_subsample_indices(
     rng = np.random.default_rng(
         int(hashlib.sha256(f"{namespace}|{seed}".encode()).hexdigest()[:16], 16)
     )
-    return np.sort(rng.choice(values, size=target, replace=False)).astype(np.int64)
+    sampled = np.sort(rng.choice(values, size=target, replace=False))
+    if values.size < np.iinfo(np.uint32).max:
+        return sampled.astype(np.uint32, copy=False)
+    return sampled.astype(np.int64, copy=False)
+
+
+def _flatnonzero_uint32(mask: np.ndarray, *, chunk_size: int = 8_000_000) -> np.ndarray:
+    """Return large selector indices without an intermediate int64 full index."""
+    values = np.asarray(mask, dtype=np.bool_).reshape(-1)
+    if values.size >= np.iinfo(np.uint32).max:
+        raise ValueError("Composite selector exceeds uint32 index capacity")
+    output = np.empty((int(np.count_nonzero(values)),), dtype=np.uint32)
+    cursor = 0
+    step = max(1, int(chunk_size))
+    for start in range(0, int(values.size), step):
+        local = np.flatnonzero(values[start:start + step]).astype(np.uint32)
+        end = cursor + int(local.size)
+        output[cursor:end] = local + np.uint32(start)
+        cursor = end
+    return output
 
 
 def prepare_composite_stream_plan(
@@ -2944,13 +3030,39 @@ def prepare_composite_stream_plan(
         if str(handle.attrs.get("schema_version", "")) != COMPOSITE_HDF5_SCHEMA_VERSION:
             raise ValueError("Unsupported composite HDF5 schema")
         omat = handle["sources/omat24"]
-        omat_root = _resolve_composite_source(composite, str(omat.attrs["root"]))
-        source_files = tuple(
-            str((omat_root / str(value)).resolve())
-            for value in omat["file_paths"].asstr()[:]
+        omat_embedded = bool(omat.attrs.get("embedded", False))
+        omat_storage = str(omat.attrs.get("storage", ""))
+        omat_packed = omat_storage == OMAT24_PACKED_SCHEMA_VERSION
+        omat_materialized = bool(omat.attrs.get("materialized", False)) or (
+            omat_storage in {
+                OMAT24_MATERIALIZED_SCHEMA_VERSION, OMAT24_PACKED_SCHEMA_VERSION
+            }
         )
-        source_orders = np.asarray(handle["selection/source_order"][:], dtype=np.int64)
-        row_indices = np.asarray(handle["selection/row_index"][:], dtype=np.int64)
+        omat_root = (
+            _resolve_composite_source(composite, str(omat.attrs.get("root", ".")))
+            if not omat_embedded
+            else composite.parent
+        )
+        relative_source_files = tuple(
+            str(value) for value in omat["file_paths"].asstr()[:]
+        )
+        source_files = (
+            relative_source_files
+            if omat_embedded
+            else tuple(str((omat_root / value).resolve()) for value in relative_source_files)
+        )
+        embedded_shard_names: Tuple[str, ...] = ()
+        if omat_embedded and not omat_packed:
+            payload = omat.get("embedded_parquet")
+            if payload is None or "shard_names" not in payload:
+                raise ValueError("Embedded OMat24 payload is missing shard_names")
+            embedded_shard_names = tuple(
+                str(value) for value in payload["shard_names"].asstr()[:]
+            )
+            if len(embedded_shard_names) != len(source_files):
+                raise ValueError("Embedded OMat24 shard count does not match file_paths")
+        source_orders = np.asarray(handle["selection/source_order"][:], dtype=np.uint16)
+        row_indices = np.asarray(handle["selection/row_index"][:], dtype=np.uint32)
         split_codes = np.asarray(handle["selection/split_code"][:], dtype=np.uint8)
         omat_atom_counts = np.asarray(handle["selection/atom_count"][:], dtype=np.uint16)
         large_group = handle["sources/neo_large"]
@@ -2961,15 +3073,15 @@ def prepare_composite_stream_plan(
             else _resolve_composite_source(composite, str(large_group.attrs["path"]))
         )
         metadata = json.loads(str(handle.attrs.get("metadata_json", "{}")))
-    for source in (*source_files, str(large_path)):
+    for source in (() if omat_embedded else source_files) + (str(large_path),):
         if not Path(source).is_file():
             raise FileNotFoundError(f"Composite source is unavailable: {source}")
 
     selected_mode = str(mode).strip().lower()
     if selected_mode not in {"base", "response", "joint"}:
         raise ValueError(f"Unsupported composite training mode: {mode!r}")
-    omat_train = np.flatnonzero(split_codes == 0).astype(np.int64)
-    omat_val = np.flatnonzero(split_codes == 1).astype(np.int64)
+    omat_train = _flatnonzero_uint32(split_codes == 0)
+    omat_val = _flatnonzero_uint32(split_codes == 1)
     if selected_mode == "response":
         omat_train = np.zeros((0,), dtype=np.int64)
         omat_val = np.zeros((0,), dtype=np.int64)
@@ -3046,6 +3158,10 @@ def prepare_composite_stream_plan(
         train_large_indices=large_train, val_large_indices=large_val,
         elements=tuple(sorted(elements)), label_counts={str(k): int(v) for k, v in label_counts.items()},
         split_info=split_info,
+        omat_embedded=omat_embedded,
+        omat_materialized=omat_materialized,
+        omat_packed=omat_packed,
+        embedded_shard_names=embedded_shard_names,
     )
 
 
@@ -3062,11 +3178,12 @@ class CompositeAtomicDataDataset(Dataset):
         cutoff: float,
     ) -> None:
         self.plan = plan
-        self.omat_indices = np.asarray(omat_indices, dtype=np.int64)
+        self.omat_indices = np.asarray(omat_indices, dtype=np.uint32)
         self.large_indices = np.asarray(large_indices, dtype=np.int64)
         self.z_table = z_table
         self.cutoff = float(cutoff)
         self._parquet_handles: Dict[int, Any] = {}
+        self._embedded_streams: Dict[int, _HDF5ByteStream] = {}
         self._parquet_streams: Dict[int, Dict[str, Any]] = {}
         self._large_handle = None
         self._handle_pid: Optional[int] = None
@@ -3095,15 +3212,94 @@ class CompositeAtomicDataDataset(Dataset):
     def _parquet_file(self, source_order: int) -> Any:
         handle = self._parquet_handles.get(int(source_order))
         if handle is None:
-            handle = _pyarrow_parquet.ParquetFile(
-                self.plan.source_files[int(source_order)]
-            )
+            source_index = int(source_order)
+            if self.plan.omat_embedded:
+                if self._large_handle is None:
+                    raise RuntimeError("Embedded OMat24 handle is not open")
+                payload = self._large_handle["sources/omat24/embedded_parquet"]
+                shard_name = self.plan.embedded_shard_names[source_index]
+                stream = _HDF5ByteStream(payload["shards"][shard_name])
+                self._embedded_streams[source_index] = stream
+                handle = _pyarrow_parquet.ParquetFile(stream)
+            else:
+                handle = _pyarrow_parquet.ParquetFile(
+                    self.plan.source_files[source_index]
+                )
             self._parquet_handles[int(source_order)] = handle
         return handle
 
     def _parquet_row(self, source_order: int, row_index: int) -> Dict[str, Any]:
         source = int(source_order)
         target = int(row_index)
+        if self.plan.omat_materialized:
+            state = self._parquet_streams.get(source)
+            if state is None or (
+                state.get("access_mode") == "stream"
+                and target < int(state.get("batch_start", 0))
+            ):
+                parquet = self._parquet_file(source)
+                counts = np.asarray(
+                    [
+                        parquet.metadata.row_group(index).num_rows
+                        for index in range(parquet.metadata.num_row_groups)
+                    ],
+                    dtype=np.int64,
+                )
+                if counts.size and int(np.max(counts)) <= 16_384:
+                    state = {
+                        "access_mode": "row_group",
+                        "row_group_offsets": np.concatenate((
+                            np.zeros((1,), dtype=np.int64),
+                            np.cumsum(counts, dtype=np.int64),
+                        )),
+                        "row_group": -1,
+                        "table": None,
+                    }
+                else:
+                    # Identity shards retain their exact source bytes and may
+                    # contain one very large row group. Stream small batches in
+                    # selector order instead of materializing that group in RAM.
+                    state = {
+                        "access_mode": "stream",
+                        "iterator": parquet.iter_batches(
+                            batch_size=2048,
+                            columns=list(OMAT24_PARQUET_COLUMNS),
+                        ),
+                        "next_start": 0,
+                        "batch_start": 0,
+                        "batch": None,
+                    }
+                self._parquet_streams[source] = state
+            if state["access_mode"] == "row_group":
+                offsets = state["row_group_offsets"]
+                if target < 0 or target >= int(offsets[-1]):
+                    raise IndexError(
+                        f"Parquet row {target} is outside materialized shard {source}"
+                    )
+                row_group = int(np.searchsorted(offsets, target, side="right") - 1)
+                if int(state["row_group"]) != row_group:
+                    state["table"] = self._parquet_file(source).read_row_group(
+                        row_group, columns=list(OMAT24_PARQUET_COLUMNS)
+                    )
+                    state["row_group"] = row_group
+                local = target - int(offsets[row_group])
+                return state["table"].slice(local, 1).to_pylist()[0]
+
+            while True:
+                batch = state.get("batch")
+                start = int(state["batch_start"])
+                if batch is not None and start <= target < start + len(batch):
+                    return batch.slice(target - start, 1).to_pylist()[0]
+                try:
+                    batch = next(state["iterator"])
+                except StopIteration as exc:
+                    raise IndexError(
+                        f"Parquet row {target} is outside materialized shard {source}"
+                    ) from exc
+                state["batch_start"] = int(state["next_start"])
+                state["next_start"] = int(state["next_start"]) + len(batch)
+                state["batch"] = batch
+
         state = self._parquet_streams.get(source)
         if state is None or target < int(state.get("batch_start", 0)):
             state = {
@@ -3133,10 +3329,50 @@ class CompositeAtomicDataDataset(Dataset):
     def _configuration_at(self, position: int) -> Configuration:
         if position < self.omat_indices.size:
             selector = int(self.omat_indices[position])
+            if self.plan.omat_packed:
+                packed = self._large_handle["sources/omat24/packed"]
+                start = int(packed["atom_ptr"][selector])
+                end = int(packed["atom_ptr"][selector + 1])
+                props: Dict[str, Any] = {
+                    "energy": float(packed["energy"][selector]),
+                    "forces": np.asarray(packed["forces"][start:end], dtype=np.float64),
+                    "stress": np.asarray(packed["stress"][selector], dtype=np.float64),
+                    "stress_volume_normalized": float(
+                        packed["stress_volume_normalized"][selector]
+                    ),
+                    "method_id": str(self._large_handle["sources/omat24"].attrs.get(
+                        "method_id", "OMat24/PBE+U"
+                    )),
+                    "group_id": str(packed["material_id"].asstr()[selector]),
+                    "system_id": str(packed["material_id"].asstr()[selector]),
+                    "sample_id": str(packed["configuration_id"].asstr()[selector]),
+                    "provenance_id": (
+                        f"OMat24:{int(self.plan.source_orders[selector])}:"
+                        f"{int(packed['source_row_index'][selector])}"
+                    ),
+                    "energy_reference": "OMat24 PBE+U",
+                    "dataset_role": "l1-foundation",
+                    "curriculum_role": "base+joint",
+                }
+                return Configuration(
+                    atomic_numbers=np.asarray(
+                        packed["atomic_numbers"][start:end], dtype=int
+                    ),
+                    positions=np.asarray(packed["positions"][start:end], dtype=np.float64),
+                    properties=props,
+                    property_weights={
+                        "energy": 1.0, "forces": 1.0, "stress": 1.0,
+                        "stress_volume_normalized": 1.0,
+                    },
+                    cell=np.asarray(packed["cell"][selector], dtype=np.float64),
+                    pbc=tuple(bool(value) for value in packed["pbc"][selector]),
+                    head="OMat24/PBE+U",
+                )
             source_order = int(self.plan.source_orders[selector])
             row_index = int(self.plan.row_indices[selector])
             row = self._parquet_row(source_order, row_index)
-            corpus_name = Path(self.plan.source_files[source_order]).parent.parent.name
+            source_path = Path(self.plan.source_files[source_order])
+            corpus_name = source_path.parent.parent.name
             return _omat24_configuration_from_row(row, corpus_name=corpus_name)
         index = int(self.large_indices[position - self.omat_indices.size])
         cfg = _read_hdf5_configuration_at(
@@ -3179,12 +3415,14 @@ class CompositeAtomicDataDataset(Dataset):
                 pass
         self._large_handle = None
         self._parquet_handles.clear()
+        self._embedded_streams.clear()
         self._parquet_streams.clear()
         self._handle_pid = None
 
     def __getstate__(self) -> Dict[str, Any]:
         state = dict(self.__dict__)
         state["_parquet_handles"] = {}
+        state["_embedded_streams"] = {}
         state["_parquet_streams"] = {}
         state["_large_handle"] = None
         state["_handle_pid"] = None
@@ -3424,7 +3662,17 @@ def inspect_composite_dataset(
         if str(handle.attrs.get("schema_version", "")) != COMPOSITE_HDF5_SCHEMA_VERSION:
             raise ValueError("Not an E3MU composite HDF5 dataset")
         omat = handle["sources/omat24"]
-        omat_root = _resolve_composite_source(composite, str(omat.attrs["root"]))
+        omat_embedded = bool(omat.attrs.get("embedded", False))
+        omat_storage = str(omat.attrs.get("storage", ""))
+        omat_packed = omat_storage == OMAT24_PACKED_SCHEMA_VERSION
+        omat_materialized = bool(omat.attrs.get("materialized", False)) or (
+            omat_storage in {
+                OMAT24_MATERIALIZED_SCHEMA_VERSION, OMAT24_PACKED_SCHEMA_VERSION
+            }
+        )
+        omat_root = _resolve_composite_source(
+            composite, str(omat.attrs.get("root", "."))
+        )
         file_paths = [str(value) for value in omat["file_paths"].asstr()[:]]
         file_hashes = [str(value) for value in omat["file_sha256"].asstr()[:]]
         missing: List[str] = []
@@ -3436,21 +3684,135 @@ def inspect_composite_dataset(
             for name in ("source_order", "row_index", "split_code", "atom_count")
             if name in selection
         }
-        if len(selection_lengths) != 4:
+        if "source_row_index" in selection:
+            selection_lengths["source_row_index"] = int(
+                selection["source_row_index"].shape[0]
+            )
+        required_lengths = {
+            name: selection_lengths[name]
+            for name in ("source_order", "row_index", "split_code", "atom_count")
+            if name in selection_lengths
+        }
+        if len(required_lengths) != 4:
             embedded_errors.append("one or more OMat24 selector arrays are missing")
         elif len(set(selection_lengths.values())) != 1:
             embedded_errors.append(
                 "OMat24 selector lengths disagree: "
                 + json.dumps(selection_lengths, sort_keys=True)
             )
-        elif selection_lengths["source_order"]:
-            max_source_order = int(np.max(selection["source_order"][:]))
-            if max_source_order >= len(file_paths):
-                embedded_errors.append(
-                    f"selector source_order={max_source_order} exceeds "
-                    f"the {len(file_paths)} declared OMat24 shards"
+        source_counts = np.zeros((len(file_paths),), dtype=np.int64)
+        selector_count = int(selection_lengths.get("source_order", 0))
+        selector_chunk = 4_000_000
+        if not embedded_errors and selector_count:
+            for start in range(0, selector_count, selector_chunk):
+                orders = np.asarray(
+                    selection["source_order"][start:start + selector_chunk],
+                    dtype=np.int64,
                 )
-        if verify_sources:
+                if np.any(orders < 0) or np.any(orders >= len(file_paths)):
+                    embedded_errors.append(
+                        "one or more selector source_order values exceed the "
+                        f"{len(file_paths)} declared OMat24 shards"
+                    )
+                    break
+                source_counts += np.bincount(orders, minlength=len(file_paths))
+        if omat_embedded and omat_packed:
+            packed = omat.get("packed")
+            if packed is None:
+                embedded_errors.append("packed OMat24 payload is missing")
+            else:
+                packed_structures = max(0, int(packed["atom_ptr"].shape[0]) - 1)
+                if packed_structures != selector_count:
+                    embedded_errors.append(
+                        "packed OMat24 structure count does not match selectors"
+                    )
+                required = {
+                    "atomic_numbers", "positions", "forces", "cell", "pbc",
+                    "energy", "stress", "stress_volume_normalized",
+                    "configuration_id", "material_id", "source_row_index",
+                }
+                absent = sorted(required - set(packed))
+                if absent:
+                    embedded_errors.append(
+                        "packed OMat24 fields are missing: " + ", ".join(absent)
+                    )
+                elif selector_count and int(packed["atom_ptr"][-1]) != int(
+                    np.sum(selection["atom_count"][:], dtype=np.int64)
+                ):
+                    embedded_errors.append("packed OMat24 atom count is inconsistent")
+        elif omat_embedded:
+            payload = omat.get("embedded_parquet")
+            if payload is None or "shard_names" not in payload or "shards" not in payload:
+                embedded_errors.append("embedded OMat24 shard payload is missing")
+            else:
+                shard_names = [str(value) for value in payload["shard_names"].asstr()[:]]
+                if len(shard_names) != len(file_paths):
+                    embedded_errors.append(
+                        "embedded OMat24 shard count does not match file_paths"
+                    )
+                elif any(name not in payload["shards"] for name in shard_names):
+                    embedded_errors.append("one or more embedded OMat24 shards are missing")
+                expected_hashes = file_hashes
+                if omat_materialized:
+                    if "materialized_rows" not in payload:
+                        embedded_errors.append(
+                            "materialized OMat24 payload is missing materialized_rows"
+                        )
+                    elif "materialized_sha256" not in payload:
+                        embedded_errors.append(
+                            "materialized OMat24 payload is missing materialized_sha256"
+                        )
+                    else:
+                        materialized_rows = np.asarray(
+                            payload["materialized_rows"][:], dtype=np.int64
+                        )
+                        expected_hashes = [
+                            str(value)
+                            for value in payload["materialized_sha256"].asstr()[:]
+                        ]
+                        if materialized_rows.shape != source_counts.shape:
+                            embedded_errors.append(
+                                "materialized row-count array does not match source shards"
+                            )
+                        elif not np.array_equal(materialized_rows, source_counts):
+                            embedded_errors.append(
+                                "materialized row counts do not match selector counts"
+                            )
+                        elif selector_count:
+                            for start in range(0, selector_count, selector_chunk):
+                                orders = np.asarray(
+                                    selection["source_order"][
+                                        start:start + selector_chunk
+                                    ],
+                                    dtype=np.int64,
+                                )
+                                rows = np.asarray(
+                                    selection["row_index"][
+                                        start:start + selector_chunk
+                                    ],
+                                    dtype=np.int64,
+                                )
+                                if np.any(rows < 0) or np.any(
+                                    rows >= materialized_rows[orders]
+                                ):
+                                    embedded_errors.append(
+                                        "materialized selector row_index exceeds its shard"
+                                    )
+                                    break
+                if verify_sources and not embedded_errors:
+                    for name, expected in zip(shard_names, expected_hashes):
+                        dataset = payload["shards"][name]
+                        digest = hashlib.sha256()
+                        for start in range(0, int(dataset.shape[0]), 8 * 1024 * 1024):
+                            digest.update(
+                                np.asarray(
+                                    dataset[start:start + 8 * 1024 * 1024],
+                                    dtype=np.uint8,
+                                ).tobytes()
+                            )
+                        if digest.hexdigest() != expected:
+                            mismatched.append(f"embedded://{name}")
+        elif verify_sources:
             for relative, expected in zip(file_paths, file_hashes):
                 source = omat_root / relative
                 if not source.is_file():
@@ -3555,6 +3917,9 @@ def inspect_composite_dataset(
             "missing_sources": missing,
             "checksum_mismatches": mismatched,
             "embedded_large": large_embedded,
+            "embedded_omat24": omat_embedded,
+            "materialized_omat24": omat_materialized,
+            "omat24_storage": omat_storage,
             "embedded_errors": embedded_errors,
             "source_files": len(file_paths),
             "sha256": sha256_file(str(composite)) if verify_sources else None,
@@ -6638,7 +7003,12 @@ class DualLayerFieldModel(torch.nn.Module):
             "ground_state_dict": self.ground.state_dict(),
             "response_state_dict": self.response.state_dict(),
         }
-        if extra: ckpt.update(extra)
+        if extra:
+            safe_extra = _checkpoint_safe(extra)
+            ckpt["extra"] = safe_extra
+            # Keep the historical top-level metadata keys readable by older
+            # evaluators while new readers use the uniform ``extra`` block.
+            ckpt.update(safe_extra)
         torch.save(ckpt, path)
 
     @classmethod
@@ -6854,6 +7224,196 @@ def _checkpoint_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool, type(None), torch.Tensor)):
         return value
     return str(value)
+
+
+def _model_uses_mixed_granularity(cfg: ModelConfig) -> bool:
+    return any(
+        bool(getattr(cfg, name, False))
+        for name in (
+            "enable_qeq", "enable_pme", "enable_deq", "enable_d4",
+            "enable_spin", "enable_film",
+        )
+    )
+
+
+def _copy_matching_pretrained_weights(
+    target: torch.nn.Module,
+    source: torch.nn.Module,
+    *,
+    source_elements: Sequence[int],
+    target_elements: Sequence[int],
+    source_cfg: Optional[ModelConfig] = None,
+    target_cfg: Optional[ModelConfig] = None,
+) -> Dict[str, Any]:
+    """Warm-start compatible tensors, remapping element-indexed rows exactly."""
+    target_state = target.state_dict()
+    source_state = source.state_dict()
+    source_index = {int(z): index for index, z in enumerate(source_elements)}
+    target_index = {int(z): index for index, z in enumerate(target_elements)}
+    shared_elements = sorted(set(source_index) & set(target_index))
+    element_keys = {
+        "ground.atomic_energies",
+        "ground.core.embed.weight",
+        "response.core.embed.weight",
+    }
+    loaded: List[str] = []
+    remapped: List[str] = []
+    skipped: Dict[str, str] = {}
+    loaded_numel = 0
+    loaded_ground_trainable_numel = 0
+    target_parameters = dict(target.named_parameters())
+    radial_settings_match = bool(
+        source_cfg is not None
+        and target_cfg is not None
+        and str(source_cfg.rbf_type) == str(target_cfg.rbf_type)
+        and float(source_cfg.r_max) == float(target_cfg.r_max)
+        and int(source_cfg.num_radial_basis) == int(target_cfg.num_radial_basis)
+    )
+    for name, target_value in target_state.items():
+        source_value = source_state.get(name)
+        if source_value is None:
+            skipped[name] = "missing from checkpoint"
+            continue
+        if name == "d4.type_zs":
+            skipped[name] = "kept target element table"
+            continue
+        if not radial_settings_match and ".core.rbf." in name:
+            skipped[name] = "kept target radial-basis geometry"
+            continue
+        if name in element_keys:
+            if name.endswith("embed.weight"):
+                if (
+                    source_value.ndim != 2
+                    or target_value.ndim != 2
+                    or source_value.shape[0] != target_value.shape[0]
+                ):
+                    skipped[name] = (
+                        f"incompatible shape {tuple(source_value.shape)} -> "
+                        f"{tuple(target_value.shape)}"
+                    )
+                    continue
+                copied = target_value.clone()
+                for atomic_number in shared_elements:
+                    copied[:, target_index[atomic_number]] = source_value[
+                        :, source_index[atomic_number]
+                    ].to(dtype=copied.dtype)
+            else:
+                if source_value.ndim != 1 or target_value.ndim != 1:
+                    skipped[name] = "invalid atomic-reference shape"
+                    continue
+                copied = target_value.clone()
+                for atomic_number in shared_elements:
+                    copied[target_index[atomic_number]] = source_value[
+                        source_index[atomic_number]
+                    ].to(dtype=copied.dtype)
+            target_state[name] = copied
+            loaded.append(name)
+            remapped.append(name)
+            copied_entries = (
+                len(shared_elements) * int(copied.shape[0])
+                if name.endswith("embed.weight")
+                else len(shared_elements)
+            )
+            loaded_numel += copied_entries
+            if name.startswith("ground.") and name in target_parameters:
+                loaded_ground_trainable_numel += copied_entries
+            continue
+        if source_value.shape != target_value.shape:
+            skipped[name] = (
+                f"incompatible shape {tuple(source_value.shape)} -> "
+                f"{tuple(target_value.shape)}"
+            )
+            continue
+        target_state[name] = source_value.to(dtype=target_value.dtype)
+        loaded.append(name)
+        loaded_numel += int(target_value.numel())
+        if name.startswith("ground.") and name in target_parameters:
+            loaded_ground_trainable_numel += int(target_value.numel())
+    target.load_state_dict(target_state, strict=True)
+    return {
+        "loaded": loaded,
+        "remapped": remapped,
+        "skipped": skipped,
+        "shared_elements": shared_elements,
+        "missing_dataset_elements": sorted(set(target_index) - set(source_index)),
+        "loaded_numel": int(loaded_numel),
+        "loaded_ground_trainable_numel": int(loaded_ground_trainable_numel),
+    }
+
+
+def _initialize_model_from_checkpoint(
+    *,
+    checkpoint_path: str,
+    target_cfg: ModelConfig,
+    target_elements: Sequence[int],
+    atomic_energies: Optional[Sequence[float]] = None,
+    missing_atomic_energies_factory: Optional[Callable[[], Sequence[float]]] = None,
+) -> Tuple[DualLayerFieldModel, Dict[str, Any]]:
+    """Construct the selected architecture and warm-start compatible weights."""
+    source = DualLayerFieldModel.load(
+        checkpoint_path, map_location="cpu", allow_unsafe_legacy=True
+    )
+    source_index = {
+        int(atomic_number): index
+        for index, atomic_number in enumerate(source.z_table_zs)
+    }
+    target_values = [int(value) for value in target_elements]
+    missing_elements = sorted(set(target_values) - set(source_index))
+    fitted_missing = False
+    if atomic_energies is None:
+        target_atomic_energies = np.zeros((len(target_values),), dtype=float)
+        if missing_elements:
+            if missing_atomic_energies_factory is None:
+                raise ValueError(
+                    "Pretrained checkpoint is missing dataset elements "
+                    f"{missing_elements}; target atomic references are required"
+                )
+            target_atomic_energies = np.asarray(
+                missing_atomic_energies_factory(), dtype=float
+            ).reshape(-1)
+            fitted_missing = True
+    else:
+        target_atomic_energies = np.asarray(atomic_energies, dtype=float).reshape(-1)
+    if target_atomic_energies.size != len(target_values):
+        raise ValueError(
+            "Target atomic-energy table has "
+            f"{target_atomic_energies.size} entries for {len(target_values)} elements"
+        )
+    source_atomic_energies = (
+        source.ground.atomic_energies.detach().cpu().numpy().reshape(-1)
+    )
+    for target_index, atomic_number in enumerate(target_values):
+        if atomic_number in source_index:
+            target_atomic_energies[target_index] = source_atomic_energies[
+                source_index[atomic_number]
+            ]
+    model_class = (
+        MixedGranularityE3GNN
+        if _model_uses_mixed_granularity(target_cfg)
+        else DualLayerFieldModel
+    )
+    target = model_class(
+        z_table=AtomicNumberTable(target_elements),
+        atomic_energies_1d=target_atomic_energies,
+        cfg=target_cfg,
+    )
+    report = _copy_matching_pretrained_weights(
+        target,
+        source,
+        source_elements=source.z_table_zs,
+        target_elements=target_elements,
+        source_cfg=source.cfg,
+        target_cfg=target_cfg,
+    )
+    if int(report["loaded_ground_trainable_numel"]) <= 0:
+        raise ValueError(
+            "Pretrained checkpoint has no compatible Layer-1 trainable weights. "
+            "Match num_channels, parity mode, and radial basis dimensions."
+        )
+    report["source_architecture"] = asdict(source.cfg)
+    report["target_architecture"] = asdict(target_cfg)
+    report["fitted_missing_atomic_energies"] = bool(fitted_missing)
+    return target, report
 
 
 class MixedGranularityE3GNN(DualLayerFieldModel):
@@ -7678,6 +8238,12 @@ class TrainConfig:
     # This retries the same batch; no structure or label is silently discarded.
     nonfinite_recovery_attempts: int = 3
     nonfinite_lr_decay: float = 0.25
+    # Isolate structures that reproducibly produce non-finite values instead
+    # of terminating a long production run. The failing batch is restored to
+    # the latest finite model state and retried structure by structure.
+    skip_bad_samples: bool = True
+    max_bad_samples: int = 1000
+    max_bad_sample_fraction: float = 0.01
     # Auto Research fixes this target set across baseline and candidates so a
     # zero loss weight cannot improve the score merely by hiding its own metric.
     validation_targets: Tuple[str, ...] = ()
@@ -7771,6 +8337,92 @@ def _batch_structure_summary(batch: Any, *, limit: int = 8) -> str:
         f"structures={identifiers or ['unknown']} atoms={atom_count} "
         f"edges={edge_count}"
     )
+
+
+def _batch_structure_ids(batch: Any) -> List[str]:
+    """Return stable sample IDs, falling back to leakage-safe group IDs."""
+    for attribute in ("sample_id", "group_id"):
+        raw = getattr(batch, attribute, None)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            return [raw]
+        if isinstance(raw, (list, tuple)):
+            return [str(value) for value in raw]
+        return [str(raw)]
+    return [f"unknown-{index}" for index in range(_batch_num_graphs(batch))]
+
+
+class _BadSampleError(FloatingPointError):
+    """Signals a numerical failure that can be isolated at structure level."""
+
+    def __init__(self, kind: str, detail: str):
+        super().__init__(detail)
+        self.kind = str(kind)
+        self.detail = str(detail)
+
+
+def _is_isolatable_numerical_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (_BadSampleError, FloatingPointError, torch.linalg.LinAlgError)):
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "non-finite", "nan", "infinity", "singular", "ill-conditioned",
+            "failed to converge", "cholesky", "linalg.eigh", "linalg.eig",
+        )
+    )
+
+
+def _split_graph_batch(batch: Any) -> List[AtomicData]:
+    """Detach a PyG batch into independent CPU graphs for fault isolation."""
+    graphs = batch.detach().cpu().to_data_list()
+    for graph in graphs:
+        if hasattr(graph, "film_condition"):
+            graph.film_condition = None
+    return graphs
+
+
+def _atomic_data_is_finite(graph: AtomicData) -> Tuple[bool, List[str]]:
+    """Check geometry and every active label before accelerator execution."""
+    invalid: List[str] = []
+    for name in ("positions", "cell", "shifts"):
+        value = getattr(graph, name, None)
+        if torch.is_tensor(value) and value.is_floating_point():
+            if not bool(torch.isfinite(value).all().cpu()):
+                invalid.append(name)
+    for name in (
+        "energy", "forces", "dipole", "polarizability", "total_charge",
+        "charges", "atomic_dipoles", "atomic_polarizability", "c6", "bec",
+        "spins", "magnetic_moments", "effective_field", "Di",
+        "J_effective", "DMI_effective", "Di_effective",
+    ):
+        value = getattr(graph, name, None)
+        weight = getattr(graph, f"{name}_weight", None)
+        if not torch.is_tensor(value) or not value.is_floating_point():
+            continue
+        active = True
+        if torch.is_tensor(weight):
+            active = bool(torch.any(torch.isfinite(weight) & (weight > 0.0)).cpu())
+        if active and not bool(torch.isfinite(value).all().cpu()):
+            invalid.append(name)
+    return not invalid, invalid
+
+
+def _collate_valid_atomic_data(
+    values: Sequence[AtomicData],
+    *,
+    invalid_callback: Optional[Callable[[AtomicData, Sequence[str]], None]] = None,
+) -> Optional[_TGBatch]:
+    valid: List[AtomicData] = []
+    for graph in values:
+        finite, invalid_fields = _atomic_data_is_finite(graph)
+        if finite:
+            valid.append(graph)
+        elif invalid_callback is not None:
+            invalid_callback(graph, invalid_fields)
+    return _TGBatch.from_data_list(valid) if valid else None
 
 
 def _nonfinite_gradient_parameters(
@@ -8864,6 +9516,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     _nonfinite_lr_decay = float(getattr(cfg, "nonfinite_lr_decay", 0.25))
     if not math.isfinite(_nonfinite_lr_decay) or not 0.0 < _nonfinite_lr_decay < 1.0:
         raise ValueError("nonfinite_lr_decay must be finite and strictly between 0 and 1")
+    if int(getattr(cfg, "max_bad_samples", 1000)) < 0:
+        raise ValueError("max_bad_samples cannot be negative")
+    _max_bad_fraction = float(getattr(cfg, "max_bad_sample_fraction", 0.01))
+    if not math.isfinite(_max_bad_fraction) or not 0.0 <= _max_bad_fraction <= 1.0:
+        raise ValueError("max_bad_sample_fraction must be finite and in [0, 1]")
 
     device, runtime_dtype = resolve_device(getattr(cfg, "device", "auto"), dtype=cfg.model.dtype)
     thread_runtime = _configure_torch_cpu_threads(
@@ -9104,87 +9761,67 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         return _cancelled_result("dataset indexing")
     z_table = AtomicNumberTable(zs)
     log(f"[{_now()}] Elements: {zs}")
-    use_mixed_model = any(
-        bool(getattr(cfg.model, name, False))
-        for name in ("enable_qeq", "enable_pme", "enable_deq", "enable_d4", "enable_spin", "enable_film")
-    )
+    use_mixed_model = _model_uses_mixed_granularity(cfg.model)
 
-    def _upgrade_loaded_model(loaded: DualLayerFieldModel) -> DualLayerFieldModel:
-        if not use_mixed_model or isinstance(loaded, MixedGranularityE3GNN):
-            return loaded
-        upgraded = MixedGranularityE3GNN(
-            z_table=AtomicNumberTable(loaded.z_table_zs),
-            atomic_energies_1d=loaded.ground.atomic_energies.detach().cpu().numpy(),
-            cfg=cfg.model,
+    def _fit_atomic_references() -> np.ndarray:
+        if composite_plan is not None:
+            return fit_atomic_energies_from_composite_plan(composite_plan, zs)
+        if stream_plan is not None and "energy" in stream_plan.label_masks:
+            return fit_atomic_energies_from_hdf5_plan(stream_plan, zs)
+        energy_fit_cfgs = [
+            item for item in train_cfgs
+            if "energy" in item.properties
+            and float(item.property_weights.get("energy", 1.0)) > 0.0
+        ]
+        if energy_fit_cfgs:
+            return fit_atomic_energies_from_configs(energy_fit_cfgs, zs)
+        log(f"[{_now()}] No training energy labels; atomic reference energies initialized to zero.")
+        return np.zeros((len(zs),), dtype=float)
+
+    def _warm_start(path: str, *, purpose: str) -> DualLayerFieldModel:
+        if not Path(path).expanduser().is_file():
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {path}")
+        loaded, report = _initialize_model_from_checkpoint(
+            checkpoint_path=path,
+            target_cfg=cfg.model,
+            target_elements=zs,
+            missing_atomic_energies_factory=_fit_atomic_references,
         )
-        upgraded.ground.load_state_dict(loaded.ground.state_dict(), strict=False)
-        upgraded.response.load_state_dict(loaded.response.state_dict(), strict=False)
-        return upgraded
+        log(
+            f"[{_now()}] Pretrained {purpose}: {path}; "
+            f"loaded={len(report['loaded'])} tensors/"
+            f"{int(report['loaded_numel']):,} values, "
+            f"shared_elements={len(report['shared_elements'])}, "
+            f"new_elements={report['missing_dataset_elements']}, "
+            f"fitted_new_element_references="
+            f"{report['fitted_missing_atomic_energies']}, "
+            f"architecture_skips={len(report['skipped'])}. Optimizer starts fresh."
+        )
+        return loaded
 
     # Instantiate the model and freeze / unfreeze branches according to mode.
     if cfg.mode == "response":
         if not cfg.base_ckpt:
             raise ValueError("base_ckpt is required for mode 'response'")
-        model = _upgrade_loaded_model(
-            DualLayerFieldModel.load(cfg.base_ckpt, map_location="cpu", allow_unsafe_legacy=True)
-        )
-        model.cfg = cfg.model
+        model = _warm_start(cfg.base_ckpt, purpose="initialization for Response")
         model.freeze_ground()
         model.unfreeze_response()
         z_table = AtomicNumberTable(model.z_table_zs)
     elif cfg.mode == "joint" and cfg.base_ckpt:
-        # Resume from an existing checkpoint for joint fine-tuning.
-        model = _upgrade_loaded_model(
-            DualLayerFieldModel.load(cfg.base_ckpt, map_location="cpu", allow_unsafe_legacy=True)
-        )
-        model.cfg = cfg.model
+        model = _warm_start(cfg.base_ckpt, purpose="initialization for Joint")
         model.unfreeze_ground()
         model.unfreeze_response()
         z_table = AtomicNumberTable(model.z_table_zs)
     elif cfg.mode == "base" and cfg.base_ckpt:
-        # Base-mode continuation is used by restartable production curricula.
-        # The checkpoint already contains the fitted atomic reference energies,
-        # so re-fitting them after an interrupted run would change the objective.
-        model = DualLayerFieldModel.load(
-            cfg.base_ckpt, map_location="cpu", allow_unsafe_legacy=True
-        )
-        if isinstance(model, MixedGranularityE3GNN):
-            raise ValueError(
-                "A mixed-granularity checkpoint cannot resume mode='base'; "
-                "use mode='joint' for coupled fine-tuning"
-            )
-        missing_elements = sorted(set(zs) - set(int(z) for z in model.z_table_zs))
-        if missing_elements:
-            raise ValueError(
-                "Base checkpoint is missing dataset elements: "
-                f"{missing_elements}"
-            )
-        model.cfg = cfg.model
+        model = _warm_start(cfg.base_ckpt, purpose="initialization for Base")
         model.unfreeze_ground()
         model.freeze_response()
         z_table = AtomicNumberTable(model.z_table_zs)
-        log(f"[{_now()}] Resuming base branch from: {cfg.base_ckpt}")
     else:
         if progress is not None:
             progress({"type": "prep", "task": "Fit atomic energies", "overall_frac": 0.01, "current": 0, "total": 1, "stage": "start"})
         log(f"[{_now()}] Fitting atomic energies ...")
-        if composite_plan is not None:
-            atomic_energies = fit_atomic_energies_from_composite_plan(
-                composite_plan, zs
-            )
-        elif stream_plan is not None and "energy" in stream_plan.label_masks:
-            atomic_energies = fit_atomic_energies_from_hdf5_plan(stream_plan, zs)
-        else:
-            energy_fit_cfgs = [
-                item for item in train_cfgs
-                if "energy" in item.properties
-                and float(item.property_weights.get("energy", 1.0)) > 0.0
-            ]
-            if energy_fit_cfgs:
-                atomic_energies = fit_atomic_energies_from_configs(energy_fit_cfgs, zs)
-            else:
-                atomic_energies = np.zeros((len(zs),), dtype=float)
-                log(f"[{_now()}] No training energy labels; atomic reference energies initialized to zero.")
+        atomic_energies = _fit_atomic_references()
         if progress is not None:
             progress({"type": "prep", "task": "Fit atomic energies", "overall_frac": 0.03, "current": 1, "total": 1, "stage": "done"})
         model_cls = MixedGranularityE3GNN if use_mixed_model else DualLayerFieldModel
@@ -9393,6 +10030,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     _dl_persistent = bool(_dl_num_workers > 0)
     _dl_prefetch = 2
     _dl_thread_prefetch = 2 if (stream_plan is not None or composite_plan is not None) else 0
+    _input_bad_samples: Dict[str, Dict[str, Any]] = {}
     log(
         f"[{_now()}] DataLoader: num_workers={_dl_num_workers} pin_memory={_dl_pin_memory} "
         f"persistent_workers={_dl_persistent} prefetch_factor={_dl_prefetch} "
@@ -9404,8 +10042,24 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     del static_cfgs, static_fields, resp_cfgs, resp_fields
     gc.collect()
 
-    def _collate(lst: List[AtomicData]) -> _TGBatch:
-        return _TGBatch.from_data_list(lst)
+    def _collate(lst: List[AtomicData]) -> Optional[_TGBatch]:
+        def rejected(graph: AtomicData, fields: Sequence[str]) -> None:
+            sample_id = str(
+                getattr(graph, "sample_id", getattr(graph, "group_id", "unknown"))
+            )
+            entry = _input_bad_samples.setdefault(
+                sample_id,
+                {
+                    "sample_id": sample_id,
+                    "phase": "input",
+                    "occurrences": 0,
+                    "reason": "",
+                },
+            )
+            entry["occurrences"] = int(entry["occurrences"]) + 1
+            entry["reason"] = "non-finite input fields: " + ", ".join(fields)
+
+        return _collate_valid_atomic_data(lst, invalid_callback=rejected)
 
     class _FixedGraphBatchSampler:
         """Reuse memory-bounded MPS batch shapes while randomizing batch order."""
@@ -9478,7 +10132,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 orders = ds.plan.source_orders[ds.omat_indices]
                 rows = ds.plan.row_indices[ds.omat_indices]
                 for source_order in np.unique(orders):
-                    local = np.flatnonzero(orders == source_order).astype(np.int64)
+                    local = np.flatnonzero(orders == source_order).astype(np.uint32)
                     self.omat_by_source[int(source_order)] = local[
                         np.argsort(rows[local], kind="stable")
                     ]
@@ -9487,7 +10141,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             if self.omat_count == 0:
                 return np.zeros((0,), dtype=np.int64)
             if self.ds.plan.mode != "joint" or self.large_count == 0:
-                selected = np.arange(self.omat_count, dtype=np.int64)
+                selected = np.arange(self.omat_count, dtype=np.uint32)
             else:
                 ratio = float(getattr(cfg, "composite_joint_foundation_ratio", 4.0))
                 if not math.isfinite(ratio) or ratio <= 0.0:
@@ -9496,7 +10150,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     )
                 target = min(self.omat_count, max(1, int(round(ratio * self.large_count))))
                 start = (self.epoch * target) % self.omat_count
-                selected = (start + np.arange(target, dtype=np.int64)) % self.omat_count
+                selected = np.asarray(
+                    (start + np.arange(target, dtype=np.uint64)) % self.omat_count,
+                    dtype=np.uint32,
+                )
             if not self.omat_by_source:
                 return selected
             selected_set = np.zeros((self.omat_count,), dtype=np.bool_)
@@ -9615,10 +10272,25 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             )
             _warmup_done = False
         else:
-            opt = torch.optim.Adam([
-                {"params": [p for p in model.ground.parameters()   if p.requires_grad], "lr": _lr_g},
-                {"params": _response_parameters, "lr": _lr_r},
-            ])
+            def _joint_optimizer() -> torch.optim.Optimizer:
+                return torch.optim.Adam([
+                    {
+                        "params": [
+                            parameter for parameter in model.ground.parameters()
+                            if parameter.requires_grad
+                        ],
+                        "lr": _lr_g,
+                    },
+                    {
+                        "params": [
+                            parameter for name, parameter in model.named_parameters()
+                            if not name.startswith("ground.") and parameter.requires_grad
+                        ],
+                        "lr": _lr_r,
+                    },
+                ])
+
+            opt = _joint_optimizer()
 
     _sched = None
     if getattr(cfg, "lr_scheduler", "flat") == "cosine":
@@ -9652,6 +10324,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     }
     _last_validated_epoch = 0
     _numerical_recoveries: List[Dict[str, Any]] = []
+    _bad_samples: Dict[str, Dict[str, Any]] = {}
+    _bad_validation_samples: Dict[str, Dict[str, Any]] = {}
+    _skipped_occurrences = 0
+    _skipped_validation_occurrences = 0
+    _consecutive_bad_batches = 0
     
     # Main training loop for the multi-objective loss:
     #   L_total = L_E + L_F + L_mu + L_alpha
@@ -9667,6 +10344,373 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     _best_state: Optional[Dict[str, torch.Tensor]] = None
     _epochs_without_improvement = 0
     t0 = time.time()
+
+    def _record_bad_sample(
+        sample_id: str,
+        *,
+        epoch: int,
+        step: int,
+        phase: str,
+        reason: BaseException,
+    ) -> None:
+        nonlocal _skipped_occurrences, _skipped_validation_occurrences
+        key = str(sample_id)
+        registry = _bad_validation_samples if phase == "validation" else _bad_samples
+        entry = registry.setdefault(
+            key,
+            {
+                "sample_id": key,
+                "first_epoch": int(epoch),
+                "first_step": int(step),
+                "phase": str(phase),
+                "occurrences": 0,
+                "reason": "",
+            },
+        )
+        entry["occurrences"] = int(entry["occurrences"]) + 1
+        entry["last_epoch"] = int(epoch)
+        entry["last_step"] = int(step)
+        entry["reason"] = f"{type(reason).__name__}: {reason}"[:2000]
+        if phase == "validation":
+            _skipped_validation_occurrences += 1
+        else:
+            _skipped_occurrences += 1
+
+    def _enforce_bad_sample_limit() -> None:
+        bad_count = len(set(_bad_samples) | set(_input_bad_samples))
+        fraction_limit = max(
+            1,
+            int(math.ceil(_max_bad_fraction * max(1, len(train_data)))),
+        )
+        configured_limit = int(getattr(cfg, "max_bad_samples", 1000))
+        effective_limit = min(configured_limit, fraction_limit)
+        if bad_count > effective_limit:
+            raise FloatingPointError(
+                f"Aborting after {bad_count} unique invalid training samples; "
+                f"the safety limit is {effective_limit} "
+                f"(max_bad_samples={configured_limit}, "
+                f"max_bad_sample_fraction={_max_bad_fraction:g}). This indicates "
+                "a systematic model, unit, or dataset problem rather than an isolated record."
+            )
+
+    def _checked_optimizer_step() -> None:
+        """Apply one update and roll back any corrupted parameters or moments."""
+        try:
+            opt.step()
+        except Exception as exc:
+            if not _is_isolatable_numerical_exception(exc):
+                raise
+            model.load_state_dict(_last_validated_state, strict=True)
+            opt.state.clear()
+            updated_lrs = _reduce_optimizer_learning_rates(opt)
+            raise _BadSampleError(
+                "optimizer_exception",
+                f"{type(exc).__name__}: {exc}; restored epoch "
+                f"{_last_validated_epoch}, lr={updated_lrs}",
+            ) from exc
+        bad_model = _nonfinite_model_state_names(model)
+        bad_optimizer = _nonfinite_optimizer_state_names(opt)
+        if not bad_model and not bad_optimizer:
+            return
+        model.load_state_dict(_last_validated_state, strict=True)
+        opt.state.clear()
+        updated_lrs = _reduce_optimizer_learning_rates(opt)
+        raise _BadSampleError(
+            "nonfinite_optimizer_update",
+            f"model={bad_model or ['finite']} optimizer="
+            f"{bad_optimizer or ['finite']}; restored epoch "
+            f"{_last_validated_epoch}, lr={updated_lrs}",
+        )
+
+    def _forward_loss_backward(
+        batch: Any,
+        *,
+        response_weight_mu: float,
+        response_weight_alpha: float,
+    ) -> Dict[str, Any]:
+        """Run one finite training calculation without mutating optimizer state."""
+        use_response_terms = cfg.mode != "base"
+        need_energy = bool(cfg.w_energy > 0.0 and _batch_has_label(batch, "energy"))
+        need_forces = bool(cfg.w_forces > 0.0 and _batch_has_label(batch, "forces"))
+        need_mu = bool(cfg.w_dipole > 0.0 and _batch_has_label(batch, "dipole"))
+        need_alpha = bool(
+            cfg.w_polarizability > 0.0
+            and _batch_has_label(batch, "polarizability")
+        )
+        need_bec = bool(cfg.w_bec > 0.0 and _batch_has_label(batch, "bec"))
+        batch_use_spin = bool(
+            isinstance(model, MixedGranularityE3GNN)
+            and cfg.model.enable_spin
+            and _batch_has_label(batch, "spins")
+        )
+        options: Dict[str, Any] = {
+            "training": True,
+            "compute_forces": need_forces,
+            "compute_bec": need_bec,
+            "use_response_terms": use_response_terms,
+            "retain_graph": need_forces,
+        }
+        if isinstance(model, MixedGranularityE3GNN):
+            options["use_spin_terms"] = batch_use_spin
+        _prepare_retry_batch(batch)
+        try:
+            out = model(batch, **options)
+        except Exception as exc:
+            if _is_isolatable_numerical_exception(exc):
+                raise _BadSampleError("forward_exception", str(exc)) from exc
+            raise
+        bad_outputs = _nonfinite_output_names(out)
+        if bad_outputs:
+            del out
+            raise _BadSampleError(
+                "nonfinite_forward", f"non-finite outputs={bad_outputs}"
+            )
+
+        loss = torch.zeros(
+            (), dtype=batch.positions.dtype, device=batch.positions.device
+        )
+        metrics: Dict[str, Any] = {
+            "energy": (0.0, 0),
+            "forces": (0.0, 0),
+            "extra": {},
+        }
+        try:
+            if need_energy:
+                target_energy = batch.energy.to(out["energy"].dtype)
+                if target_energy.ndim == 0:
+                    target_energy = target_energy.unsqueeze(0)
+                atoms_per_graph = (
+                    (batch.ptr[1:] - batch.ptr[:-1]).to(target_energy.dtype)
+                    if hasattr(batch, "ptr") and batch.ptr.numel() > 1
+                    else torch.ones(
+                        target_energy.numel(),
+                        dtype=target_energy.dtype,
+                        device=target_energy.device,
+                    )
+                )
+                energy_weight = _expanded_property_weight(
+                    batch, "energy", out["energy"], atomwise=False
+                )
+                loss = loss + float(cfg.w_energy) * _weighted_mse(
+                    out["energy"] / atoms_per_graph,
+                    target_energy / atoms_per_graph,
+                    energy_weight,
+                )
+                metrics["energy"] = _masked_mae_statistics(
+                    out["energy"] / atoms_per_graph,
+                    target_energy / atoms_per_graph,
+                    energy_weight,
+                )
+            if need_forces:
+                target_forces = batch.forces.to(out["forces"].dtype)
+                force_weight = _expanded_property_weight(
+                    batch, "forces", out["forces"], atomwise=True
+                )
+                loss = loss + float(cfg.w_forces) * _configured_force_loss(
+                    out["forces"], target_forces, force_weight, cfg
+                )
+                metrics["forces"] = _masked_mae_statistics(
+                    out["forces"], target_forces, force_weight
+                )
+            if need_mu:
+                target_mu = (
+                    batch.dipole.squeeze(1)
+                    if batch.dipole.ndim == 3 else batch.dipole
+                )
+                mu_weight = _expanded_property_weight(
+                    batch, "dipole", out["dipole"], atomwise=False
+                )
+                target_mu = target_mu.to(out["dipole"].dtype)
+                loss = loss + response_weight_mu * _weighted_mse(
+                    out["dipole"], target_mu, mu_weight
+                )
+                metrics["extra"]["dipole"] = _masked_mae_statistics(
+                    out["dipole"], target_mu, mu_weight
+                )
+            if need_alpha:
+                target_alpha = (
+                    batch.polarizability.squeeze(1)
+                    if batch.polarizability.ndim == 4
+                    else batch.polarizability
+                )
+                alpha_weight = _expanded_property_weight(
+                    batch,
+                    "polarizability",
+                    out["polarizability"],
+                    atomwise=False,
+                )
+                target_alpha = target_alpha.to(out["polarizability"].dtype)
+                loss = loss + response_weight_alpha * _weighted_mse(
+                    out["polarizability"], target_alpha, alpha_weight
+                )
+                metrics["extra"]["polarizability"] = _masked_mae_statistics(
+                    out["polarizability"], target_alpha, alpha_weight
+                )
+            additional_loss, additional_metrics = _additional_physics_loss(
+                out, batch, cfg
+            )
+            loss = loss + additional_loss
+            metrics["extra"].update(additional_metrics)
+        except Exception as exc:
+            del loss, out
+            if _is_isolatable_numerical_exception(exc):
+                raise _BadSampleError("loss_exception", str(exc)) from exc
+            raise
+        if not bool(torch.isfinite(loss.detach()).all().cpu()):
+            del loss, out
+            raise _BadSampleError("nonfinite_loss", "loss assembly is non-finite")
+        if loss.requires_grad:
+            try:
+                loss.backward()
+            except Exception as exc:
+                del loss, out
+                if _is_isolatable_numerical_exception(exc):
+                    raise _BadSampleError("backward_exception", str(exc)) from exc
+                raise
+            bad_parameters = _nonfinite_gradient_parameters(model)
+            if bad_parameters:
+                del loss, out
+                raise _BadSampleError(
+                    "nonfinite_gradient", f"parameters={bad_parameters}"
+                )
+            grad_norm = _clip_grad_norm_stable(
+                model.parameters(), float(cfg.grad_clip_norm)
+            )
+            if not math.isfinite(grad_norm):
+                del loss, out
+                raise _BadSampleError(
+                    "gradient_norm_overflow",
+                    "individual gradients are finite but their norm overflowed",
+                )
+        metrics["loss"] = float(loss.detach().cpu())
+        del loss, out
+        return metrics
+
+    def _validation_batch_is_finite(batch: Any) -> None:
+        """Probe validation numerics without changing metric accumulators."""
+        use_response_terms = cfg.mode != "base"
+        need_forces = bool(
+            (cfg.w_forces > 0.0 or "forces" in _validation_targets)
+            and _batch_has_label(batch, "forces")
+        )
+        need_bec = bool(
+            (cfg.w_bec > 0.0 or "bec" in _validation_targets)
+            and _batch_has_label(batch, "bec")
+        )
+        batch_use_spin = bool(
+            isinstance(model, MixedGranularityE3GNN)
+            and cfg.model.enable_spin
+            and _batch_has_label(batch, "spins")
+        )
+        options: Dict[str, Any] = {
+            "training": False,
+            "compute_forces": need_forces,
+            "compute_bec": need_bec,
+            "use_response_terms": use_response_terms,
+            "retain_graph": False,
+        }
+        if isinstance(model, MixedGranularityE3GNN):
+            options["use_spin_terms"] = batch_use_spin
+        try:
+            with torch.set_grad_enabled(need_forces or need_bec or batch_use_spin):
+                probe = model(batch, **options)
+        except Exception as exc:
+            if _is_isolatable_numerical_exception(exc):
+                raise _BadSampleError("validation_forward_exception", str(exc)) from exc
+            raise
+        bad_outputs = _nonfinite_output_names(probe)
+        del probe
+        if bad_outputs:
+            raise _BadSampleError(
+                "nonfinite_validation_forward", f"non-finite outputs={bad_outputs}"
+            )
+
+    def _validation_forward_with_quarantine(
+        batch: Any,
+        *,
+        options: Dict[str, Any],
+        sample_ids: Sequence[str],
+        epoch: int,
+        step: int,
+    ) -> Tuple[Optional[Any], Optional[Dict[str, torch.Tensor]]]:
+        """Run validation once, isolating only individually reproducible faults."""
+        def calculate(selected: Any) -> Dict[str, torch.Tensor]:
+            try:
+                prediction = model(selected, **options)
+            except Exception as exc:
+                if _is_isolatable_numerical_exception(exc):
+                    raise _BadSampleError(
+                        "validation_forward_exception", str(exc)
+                    ) from exc
+                raise
+            bad_outputs = _nonfinite_output_names(prediction)
+            if bad_outputs:
+                del prediction
+                raise _BadSampleError(
+                    "nonfinite_validation_forward",
+                    f"non-finite outputs={bad_outputs}",
+                )
+            return prediction
+
+        try:
+            return batch, calculate(batch)
+        except _BadSampleError as batch_error:
+            if not bool(getattr(cfg, "skip_bad_samples", True)):
+                raise FloatingPointError(
+                    f"{batch_error.kind} at validation epoch={epoch}, step={step}; "
+                    f"{_batch_structure_summary(batch)}; {batch_error.detail}"
+                ) from batch_error
+            graphs = _split_graph_batch(batch)
+            valid_graphs: List[AtomicData] = []
+            invalid_ids: List[str] = []
+            for graph_index, graph in enumerate(graphs):
+                sample_id = (
+                    str(sample_ids[graph_index])
+                    if graph_index < len(sample_ids)
+                    else f"validation-{epoch}-{step}-{graph_index}"
+                )
+                single = _TGBatch.from_data_list([graph]).to(device)
+                try:
+                    _validation_batch_is_finite(single)
+                    valid_graphs.append(graph)
+                except _BadSampleError as sample_error:
+                    _record_bad_sample(
+                        sample_id,
+                        epoch=epoch,
+                        step=step,
+                        phase="validation",
+                        reason=sample_error,
+                    )
+                    invalid_ids.append(sample_id)
+                finally:
+                    del single
+            if not invalid_ids:
+                del graphs, valid_graphs
+                raise FloatingPointError(
+                    f"Validation batch failed at epoch={epoch}, step={step}, but "
+                    "every structure is finite when evaluated independently. This "
+                    "is a systemic batching/backend failure and will not be hidden "
+                    "by skipping scientific records."
+                ) from batch_error
+            log(
+                f"[{_now()}] WARN: excluded {len(invalid_ids)} individually "
+                f"invalid validation structure(s) at epoch={epoch}, step={step}: "
+                f"{invalid_ids[:8]}."
+            )
+            del batch, graphs
+            if not valid_graphs:
+                return None, None
+            rebuilt = _TGBatch.from_data_list(valid_graphs).to(device)
+            del valid_graphs
+            try:
+                return rebuilt, calculate(rebuilt)
+            except _BadSampleError as residual_error:
+                del rebuilt
+                raise FloatingPointError(
+                    f"Validation remained non-finite after removing individually "
+                    f"reproducible bad samples at epoch={epoch}, step={step}; "
+                    f"{residual_error.detail}"
+                ) from residual_error
 
     # ------------------------------------------------------------------
     # Per-epoch artifact setup: checkpoints, regression plots, MAE chart.
@@ -9873,179 +10917,163 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             if stop_flag and stop_flag():
                 stopped = True
                 break
-            opt.zero_grad(set_to_none=True)
+            if batch is None:
+                if not bool(getattr(cfg, "skip_bad_samples", True)):
+                    raise FloatingPointError(
+                        "A training batch contains only non-finite input records"
+                    )
+                _enforce_bad_sample_limit()
+                continue
+            _enforce_bad_sample_limit()
+            original_graphs: Optional[List[AtomicData]] = None
+            original_ids = _batch_structure_ids(batch)
             batch = batch.to(device)
-
-            use_response_terms = (cfg.mode != "base")
-            need_energy = bool(cfg.w_energy > 0.0 and _batch_has_label(batch, "energy"))
-            need_forces = bool(cfg.w_forces > 0.0 and _batch_has_label(batch, "forces"))
-            need_mu = bool(cfg.w_dipole > 0.0 and _batch_has_label(batch, "dipole"))
-            need_alpha = bool(
-                cfg.w_polarizability > 0.0 and _batch_has_label(batch, "polarizability")
-            )
-            need_bec = bool(cfg.w_bec > 0.0 and _batch_has_label(batch, "bec"))
-            compute_forces = bool(need_forces)
-            retain_forces_graph = bool(compute_forces)
-            batch_use_spin = bool(
-                isinstance(model, MixedGranularityE3GNN)
-                and cfg.model.enable_spin
-                and _batch_has_label(batch, "spins")
-            )
-
-            forward_options: Dict[str, Any] = {
-                "training": True,
-                "compute_forces": compute_forces,
-                "compute_bec": need_bec,
-                "use_response_terms": use_response_terms,
-                "retain_graph": retain_forces_graph,
-            }
-            if isinstance(model, MixedGranularityE3GNN):
-                forward_options["use_spin_terms"] = batch_use_spin
-            _forward_attempt = 0
-            while True:
-                _prepare_retry_batch(batch)
-                out = model(batch, **forward_options)
-                _bad_forward_outputs = _nonfinite_output_names(out)
-                if not _bad_forward_outputs:
-                    break
-                _failure_summary = _batch_structure_summary(batch)
-                if _forward_attempt >= _max_nonfinite_recoveries:
-                    raise FloatingPointError(
-                        f"Non-finite training forward at epoch={epoch}, step={step}. "
-                        f"{_failure_summary}; non-finite outputs={_bad_forward_outputs}. "
-                        f"Recovery exhausted after {_forward_attempt} attempt(s)."
-                    )
-                del out
-                _restore_source = ""
-                model.load_state_dict(_last_validated_state, strict=True)
-                _restore_source = (
-                    f"validated epoch {_last_validated_epoch}"
-                    if _last_validated_epoch > 0
-                    else "initial finite model"
+            opt.zero_grad(set_to_none=True)
+            try:
+                result = _forward_loss_backward(
+                    batch,
+                    response_weight_mu=_w_mu,
+                    response_weight_alpha=_w_alpha,
                 )
-                opt.state.clear()
-                _new_lrs = _reduce_optimizer_learning_rates(opt)
-                _forward_attempt += 1
-                _recovery = {
-                    "epoch": int(epoch),
-                    "step": int(step),
-                    "attempt": int(_forward_attempt),
-                    "source": _restore_source,
-                    "outputs": list(_bad_forward_outputs),
-                    "learning_rates": list(_new_lrs),
-                }
-                _numerical_recoveries.append(_recovery)
-                log(
-                    f"[{_now()}] Numerical recovery {len(_numerical_recoveries)}: "
-                    f"epoch={epoch} step={step}, restored {_restore_source}, "
-                    f"cleared Adam state, lr={_new_lrs}; retrying the same batch."
-                )
+                _checked_optimizer_step()
+                _consecutive_bad_batches = 0
+                accepted_results = [result]
+            except _BadSampleError as batch_error:
                 opt.zero_grad(set_to_none=True)
-                _release_mps_cache()
-
-            l = torch.zeros((), dtype=batch.positions.dtype, device=batch.positions.device)
-            if need_energy:
-                y_e = batch.energy.to(out["energy"].dtype)
-                if y_e.ndim == 0:
-                    y_e = y_e.unsqueeze(0)
-                # Normalise by atoms-per-molecule so large systems don't dominate the loss.
-                if hasattr(batch, "ptr") and batch.ptr.numel() > 1:
-                    _npa_tr = (batch.ptr[1:] - batch.ptr[:-1]).to(y_e.dtype)
+                retry_error = batch_error
+                accepted_results = []
+                # A backend/kernel fault can be transient. Retry the untouched
+                # batch once before classifying any scientific record as bad.
+                if _max_nonfinite_recoveries > 0:
+                    _release_mps_cache()
+                    try:
+                        result = _forward_loss_backward(
+                            batch,
+                            response_weight_mu=_w_mu,
+                            response_weight_alpha=_w_alpha,
+                        )
+                        _checked_optimizer_step()
+                        accepted_results = [result]
+                        _consecutive_bad_batches = 0
+                        recovery = {
+                            "epoch": int(epoch),
+                            "step": int(step),
+                            "attempt": 1,
+                            "source": "same unchanged batch/model state",
+                            "outputs": [batch_error.kind],
+                            "learning_rates": [
+                                float(group["lr"]) for group in opt.param_groups
+                            ],
+                        }
+                        _numerical_recoveries.append(recovery)
+                        log(
+                            f"[{_now()}] Numerical recovery "
+                            f"{len(_numerical_recoveries)}: epoch={epoch} "
+                            f"step={step}, transient {batch_error.kind}; "
+                            "retrying the same batch succeeded."
+                        )
+                    except _BadSampleError as repeated_error:
+                        opt.zero_grad(set_to_none=True)
+                        retry_error = repeated_error
+                if accepted_results:
+                    pass
+                elif not bool(getattr(cfg, "skip_bad_samples", True)):
+                    raise FloatingPointError(
+                        f"{retry_error.kind} at epoch={epoch}, step={step}. "
+                        f"{_batch_structure_summary(batch)}; {retry_error.detail}"
+                    ) from retry_error
+                if accepted_results:
+                    original_graphs = None
                 else:
-                    _npa_tr = torch.ones(y_e.numel(), dtype=y_e.dtype, device=y_e.device)
-                w_e = _expanded_property_weight(batch, "energy", out["energy"], atomwise=False)
-                l = l + float(cfg.w_energy) * _weighted_mse(
-                    out["energy"] / _npa_tr, y_e / _npa_tr, w_e
-                )
-                with torch.no_grad():
-                    _sum, _count = _masked_mae_statistics(
-                        out["energy"] / _npa_tr, y_e / _npa_tr, w_e
+                    original_graphs = _split_graph_batch(batch)
+                del batch
+                _release_mps_cache()
+                newly_bad: List[str] = []
+                for graph_index, graph in enumerate(original_graphs or []):
+                    sample_id = (
+                        original_ids[graph_index]
+                        if graph_index < len(original_ids)
+                        else f"epoch-{epoch}-step-{step}-graph-{graph_index}"
                     )
-                    train_emae_sum += _sum
-                    train_emae_n += _count
-            if need_forces:
-                y_f = batch.forces.to(out["forces"].dtype)
-                w_f = _expanded_property_weight(batch, "forces", out["forces"], atomwise=True)
-                l = l + float(cfg.w_forces) * _configured_force_loss(
-                    out["forces"], y_f, w_f, cfg
-                )
-
-            if need_mu:
-                y_mu = batch.dipole.squeeze(1) if batch.dipole.ndim == 3 else batch.dipole
-                w_mu = _expanded_property_weight(batch, "dipole", out["dipole"], atomwise=False)
-                l = l + _w_mu * _weighted_mse(
-                    out["dipole"], y_mu.to(out["dipole"].dtype), w_mu
-                )
-                _sum, _count = _masked_mae_statistics(
-                    out["dipole"], y_mu.to(out["dipole"].dtype), w_mu
-                )
-                _acc = train_extra_metrics.setdefault("dipole", [0.0, 0.0])
-                _acc[0] += _sum
-                _acc[1] += _count
-
-            if need_alpha:
-                y_a = batch.polarizability.squeeze(1) if batch.polarizability.ndim == 4 else batch.polarizability
-                w_a = _expanded_property_weight(
-                    batch, "polarizability", out["polarizability"], atomwise=False
-                )
-                l = l + _w_alpha * _weighted_mse(
-                    out["polarizability"], y_a.to(out["polarizability"].dtype), w_a
-                )
-                _sum, _count = _masked_mae_statistics(
-                    out["polarizability"], y_a.to(out["polarizability"].dtype), w_a
-                )
-                _acc = train_extra_metrics.setdefault("polarizability", [0.0, 0.0])
-                _acc[0] += _sum
-                _acc[1] += _count
-
-            additional_loss, additional_metrics = _additional_physics_loss(out, batch, cfg)
-            l = l + additional_loss
-            for name, (value_sum, value_count) in additional_metrics.items():
-                accumulator = train_extra_metrics.setdefault(name, [0.0, 0.0])
-                accumulator[0] += value_sum
-                accumulator[1] += value_count
-            if not bool(torch.isfinite(l.detach()).all().cpu()):
-                bad_outputs = _nonfinite_output_names(out)
-                raise FloatingPointError(
-                    f"Non-finite training loss at epoch={epoch}, step={step}. "
-                    f"{_batch_structure_summary(batch)}; "
-                    f"non-finite outputs={bad_outputs or ['loss assembly']}. "
-                    "Check dataset units, learning rate, and active physics layers."
-                )
-            if l.requires_grad:
-                l.backward()
-                bad_parameters = _nonfinite_gradient_parameters(model)
-                if bad_parameters:
-                    batch_summary = _batch_structure_summary(batch)
+                    if sample_id in _bad_samples:
+                        _record_bad_sample(
+                            sample_id,
+                            epoch=epoch,
+                            step=step,
+                            phase="train",
+                            reason=retry_error,
+                        )
+                        continue
+                    single = _TGBatch.from_data_list([graph]).to(device)
                     opt.zero_grad(set_to_none=True)
-                    raise FloatingPointError(
-                        f"Non-finite gradient at epoch={epoch}, step={step}. "
-                        f"{batch_summary}; parameters={bad_parameters}. "
-                        "No optimizer update was applied."
+                    try:
+                        single_result = _forward_loss_backward(
+                            single,
+                            response_weight_mu=_w_mu,
+                            response_weight_alpha=_w_alpha,
+                        )
+                        _checked_optimizer_step()
+                        accepted_results.append(single_result)
+                    except _BadSampleError as sample_error:
+                        opt.zero_grad(set_to_none=True)
+                        _record_bad_sample(
+                            sample_id,
+                            epoch=epoch,
+                            step=step,
+                            phase="train",
+                            reason=sample_error,
+                        )
+                        newly_bad.append(sample_id)
+                    finally:
+                        del single
+                        _release_mps_cache()
+                if newly_bad:
+                    log(
+                        f"[{_now()}] WARN: isolated and skipped {len(newly_bad)} "
+                        f"invalid structure(s) at epoch={epoch}, step={step}: "
+                        f"{newly_bad[:8]}; batch_failure={batch_error.kind}."
                     )
-                grad_norm = _clip_grad_norm_stable(
-                    model.parameters(), float(cfg.grad_clip_norm)
-                )
-                if not math.isfinite(grad_norm):
-                    batch_summary = _batch_structure_summary(batch)
-                    opt.zero_grad(set_to_none=True)
-                    raise FloatingPointError(
-                        f"Gradient norm overflow at epoch={epoch}, step={step}. "
-                        f"{batch_summary}; all individual gradients were finite. "
-                        "No optimizer update was applied."
-                    )
-                opt.step()
-            train_loss += float(l.detach().cpu().item())
-            if need_forces:
-                with torch.no_grad():
-                    _sum, _count = _masked_mae_statistics(out["forces"], y_f, w_f)
-                    train_fmae_sum += _sum
-                    train_fmae_n += _count
+                    if progress is not None:
+                        progress(
+                            {
+                                "type": "bad_samples",
+                                "epoch": int(epoch),
+                                "step": int(step),
+                                "sample_ids": list(newly_bad),
+                                "unique_bad_samples": len(_bad_samples),
+                            }
+                        )
+                _enforce_bad_sample_limit()
+                if accepted_results:
+                    _consecutive_bad_batches = 0
+                else:
+                    _consecutive_bad_batches += 1
+                    if _consecutive_bad_batches >= 8:
+                        raise FloatingPointError(
+                            "Eight consecutive batches contained no numerically valid "
+                            "structures; refusing to mask a systematic divergence."
+                        )
 
-            # Break references to the large higher-order force graph before the
-            # next MPS batch. Allocator blocks remain reusable without retaining
-            # Python graph objects or parameter gradients.
-            del l, out, batch
+            if accepted_results:
+                train_loss += float(np.mean(
+                    [float(result["loss"]) for result in accepted_results]
+                ))
+            for result in accepted_results:
+                energy_sum, energy_count = result["energy"]
+                force_sum, force_count = result["forces"]
+                train_emae_sum += float(energy_sum)
+                train_emae_n += int(energy_count)
+                train_fmae_sum += float(force_sum)
+                train_fmae_n += int(force_count)
+                for name, (value_sum, value_count) in result["extra"].items():
+                    accumulator = train_extra_metrics.setdefault(name, [0.0, 0.0])
+                    accumulator[0] += float(value_sum)
+                    accumulator[1] += float(value_count)
+            accepted_results.clear()
+            if original_graphs is not None:
+                del original_graphs
+            if "batch" in locals():
+                del batch
 
             if progress is not None:
                 # Convert epoch / step progress into a single overall fraction.
@@ -10089,10 +11117,17 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         val_fnorm_mae_sum = 0.0;   val_fnorm_mae_n = 0
         val_extra_metrics: Dict[str, List[float]] = {}
         val_residual_max: Dict[str, float] = {}
+        val_batches_used = 0
         for batch in v_loader:
             if stop_flag and stop_flag():
                 stopped = True
                 break
+            if batch is None:
+                if not bool(getattr(cfg, "skip_bad_samples", True)):
+                    raise FloatingPointError(
+                        "A validation batch contains only non-finite input records"
+                    )
+                continue
             val_step += 1
             if progress is not None:
                 progress({
@@ -10102,6 +11137,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     "step":   int(val_step),
                     "steps":  int(len(v_loader)),
                 })
+            validation_ids = _batch_structure_ids(batch)
             batch = batch.to(device)
             use_response_terms = (cfg.mode != "base")
             need_energy = bool(
@@ -10145,7 +11181,16 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 }
                 if isinstance(model, MixedGranularityE3GNN):
                     forward_options["use_spin_terms"] = batch_use_spin
-                out = model(batch, **forward_options)
+                batch, out = _validation_forward_with_quarantine(
+                    batch,
+                    options=forward_options,
+                    sample_ids=validation_ids,
+                    epoch=epoch,
+                    step=val_step,
+                )
+                if batch is None or out is None:
+                    _release_mps_cache()
+                    continue
                 l = torch.zeros((), dtype=batch.positions.dtype, device=batch.positions.device)
                 if need_energy:
                     y_e = batch.energy.to(out["energy"].dtype)
@@ -10265,18 +11310,23 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                             val_residual_max.get(residual_name, 0.0), value
                         )
                 if not bool(torch.isfinite(l.detach()).all().cpu()):
-                    bad_outputs = _nonfinite_output_names(out)
                     raise FloatingPointError(
-                        f"Non-finite validation loss at epoch={epoch}, "
-                        f"step={val_step}. {_batch_structure_summary(batch)}; "
-                        f"non-finite outputs={bad_outputs or ['loss assembly']}."
+                        f"Validation loss assembly is non-finite at epoch={epoch}, "
+                        f"step={val_step} despite finite model outputs; "
+                        "check active label units and loss weights."
                     )
                 val_loss += float(l.detach().cpu().item())
+                val_batches_used += 1
             del l, out, batch
         if stopped:
             break
 
-        _final_val_loss = val_loss / max(1, len(v_loader))
+        if val_batches_used <= 0:
+            raise FloatingPointError(
+                "Validation contains no numerically valid structures; refusing "
+                "to create a checkpoint from training-only metrics."
+            )
+        _final_val_loss = val_loss / float(val_batches_used)
         _final_val_fmae = (val_fmae_sum / val_fmae_n) if val_fmae_n > 0 else float("nan")
         _final_val_emae = (val_emae_sum / val_emae_n) if val_emae_n > 0 else float("nan")
         _final_val_fnorm_mae = (val_fnorm_mae_sum / val_fnorm_mae_n) if val_fnorm_mae_n > 0 else float("nan")
@@ -10688,6 +11738,12 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 "memory": dict(memory),
                 "memory_leak_warning": leak_warning,
                 "numerical_recoveries": int(len(_numerical_recoveries)),
+                "unique_bad_samples": int(len(_bad_samples)),
+                "unique_bad_input_samples": int(len(_input_bad_samples)),
+                "skipped_bad_sample_occurrences": int(_skipped_occurrences),
+                "unique_bad_validation_samples": int(
+                    len(_bad_validation_samples)
+                ),
                 "artifact_dir": str(_train_dir),
                 "plots_dir": str(_plots_dir),
             })
@@ -10765,6 +11821,17 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 and _epoch_memory_hist[-1]["rss_growth_mib"] > 256.0
             ),
             "numerical_recoveries": _checkpoint_safe(_numerical_recoveries),
+            "bad_samples": _checkpoint_safe(list(_bad_samples.values())),
+            "bad_input_samples": _checkpoint_safe(
+                list(_input_bad_samples.values())
+            ),
+            "skipped_bad_sample_occurrences": int(_skipped_occurrences),
+            "bad_validation_samples": _checkpoint_safe(
+                list(_bad_validation_samples.values())
+            ),
+            "skipped_bad_validation_occurrences": int(
+                _skipped_validation_occurrences
+            ),
             "loss_weights": {
                 name: float(getattr(cfg, name))
                 for name in (
@@ -10781,6 +11848,24 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         f"epoch={_best_epoch} val_loss={_best_val_loss:.6g} "
         f"normalized_score={_best_validation_score:.6g}"
     )
+    if _bad_samples:
+        log(
+            f"[{_now()}] Training retained {len(_bad_samples)} quarantined "
+            f"sample ID(s), skipped {_skipped_occurrences} occurrence(s); "
+            "the complete audit is stored in checkpoint extra.bad_samples."
+        )
+    if _input_bad_samples:
+        log(
+            f"[{_now()}] Input validation quarantined {len(_input_bad_samples)} "
+            "sample ID(s); the audit is stored in checkpoint "
+            "extra.bad_input_samples."
+        )
+    if _bad_validation_samples:
+        log(
+            f"[{_now()}] Validation excluded {len(_bad_validation_samples)} "
+            "invalid sample ID(s); the audit is stored in checkpoint "
+            "extra.bad_validation_samples."
+        )
     if cfg.export_sevennet:
         try:
             export_sevennet_torchscript(out_path, log)
@@ -12607,7 +13692,7 @@ class App(tk.Tk):
                 ("Canonical HDF5", self.var_dataset, "open"),
                 ("Legacy static", self.var_static, "open"),
                 ("Legacy response", self.var_response, "open"),
-                ("Base checkpoint", self.var_base_ckpt, "open"),
+                ("Pretrained / base checkpoint", self.var_base_ckpt, "open"),
                 ("Output checkpoint", self.var_out_ckpt, "save"),
             ],
             palette,
@@ -12927,7 +14012,7 @@ class App(tk.Tk):
             ("Canonical HDF5", self.var_dataset, "open"),
             ("Legacy static", self.var_static, "open"),
             ("Legacy response", self.var_response, "open"),
-            ("Base checkpoint", self.var_base_ckpt, "open"),
+            ("Pretrained / base checkpoint", self.var_base_ckpt, "open"),
             ("Output checkpoint", self.var_out_ckpt, "save"),
         ]
         for i, (lbl, var, browse_mode) in enumerate(rows):
@@ -13760,6 +14845,9 @@ class App(tk.Tk):
             w_mu_f    = float(self.var_w_dipole_final.get())
             w_al_f    = float(self.var_w_alpha_final.get())
             out_ckpt  = self.var_out_ckpt.get()
+            initial_checkpoint = self.var_base_ckpt.get().strip()
+            if initial_checkpoint and not Path(initial_checkpoint).expanduser().is_file():
+                raise FileNotFoundError(initial_checkpoint)
 
             self._validate_gui_data_paths("joint")
             stem = Path(out_ckpt).stem
@@ -13768,7 +14856,8 @@ class App(tk.Tk):
             resp_out = str(par / f"{stem}_resp.pt")
 
             cfg_base = TrainConfig(
-                mode="base", out_ckpt=base_out, epochs=epochs, lr=lr,
+                mode="base", base_ckpt=initial_checkpoint,
+                out_ckpt=base_out, epochs=epochs, lr=lr,
                 **self._gui_train_kwargs_for_mode("base"),
             )
             cfg_resp = TrainConfig(
@@ -13813,7 +14902,14 @@ class App(tk.Tk):
                 _sf  = lambda: self._stop
 
                 _log(f"[{_now()}] === Full Chain: {total} stages ===")
-                _log(f"[{_now()}] Stage 1/{total}: Base → {base_out}")
+                _log(
+                    f"[{_now()}] Stage 1/{total}: Base "
+                    + (
+                        f"(pretrained={initial_checkpoint}) "
+                        if initial_checkpoint else "(from scratch) "
+                    )
+                    + f"→ {base_out}"
+                )
                 train_dual_layer(cfg_base, _log, _pq, _sf)
                 if self._stop:
                     self._progress_q.put({"type": "run_complete", "stopped": True})
@@ -14254,10 +15350,10 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "Use extXYZ or extXYZ.gz paired with a compatible static dataset.",
     ),
     "base_ckpt": _p(
-        "Base checkpoint",
-        "Initializes or freezes a previously trained Layer-1 model.",
-        "Response-only training keeps the ground-state PES fixed while fitting response heads.",
-        "Required for Response mode; optional initialization for Joint mode.",
+        "Pretrained / base checkpoint",
+        "Warm-starts Base, Response, Joint, and the first stage of Full Chain.",
+        "Compatible Layer-1 weights are transferred into the selected architecture; Response mode then freezes Layer 1, while other modes fine-tune it with a fresh optimizer.",
+        "Required for Response mode; optional for Base, Joint, and Full Chain. Match channels and parity for the largest transfer.",
     ),
     "out_ckpt": _p(
         "Output checkpoint",
@@ -15689,7 +16785,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             ("dataset", "Canonical HDF5", "dataset"),
             ("static_data", "Legacy static", "data"),
             ("response_data", "Legacy response", "data"),
-            ("base_ckpt", "Base checkpoint", "checkpoint"),
+            ("base_ckpt", "Pretrained / base checkpoint", "checkpoint"),
             ("out_ckpt", "Output checkpoint", "save"),
         ):
             card.body_layout.addWidget(self._make_file_field(key, title, mode))
@@ -17250,8 +18346,12 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             epochs = int(values["epochs"])
             lr = float(values["lr"])
             stages = max(1, int(values["joint_stages"]))
+            initial_checkpoint = str(values["base_ckpt"]).strip()
+            if initial_checkpoint and not Path(initial_checkpoint).expanduser().is_file():
+                raise FileNotFoundError(initial_checkpoint)
             base_cfg = self._make_train_config(
-                "base", out_ckpt=base_out, base_ckpt="", epochs=epochs, lr=lr
+                "base", out_ckpt=base_out, base_ckpt=initial_checkpoint,
+                epochs=epochs, lr=lr
             )
             response_cfg = self._make_train_config(
                 "response",
@@ -17301,7 +18401,12 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     return
                 self.bus.log.emit(
                     f"[{self.backend._now()}] === Full Chain {index}/{total}: "
-                    f"{cfg.mode} -> {cfg.out_ckpt} ==="
+                    f"{cfg.mode}"
+                    + (
+                        f" (pretrained={initial_checkpoint})"
+                        if index == 1 and initial_checkpoint else ""
+                    )
+                    + f" -> {cfg.out_ckpt} ==="
                 )
                 stage_label = (
                     "Base" if index == 1
@@ -18364,7 +19469,7 @@ def run_qt_gui(backend: Any, argv: Optional[Sequence[str]] = None) -> int:
     if app is None:
         app = QtWidgets.QApplication(list(argv or []))
     app.setApplicationName("E3MU Research Studio")
-    app.setOrganizationName("Morikawa Lab")
+    app.setOrganizationName("Fona Group")
     app.setStyle("Fusion")
     window = ModernE3MUGui(backend)
     window.show()

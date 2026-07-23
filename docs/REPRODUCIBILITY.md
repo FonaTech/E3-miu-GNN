@@ -86,10 +86,10 @@ hf download FonaTech/E3-miu-GNN \
 Then validate the canonical file used by the chosen config:
 
 ```bash
-python E3_miu_GNN.py dataset-summary \
+python Datasets_Preparation.py dataset-summary \
   Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5
 
-python E3_miu_GNN.py dataset-validate \
+python Datasets_Preparation.py dataset-validate \
   Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5 \
   --output Validation/neo_tiny_validation.json
 ```
@@ -97,7 +97,7 @@ python E3_miu_GNN.py dataset-validate \
 Audit portable-tier nesting with ordered name/path pairs:
 
 ```bash
-python E3_miu_GNN.py dataset-tier-audit \
+python Datasets_Preparation.py dataset-tier-audit \
   --tier tiny=Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5 \
   --tier small=Datasets/Neo/canonical/neo_small_l1_l2_l3.h5 \
   --tier standard=Datasets/Neo/canonical/neo_mixed_l1_l2_l3.h5 \

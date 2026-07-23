@@ -155,6 +155,8 @@ sampled.
 | Small | 15,221 | 964,550 | 85 | 9,660 | 52.8 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
 | Standard | 46,414 | 2,316,736 | 85 | 28,284 | 135.1 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
 | Large | 613,267 | 17,760,024 | 89 | 511,274 | 1.23 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
+| Plus | 25,819,271 | 488,227,614 | 94 | 25,717,278 | 40.63 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_plus_l1_l2_l3.h5) |
+| Max | 101,283,549 | 1,899,323,661 | 94 | 101,181,556 | 134.39 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_max_l1_l2_l3.h5) |
 
 The fixed split counts are:
 
@@ -203,13 +205,13 @@ heads and independent validation.
 ## Validation commands
 
 ```bash
-python E3_miu_GNN.py dataset-summary \
+python Datasets_Preparation.py dataset-summary \
   Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5
 
-python E3_miu_GNN.py dataset-validate \
+python Datasets_Preparation.py dataset-validate \
   Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5
 
-python E3_miu_GNN.py dataset-tier-audit \
+python Datasets_Preparation.py dataset-tier-audit \
   --tier tiny=Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5 \
   --tier small=Datasets/Neo/canonical/neo_small_l1_l2_l3.h5 \
   --tier standard=Datasets/Neo/canonical/neo_mixed_l1_l2_l3.h5

@@ -114,8 +114,8 @@ Auto Research.
 Inspect and validate a canonical dataset:
 
 ```bash
-python E3_miu_GNN.py dataset-summary path/to/data.h5
-python E3_miu_GNN.py dataset-validate path/to/data.h5 --output validation.json
+python Datasets_Preparation.py dataset-summary path/to/data.h5
+python Datasets_Preparation.py dataset-validate path/to/data.h5 --output validation.json
 ```
 
 Train and evaluate:
@@ -145,12 +145,14 @@ Tiny RAM and I/O trade-offs are reported in
 Convert an extXYZ file into the canonical schema:
 
 ```bash
-python E3_miu_GNN.py dataset-extxyz \
+python Datasets_Preparation.py dataset-extxyz \
   input.extxyz.gz output.h5
 ```
 
-Run `python E3_miu_GNN.py --help` for the complete dataset,
-training, evaluation, VASP, self-test, and GUI command set.
+Run `python E3_miu_GNN.py --help` for training, evaluation, self-test, and GUI
+commands. Run `python Datasets_Preparation.py --help` for offline dataset,
+release-staging, and VASP data-generation commands. Legacy `dataset-*` and
+`vasp-*` invocations through `E3_miu_GNN.py` are lazily forwarded.
 
 ### Phonon workflow
 
@@ -170,7 +172,7 @@ device selection. SevenNet TorchScript exports remain ground-only by design.
 ## Dataset access and policy
 
 The GitHub repository includes the Tiny file for a quick start. Small,
-Standard, Large, and the complete release metadata are hosted in the
+Standard, Large, and release metadata are hosted in the
 [FonaTech/E3-miu-GNN Hugging Face dataset](https://huggingface.co/datasets/FonaTech/E3-miu-GNN).
 Neo uses the `e3mu-hdf5-v1` schema with explicit label masks, units, provenance,
 physical parent groups, and fixed train/validation/test splits. Missing labels
@@ -183,6 +185,21 @@ silently mixed.
 | Small | 15,221 | 52.8 MB | Intermediate experiments | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
 | Standard | 46,414 | 135.1 MB | Portable mixed-granularity training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
 | Large | 613,267 | 1.23 GB | Trajectory-rich training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
+| Plus | 25,819,271 | 40.63 GB portable single-file HDF5 | 25% material-family OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
+| Max | 101,283,549 | 134.39 GB portable single-file HDF5 | Full deduplicated OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
+
+Plus uses schema `e3mu-composite-hdf5-v1`. Its complete Large geometry,
+labels, masks, and provenance are embedded in the Plus HDF5 itself. Each of the
+635 declared OMat24 source shards is represented by an internal Parquet shard
+containing only selected rows. The runtime opens these through an HDF5-backed
+reader, so copying the single `.h5` file to another machine does not require the
+original OMat24 tree. Arrow logical types and float64 bit patterns are
+preserved. The original row number remains in `selection/source_row_index`.
+
+Max contains 100,670,282 unique OMat24 configurations after removing 154,252
+duplicate configuration IDs, plus all 613,267 Large records. It uses the same
+self-contained materialized-Parquet storage and staged Base -> Response -> Joint
+curriculum as Plus.
 
 Large-scale pretraining is currently in progress. The present release provides
 the architecture, training system, datasets, and validation tools; validated

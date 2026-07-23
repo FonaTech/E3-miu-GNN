@@ -238,8 +238,8 @@ process.
 | Streamed, cold topology cache | 30.44 s | 3.707 s | 372.3 MiB | 807.0 MiB |
 | Streamed, reused topology cache | 0.0246 s | 3.733 s | 120.3 MiB | 552.0 MiB |
 
-The reusable exact topology cache is 43.62 MiB. Local atom indices use the
-smallest safe unsigned integer width and are restored to `int64` before model
+The reusable exact topology cache is 43.62 MiB. Local atom indices use an
+adaptive safe unsigned integer width and are restored to `int64` before model
 execution. Periodic shifts use a per-structure, bitwise-exact dictionary: the
 5,542,544 nonzero Tiny shift rows contain 78,758 unique `float64[3]` bit
 patterns, with at most 80 patterns in one structure. The dictionary values and
