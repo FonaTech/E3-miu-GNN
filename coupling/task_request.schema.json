@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/FonaTech/E3-miu-GNN/raw/main/coupling/task_request.schema.json",
+  "title": "E3-miu-GNN task request",
+  "type": "object",
+  "required": ["schema", "action", "checkpoint"],
+  "properties": {
+    "schema": {"const": "e3mu-task-v1"},
+    "action": {"enum": ["inspect", "predict", "relax", "evaluate", "phonon", "export_sevennet"]},
+    "checkpoint": {"type": "string", "minLength": 1},
+    "structure": {"type": "string", "minLength": 1},
+    "dataset": {"type": "string", "minLength": 1},
+    "options": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"action": {"enum": ["predict", "relax", "phonon"]}}},
+      "then": {"required": ["structure"]}
+    },
+    {
+      "if": {"properties": {"action": {"const": "evaluate"}}},
+      "then": {"required": ["dataset"]}
+    }
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/FonaTech/E3-miu-GNN/raw/main/coupling/model_manifest.schema.json",
+  "title": "E3-miu-GNN model manifest",
+  "type": "object",
+  "required": ["schema", "ok", "checkpoint", "model", "inference"],
+  "properties": {
+    "schema": {"const": "e3mu-model-manifest-v1"},
+    "ok": {"const": true},
+    "checkpoint": {
+      "type": "object",
+      "required": ["path", "sha256", "bytes", "format", "schema_version"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "format": {"type": "string"},
+        "schema_version": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "model": {
+      "type": "object",
+      "required": ["class", "config", "parameter_count", "elements", "cutoff_A", "configured_physics"],
+      "properties": {
+        "class": {"type": "string"},
+        "config": {"type": "object"},
+        "parameter_count": {"type": "integer", "minimum": 0},
+        "trainable_parameter_count": {"type": "integer", "minimum": 0},
+        "elements": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 118}, "uniqueItems": true},
+        "chemical_symbols": {"type": "array", "items": {"type": "string"}},
+        "cutoff_A": {"type": "number", "exclusiveMinimum": 0},
+        "dtype": {"enum": ["float32", "float64"]},
+        "configured_physics": {
+          "type": "array",
+          "items": {"enum": ["qeq", "pme", "deq", "d4", "spin", "film", "dmi"]},
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "inference": {
+      "type": "object",
+      "required": ["recommended_mode", "reason", "outputs", "limitations"],
+      "properties": {
+        "recommended_mode": {"enum": ["ground_only", "full_coupled"]},
+        "reason": {"type": "string"},
+        "outputs": {
+          "type": "object",
+          "required": ["potential", "recommended", "unsupported"],
+          "properties": {
+            "potential": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+            "recommended": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+            "unsupported": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+          },
+          "additionalProperties": false
+        },
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "training_metadata": {"type": "object"}
+  },
+  "additionalProperties": false
+}

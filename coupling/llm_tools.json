@@ -1,0 +1,108 @@
+{
+  "schema": "e3mu-llm-tools-v1",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "e3mu_inspect_checkpoint",
+        "description": "Inspect a local E3-miu-GNN checkpoint and return its architecture, elements, recommended inference mode, trusted outputs, and limitations.",
+        "parameters": {
+          "type": "object",
+          "required": ["checkpoint"],
+          "properties": {
+            "checkpoint": {"type": "string", "description": "Local checkpoint path."},
+            "allow_unsafe_legacy": {"type": "boolean", "default": false, "description": "Opt in only for a trusted legacy pickle checkpoint."}
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "e3mu_predict",
+        "description": "Predict physically supported properties for an ASE-readable structure using an E3-miu-GNN checkpoint.",
+        "parameters": {
+          "type": "object",
+          "required": ["checkpoint", "structure"],
+          "properties": {
+            "checkpoint": {"type": "string"},
+            "structure": {"type": "string"},
+            "index": {"type": "string", "default": "0"},
+            "device": {"enum": ["auto", "cpu", "mps", "cuda"], "default": "auto"},
+            "model_mode": {"enum": ["auto", "ground_only", "full_coupled"], "default": "auto"},
+            "properties": {"type": "array", "items": {"type": "string"}, "default": ["energy", "forces"]},
+            "total_charge": {"type": "number", "default": 0.0},
+            "electric_field": {"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}, {"type": "number"}], "items": false, "default": [0.0, 0.0, 0.0]},
+            "spin_policy": {"enum": ["auto", "off", "required"], "default": "auto"}
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "e3mu_relax",
+        "description": "Relax atomic positions at a fixed cell with E3-miu-GNN energy and conservative forces.",
+        "parameters": {
+          "type": "object",
+          "required": ["checkpoint", "structure"],
+          "properties": {
+            "checkpoint": {"type": "string"},
+            "structure": {"type": "string"},
+            "device": {"enum": ["auto", "cpu", "mps", "cuda"], "default": "auto"},
+            "model_mode": {"enum": ["auto", "ground_only", "full_coupled"], "default": "auto"},
+            "fmax": {"type": "number", "exclusiveMinimum": 0, "default": 0.05},
+            "steps": {"type": "integer", "minimum": 1, "default": 200},
+            "optimizer": {"enum": ["FIRE", "BFGS"], "default": "FIRE"},
+            "output_structure": {"type": "string"},
+            "trajectory": {"type": "string"}
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "e3mu_evaluate",
+        "description": "Evaluate an E3-miu-GNN checkpoint on a canonical dataset split and return mask-aware metrics.",
+        "parameters": {
+          "type": "object",
+          "required": ["checkpoint", "dataset"],
+          "properties": {
+            "checkpoint": {"type": "string"},
+            "dataset": {"type": "string"},
+            "split": {"enum": ["train", "val", "test", "all"], "default": "test"},
+            "batch_size": {"type": "integer", "minimum": 1, "default": 4},
+            "device": {"enum": ["auto", "cpu", "mps", "cuda"], "default": "auto"}
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "e3mu_phonon",
+        "description": "Run the native finite-displacement Phonopy workflow for one periodic structure and export numerical spectra.",
+        "parameters": {
+          "type": "object",
+          "required": ["checkpoint", "structure", "output"],
+          "properties": {
+            "checkpoint": {"type": "string"},
+            "structure": {"type": "string"},
+            "output": {"type": "string"},
+            "device": {"enum": ["auto", "cpu", "mps", "cuda"], "default": "auto"},
+            "model_mode": {"enum": ["auto", "ground_only", "full_coupled"], "default": "auto"},
+            "supercell": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 1}, {"type": "integer", "minimum": 1}, {"type": "integer", "minimum": 1}], "items": false, "default": [2, 2, 2]},
+            "dos_mesh": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 1}, {"type": "integer", "minimum": 1}, {"type": "integer", "minimum": 1}], "items": false, "default": [10, 10, 10]},
+            "displacement": {"type": "number", "exclusiveMinimum": 0, "default": 0.01}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

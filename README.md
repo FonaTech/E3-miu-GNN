@@ -154,6 +154,33 @@ commands. Run `python Datasets_Preparation.py --help` for offline dataset,
 release-staging, and VASP data-generation commands. Legacy `dataset-*` and
 `vasp-*` invocations through `E3_miu_GNN.py` are lazily forwarded.
 
+### Model API and automation
+
+The repository includes a stable headless package for human scripts, ASE,
+workflow engines, and LLM agents:
+
+```bash
+python -m pip install -e .
+e3mu --pretty inspect model.pt
+e3mu predict model.pt POSCAR --properties energy,forces --output prediction.json
+```
+
+```python
+from ase.io import read
+from e3mu import E3MUCalculator
+
+atoms = read("POSCAR")
+atoms.calc = E3MUCalculator("model.pt", device="auto", model_mode="auto")
+energy = atoms.get_potential_energy()
+forces = atoms.get_forces()
+```
+
+Checkpoint inspection reports the trained inference mode, supported elements,
+active physics, trusted outputs, and explicit limitations before a calculation
+runs. Versioned JSON schemas and LLM function contracts are stored in
+[`coupling/`](coupling/README.md). See the [API reference](docs/API.md),
+[interface guide](docs/INTERFACES.md), and [coupling guide](docs/COUPLING.md).
+
 ### Phonon workflow
 
 Launch the finite-displacement Phonopy interface with:
@@ -212,7 +239,7 @@ the archive-level redistribution terms for the transformed `BEC/H2O`,
 
 ## Verified behavior
 
-The current source tree passes 67 regression tests and the deterministic
+The current source tree passes 125 regression tests and the deterministic
 physics self-test. The checked invariants include:
 
 - rotation and reflection behavior of energy, force, dipole, and
@@ -246,17 +273,24 @@ part maps to a deeper user or developer reference:
 | Optimization, validation, and measured results | [Training and validation](docs/TRAINING_AND_VALIDATION.md) |
 | Installation and reproducibility | [Reproducibility](docs/REPRODUCIBILITY.md) |
 | Mathematical definitions and code map | [Formula reference](docs/FORMULAE.md) |
+| Python and ASE API | [Public API](docs/API.md) |
+| Human, script, and agent interfaces | [Interface guide](docs/INTERFACES.md) |
+| Phonopy, SevenNet-style, and workflow coupling | [Coupling](docs/COUPLING.md) |
 
 ## Repository layout
 
 ```text
-E3_miu_GNN.py   Single executable implementation
+E3_miu_GNN.py                 Single executable training implementation
+e3mu/                         Public Python, ASE, and JSON API
+coupling/                     Versioned schemas and integration examples
+skills/e3-miu-gnn/            LLM-callable workflow skill
 tests/                        Regression and physics tests
 docs/PAPER.md                 Markdown manuscript
-docs/*.md                     Technical sections and reproducibility notes
+docs/*.md                     Technical and API documentation
 docs/assets/                  Architecture figures and measured plots
 Datasets/Neo/*.md             Dataset card, schema, provenance, and rights docs
-requirements.txt              Runtime and test dependencies
+requirements.txt              Complete research environment
+pyproject.toml                Installable package and `e3mu` entry point
 ```
 
 ## Citation

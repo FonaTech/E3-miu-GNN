@@ -1,0 +1,14 @@
+{
+  "schema": "e3mu-task-v1",
+  "action": "predict",
+  "checkpoint": "model_base.pt",
+  "structure": "mp-2998_BaTiO3.cif",
+  "options": {
+    "device": "auto",
+    "model_mode": "auto",
+    "properties": ["energy", "forces"],
+    "spin_policy": "auto",
+    "total_charge": 0.0,
+    "electric_field": [0.0, 0.0, 0.0]
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "E3-miu-GNN Model Operations"
+  short_description: "Run and validate E3-miu-GNN atomistic models"
+  default_prompt: "Use $e3-miu-gnn to inspect a checkpoint and run a safe atomistic prediction."

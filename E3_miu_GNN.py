@@ -82,9 +82,42 @@ try:
 except Exception:
     _SciPyKDTree = None
 
-import tkinter as tk
-import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, ttk
+try:
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import filedialog, messagebox, ttk
+    HAS_TKINTER = True
+except ImportError:
+    HAS_TKINTER = False
+
+    class _UnavailableTkWidget:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError(
+                "Tkinter is unavailable. Install the platform Tk package or use "
+                "the headless e3mu API."
+            )
+
+    class _UnavailableTkModule:
+        Tk = _UnavailableTkWidget
+        Canvas = _UnavailableTkWidget
+        Frame = _UnavailableTkWidget
+        Label = _UnavailableTkWidget
+        Text = _UnavailableTkWidget
+        PanedWindow = _UnavailableTkWidget
+        Variable = _UnavailableTkWidget
+        StringVar = _UnavailableTkWidget
+        BooleanVar = _UnavailableTkWidget
+        TclError = RuntimeError
+
+    class _UnavailableTkNamespace:
+        def __getattr__(self, _name: str) -> Any:
+            return _UnavailableTkWidget
+
+    tk = _UnavailableTkModule()  # type: ignore[assignment]
+    tkfont = _UnavailableTkNamespace()  # type: ignore[assignment]
+    ttk = _UnavailableTkNamespace()  # type: ignore[assignment]
+    filedialog = _UnavailableTkNamespace()  # type: ignore[assignment]
+    messagebox = _UnavailableTkNamespace()  # type: ignore[assignment]
 
 from ase import Atoms
 from ase.data import atomic_numbers as ASE_ATOMIC_NUMBERS
@@ -8201,7 +8234,7 @@ def export_sevennet_torchscript(ckpt_path: str, log: Callable) -> None:
                 f"  Unexpected keys: {remaining_unexpected}"
             )
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     cfg = ModelConfig(**{k: v for k, v in ckpt["model_config"].items()
                          if k in ModelConfig.__dataclass_fields__})
     zs: List[int] = list(ckpt["z_table_zs"])
@@ -19723,6 +19756,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not arguments:
         if HAS_PYQT6:
             return run_qt_gui(sys.modules[__name__])
+        if not HAS_TKINTER:
+            print(
+                "No GUI toolkit is available. Install PyQt6 or Tkinter, or use "
+                "the headless 'e3mu' and E3_miu_GNN.py CLI commands.",
+                file=sys.stderr,
+            )
+            return 2
         print(
             "PyQt6 is unavailable; falling back to the legacy Tk GUI. "
             "Install PyQt6>=6.7,<7 for the modern interface.",
@@ -19739,6 +19779,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         return run_qt_gui(sys.modules[__name__])
     if args.command == "gui-tk":
+        if not HAS_TKINTER:
+            parser.error("Tkinter is required for 'gui-tk'")
         App().mainloop()
         return 0
     if args.command == "train":

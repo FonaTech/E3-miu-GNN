@@ -22,8 +22,35 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import numpy as np
 import torch
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    HAS_TKINTER = True
+except ImportError:
+    HAS_TKINTER = False
+
+    class _UnavailableTkWidget:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError(
+                "Tkinter is unavailable. Use the Verify_Program_Phonon.py CLI "
+                "or e3mu.run_phonon in a headless environment."
+            )
+
+    class _UnavailableTkModule:
+        Tk = _UnavailableTkWidget
+        Canvas = _UnavailableTkWidget
+        Text = _UnavailableTkWidget
+        StringVar = _UnavailableTkWidget
+        BooleanVar = _UnavailableTkWidget
+
+    class _UnavailableTkNamespace:
+        def __getattr__(self, _name: str) -> Any:
+            return _UnavailableTkWidget
+
+    tk = _UnavailableTkModule()  # type: ignore[assignment]
+    ttk = _UnavailableTkNamespace()  # type: ignore[assignment]
+    filedialog = _UnavailableTkNamespace()  # type: ignore[assignment]
+    messagebox = _UnavailableTkNamespace()  # type: ignore[assignment]
 
 from ase import Atoms
 from ase.io import read as ase_read
@@ -667,6 +694,15 @@ class DualLayerPESCalculator(Calculator):
         self.calculation_count += 1
         self.results["energy"] = E
         self.results["forces"] = np.asarray(F, dtype=float).copy()
+
+
+# Keep the phonon workflow and the public headless API on one calculator
+# implementation.  The historical class above remains in the source for
+# backwards-readable diffs, while new calls use the shared implementation.
+try:
+    from e3mu.calculator import E3MUCalculator as DualLayerPESCalculator
+except Exception:
+    pass
 
 
 class SevenNetTSCalculator(Calculator):
@@ -2814,4 +2850,11 @@ def _run_cli(arguments: Sequence[str]) -> int:
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         raise SystemExit(_run_cli(sys.argv[1:]))
+    if not HAS_TKINTER:
+        print(
+            "Tkinter is unavailable. Run 'python Verify_Program_Phonon.py --help' "
+            "for the headless CLI.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     App().mainloop()
