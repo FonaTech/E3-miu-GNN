@@ -884,6 +884,7 @@ def _load_model_for_phonon(
 ):
     """Load either a DualLayerFieldModel .pt checkpoint or a SevenNet TorchScript .pt model."""
     # First try loading as our native DualLayerFieldModel checkpoint
+    dual_error = "native checkpoint loading was not attempted"
     try:
         model = DualLayerFieldModel.load(
             model_ckpt,
@@ -903,8 +904,9 @@ def _load_model_for_phonon(
             f"configured_physics={flags or ['short_range']}"
         )
         return model
-    except Exception as e_dual:
-        log(f"[{_now()}] Not a DualLayerFieldModel ({type(e_dual).__name__}: {e_dual}); trying SevenNet TorchScript...")
+    except Exception as exc:
+        dual_error = f"{type(exc).__name__}: {exc}"
+        log(f"[{_now()}] Not a DualLayerFieldModel ({dual_error}); trying SevenNet TorchScript...")
 
     # Fall back to SevenNet TorchScript
     try:
@@ -914,7 +916,7 @@ def _load_model_for_phonon(
     except Exception as e_sn:
         raise RuntimeError(
             f"Could not load model from '{model_ckpt}'.\n"
-            f"  DualLayerFieldModel error: {e_dual}\n"
+            f"  DualLayerFieldModel error: {dual_error}\n"
             f"  SevenNet TorchScript error: {e_sn}\n"
             "For a trusted local full-module checkpoint, enable the explicit "
             "legacy-checkpoint option. Never enable it for an untrusted file."

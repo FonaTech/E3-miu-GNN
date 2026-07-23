@@ -180,6 +180,8 @@ active physics, trusted outputs, and explicit limitations before a calculation
 runs. Versioned JSON schemas and LLM function contracts are stored in
 [`coupling/`](coupling/README.md). See the [API reference](docs/API.md),
 [interface guide](docs/INTERFACES.md), and [coupling guide](docs/COUPLING.md).
+The portable agent skill is in [`skills/e3-miu-gnn/`](skills/e3-miu-gnn/SKILL.md);
+runtime-specific install locations are listed in the interface guide.
 
 ### Phonon workflow
 

@@ -9990,7 +9990,6 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 stop_flag=stop_flag,
             )
             if topology_cache is None:
-                del model
                 return _cancelled_result("disk topology-cache construction")
         else:
             log(
@@ -10114,7 +10113,6 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 f"{time.perf_counter() - graph_start:.2f} s."
             )
         if stopped:
-            del data_all, selected_cfgs, selected_fields, model
             return _cancelled_result("neighbor-graph construction")
         train_data = data_all[:n_train_graphs]
         val_data = data_all[n_train_graphs:]
@@ -10149,8 +10147,8 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     )
     # Release every materialized representation before optimization. Streamed
     # datasets retain only their compact plan plus disk-backed dataset objects.
-    del all_cfgs, all_fields, train_cfgs, train_fields, val_cfgs, val_fields
-    del static_cfgs, static_fields, resp_cfgs, resp_fields
+    all_cfgs = all_fields = train_cfgs = train_fields = val_cfgs = val_fields = []
+    static_cfgs = static_fields = resp_cfgs = resp_fields = []
     gc.collect()
 
     def _collate(lst: List[AtomicData]) -> Optional[_TGBatch]:
@@ -10572,7 +10570,6 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             raise
         bad_outputs = _nonfinite_output_names(out)
         if bad_outputs:
-            del out
             raise _BadSampleError(
                 "nonfinite_forward", f"non-finite outputs={bad_outputs}"
             )
@@ -10663,24 +10660,20 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             loss = loss + additional_loss
             metrics["extra"].update(additional_metrics)
         except Exception as exc:
-            del loss, out
             if _is_isolatable_numerical_exception(exc):
                 raise _BadSampleError("loss_exception", str(exc)) from exc
             raise
         if not bool(torch.isfinite(loss.detach()).all().cpu()):
-            del loss, out
             raise _BadSampleError("nonfinite_loss", "loss assembly is non-finite")
         if loss.requires_grad:
             try:
                 loss.backward()
             except Exception as exc:
-                del loss, out
                 if _is_isolatable_numerical_exception(exc):
                     raise _BadSampleError("backward_exception", str(exc)) from exc
                 raise
             bad_parameters = _nonfinite_gradient_parameters(model)
             if bad_parameters:
-                del loss, out
                 raise _BadSampleError(
                     "nonfinite_gradient", f"parameters={bad_parameters}"
                 )
@@ -10688,13 +10681,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 model.parameters(), float(cfg.grad_clip_norm)
             )
             if not math.isfinite(grad_norm):
-                del loss, out
                 raise _BadSampleError(
                     "gradient_norm_overflow",
                     "individual gradients are finite but their norm overflowed",
                 )
         metrics["loss"] = float(loss.detach().cpu())
-        del loss, out
         return metrics
 
     def _validation_batch_is_finite(batch: Any) -> None:
@@ -11887,9 +11878,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             close = getattr(dataset_object, "close", None)
             if callable(close):
                 close()
-        del opt, model, loader, v_loader, train_data, val_data, _best_state
-        if _sched is not None:
-            del _sched
+        opt = model = loader = v_loader = train_data = val_data = _best_state = None
+        _sched = None
+        gc.collect()
+        _release_mps_cache()
         return _cancelled_result("the first training/validation epoch")
 
     out_p = Path(str(cfg.out_ckpt)).expanduser()
@@ -11992,9 +11984,8 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         close = getattr(dataset_object, "close", None)
         if callable(close):
             close()
-    del opt, model, loader, v_loader, train_data, val_data, _best_state
-    if _sched is not None:
-        del _sched
+    opt = model = loader = v_loader = train_data = val_data = _best_state = None
+    _sched = None
     gc.collect()
     _release_mps_cache()
     return out_path, _best_validation_score
