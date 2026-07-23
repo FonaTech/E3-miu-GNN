@@ -52,25 +52,20 @@ import ast
 import argparse
 import collections
 import copy
-import decimal
 import gc
 import hashlib
+import importlib.util
 import itertools
 import json
 import math
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
-import urllib.request
-import zipfile
-import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
@@ -149,13 +144,6 @@ except Exception:
     HAS_H5PY = False
 
 try:
-    import ijson
-    HAS_IJSON = True
-except Exception:
-    ijson = None  # type: ignore[assignment]
-    HAS_IJSON = False
-
-try:
     import pyarrow.parquet as _pyarrow_parquet
     HAS_PYARROW = True
 except Exception:
@@ -189,7 +177,13 @@ ALPHA_VOLUME_TO_EV_PER_FIELD2 = 0.06944615422483141
 COULOMB_EV_ANGSTROM = 14.3996454784255
 MU_B_EV_PER_TESLA = 5.7883817982e-5
 HDF5_SCHEMA_VERSION = "e3mu-hdf5-v1"
-NEO_MANIFEST_VERSION = "e3mu-neo-manifest-v1"
+COMPOSITE_HDF5_SCHEMA_VERSION = "e3mu-composite-hdf5-v1"
+HDF5_CANONICAL_ROOT_GROUPS: Tuple[str, ...] = (
+    "structures",
+    "labels",
+    "masks",
+    "metadata",
+)
 HDF5_METADATA_FIELDS: Tuple[str, ...] = (
     "source",
     "method_id",
@@ -201,8 +195,9 @@ HDF5_METADATA_FIELDS: Tuple[str, ...] = (
     "domain",
     "energy_reference",
     "provenance_id",
+    "dataset_role",
+    "curriculum_role",
 )
-HDF5_AUXILIARY_PROPERTY_KEYS = {"bec_acoustic_sum_residual_max"}
 _TORCH_RUNTIME_LOCK = threading.RLock()
 
 
@@ -1386,6 +1381,11 @@ HDF5_STRUCTURE_LABELS: Dict[str, Tuple[int, ...]] = {
     "spin_mapping_rmse": (),
     "spin_variant": (),
     "soc": (),
+    # OMat24 publishes the symmetric Cauchy stress in eV/Angstrom^3.  The
+    # current optimizer does not attach a stress loss, but canonical storage
+    # retains the source label losslessly for future cell-gradient training.
+    "stress": (3, 3),
+    "stress_volume_normalized": (),
 }
 HDF5_ATOM_LABELS: Dict[str, Tuple[int, ...]] = {
     "forces": (3,),
@@ -1431,6 +1431,8 @@ HDF5_UNITS = {
     "spin_mapping_rmse": "eV",
     "spin_variant": "integer_id",
     "soc": "boolean",
+    "stress": "eV/angstrom^3",
+    "stress_volume_normalized": "boolean",
 }
 
 
@@ -1454,406 +1456,92 @@ def stable_split(group_id: str, *, train: int = 80, val: int = 10) -> str:
     return "test"
 
 
-def assign_stable_group_splits(
-    configurations: Sequence[Configuration],
-    *,
-    train: int = 80,
-    val: int = 10,
-) -> Dict[str, Any]:
-    """Assign group-safe splits and guarantee that train covers every element."""
-    groups: Dict[str, List[Configuration]] = {}
-    group_elements: Dict[str, set] = {}
-    for index, cfg in enumerate(configurations):
-        group_id = str(cfg.properties.get("group_id", f"structure-{index}"))
-        groups.setdefault(group_id, []).append(cfg)
-        group_elements.setdefault(group_id, set()).update(int(z) for z in cfg.atomic_numbers)
-    assignments = {
-        group_id: stable_split(group_id, train=train, val=val) for group_id in groups
-    }
-    all_elements = set().union(*group_elements.values()) if group_elements else set()
-    train_elements = set().union(
-        *(group_elements[group] for group, split_name in assignments.items() if split_name == "train")
-    ) if any(value == "train" for value in assignments.values()) else set()
-    promoted: List[str] = []
-    for element in sorted(all_elements - train_elements):
-        candidates = sorted(
-            (group for group in groups if element in group_elements[group]),
-            key=lambda group: hashlib.sha256(f"coverage|{group}".encode("utf-8")).hexdigest(),
+_DATASET_PREPARATION_EXPORTS = frozenset({
+    "NEO_MANIFEST_VERSION",
+    "NEO_HF_TIER_PATHS",
+    "NEO_HF_REQUIRED_DOCUMENTS",
+    "assign_stable_group_splits",
+    "download_with_sha256",
+    "write_hdf5_dataset",
+    "write_hdf5_dataset_stream",
+    "extxyz_to_hdf5",
+    "rebuild_qm7x_hdf5",
+    "extract_verified_zip_member",
+    "scan_jarvis_multi_element_candidates",
+    "select_jarvis_multi_element_candidates",
+    "rebuild_jarvis_multi_element_hdf5",
+    "select_jarvis_dfpt_candidates",
+    "download_jarvis_dfpt_archives",
+    "rebuild_jarvis_dfpt_hdf5",
+    "rebuild_so3lr_hdf5",
+    "rebuild_deepspin_hdf5",
+    "scan_mptrj_magnetic_candidates",
+    "select_mptrj_magnetic_candidates",
+    "rebuild_mptrj_magnetic_hdf5",
+    "rebuild_mptrj_large_hdf5",
+    "select_static_mptrj_parquet_rows",
+    "rebuild_static_mptrj_hdf5",
+    "rebuild_scfnn_from_combined_extxyz",
+    "rebuild_bec_from_combined_response",
+    "select_neo_stratified_hdf5_indices",
+    "build_neo_stratified_tier",
+    "audit_neo_tier_hierarchy",
+    "build_neo_mixed_dataset",
+    "build_neo_smoke_dataset",
+    "validate_neo_hdf5",
+    "hdf5_dataset_summary",
+    "build_neo_omat24_composite",
+    "embed_neo_large_in_composite",
+    "prepare_neo_huggingface_release",
+    "generate_vasp_magnetic_jobs",
+    "run_vasp_job",
+    "attach_spin_energy_mappings",
+    "collect_vasp_magnetic_jobs",
+    "_base_magnetic_structures",
+    "_initial_spin_vectors",
+    "_order_atoms_for_vasp",
+    "_spin_family",
+    "_spin_mapping_features",
+})
+
+
+def _load_dataset_preparation_module() -> Any:
+    """Load the sibling offline-tool module without relying on the CWD."""
+    module_name = "Datasets_Preparation"
+    source = Path(__file__).with_name(f"{module_name}.py").resolve()
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        raw_path = getattr(existing, "__file__", None)
+        if raw_path and Path(raw_path).resolve() == source:
+            return existing
+    if not source.is_file():
+        raise ModuleNotFoundError(
+            f"Offline dataset tools are unavailable: {source} does not exist"
         )
-        if not candidates:
-            continue
-        selected = candidates[0]
-        assignments[selected] = "train"
-        train_elements.update(group_elements[selected])
-        promoted.append(selected)
-    for group_id, family in groups.items():
-        for cfg in family:
-            cfg.properties["split"] = assignments[group_id]
-    counts = {
-        split_name: sum(len(groups[group]) for group, value in assignments.items() if value == split_name)
-        for split_name in ("train", "val", "test")
-    }
-    return {
-        "strategy": "stable_group_hash_with_train_element_coverage",
-        "counts": counts,
-        "promoted_groups": promoted,
-        "train_elements": sorted(train_elements),
-        "all_elements": sorted(all_elements),
-    }
+    spec = importlib.util.spec_from_file_location(module_name, source)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load offline dataset tools from {source}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if sys.modules.get(module_name) is module:
+            del sys.modules[module_name]
+        raise
+    return module
 
 
-def download_with_sha256(
-    url: str,
-    destination: str,
-    *,
-    expected_sha256: Optional[str] = None,
-    log: Callable[[str], None] = print,
-) -> str:
-    """Download once, then verify content. Existing verified files are reused."""
-    path = Path(destination).expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and (expected_sha256 is None or sha256_file(str(path)) == expected_sha256):
-        log(f"[{_now()}] Reusing verified dataset: {path}")
-        return str(path)
-    temporary = path.with_suffix(path.suffix + ".partial")
-    request = urllib.request.Request(url, headers={"User-Agent": "e3mu-dataset/1"})
-    with urllib.request.urlopen(request) as response, temporary.open("wb") as output:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            output.write(chunk)
-    actual = sha256_file(str(temporary))
-    if expected_sha256 is not None and actual != expected_sha256:
-        raise ValueError(f"SHA256 mismatch for {url}: expected {expected_sha256}, got {actual}")
-    temporary.replace(path)
-    log(f"[{_now()}] Downloaded {url} -> {path} sha256={actual}")
-    return str(path)
+def __getattr__(name: str) -> Any:
+    """Resolve legacy dataset-preparation APIs only when explicitly requested."""
+    if name not in _DATASET_PREPARATION_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    preparation = _load_dataset_preparation_module()
 
+    value = getattr(preparation, name)
+    globals()[name] = value
+    return value
 
-def write_hdf5_dataset(
-    configurations: Sequence[Configuration],
-    path: str,
-    *,
-    metadata: Optional[Dict[str, Any]] = None,
-    overwrite: bool = False,
-) -> str:
-    if not HAS_H5PY:
-        raise RuntimeError("HDF5 support requires h5py")
-    output = Path(path).expanduser().resolve()
-    if output.exists() and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing dataset: {output}")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    n_structures = len(configurations)
-    atom_ptr = np.zeros(n_structures + 1, dtype=np.int64)
-    for index, cfg in enumerate(configurations):
-        atom_ptr[index + 1] = atom_ptr[index] + int(len(cfg.atomic_numbers))
-    n_atoms = int(atom_ptr[-1])
-    atomic_numbers = np.empty((n_atoms,), dtype=np.int16)
-    positions = np.empty((n_atoms, 3), dtype=np.float64)
-    cells = np.empty((n_structures, 3, 3), dtype=np.float64)
-    pbc = np.empty((n_structures, 3), dtype=np.bool_)
-
-    structure_values = {
-        name: np.full((n_structures,) + shape, np.nan, dtype=np.float64)
-        for name, shape in HDF5_STRUCTURE_LABELS.items()
-    }
-    structure_masks = {name: np.zeros((n_structures,), dtype=np.bool_) for name in HDF5_STRUCTURE_LABELS}
-    atom_values = {
-        name: np.full((n_atoms,) + shape, np.nan, dtype=np.float64)
-        for name, shape in HDF5_ATOM_LABELS.items()
-    }
-    atom_masks = {name: np.zeros((n_structures,), dtype=np.bool_) for name in HDF5_ATOM_LABELS}
-    meta_fields = {name: [] for name in HDF5_METADATA_FIELDS}
-
-    for structure_index, cfg in enumerate(configurations):
-        start, end = int(atom_ptr[structure_index]), int(atom_ptr[structure_index + 1])
-        atomic_numbers[start:end] = np.asarray(cfg.atomic_numbers, dtype=np.int16)
-        positions[start:end] = np.asarray(cfg.positions, dtype=np.float64)
-        cells[structure_index] = np.asarray(
-            cfg.cell if cfg.cell is not None else np.eye(3) * 100.0, dtype=np.float64
-        ).reshape(3, 3)
-        pbc[structure_index] = np.asarray(cfg.pbc, dtype=np.bool_)
-        props = dict(cfg.properties or {})
-        for name, shape in HDF5_STRUCTURE_LABELS.items():
-            if name not in props:
-                continue
-            structure_values[name][structure_index] = np.asarray(props[name], dtype=np.float64).reshape(shape)
-            structure_masks[name][structure_index] = True
-        for name, shape in HDF5_ATOM_LABELS.items():
-            if name not in props:
-                continue
-            atom_values[name][start:end] = np.asarray(props[name], dtype=np.float64).reshape((end - start,) + shape)
-            atom_masks[name][structure_index] = True
-        group_id = str(props.get("group_id", f"structure-{structure_index}"))
-        meta_fields["source"].append(str(props.get("source", "unknown")))
-        meta_fields["method_id"].append(str(props.get("method_id", "unknown")))
-        meta_fields["system_id"].append(str(props.get("system_id", "unknown")))
-        meta_fields["group_id"].append(group_id)
-        meta_fields["split"].append(str(props.get("split", stable_split(group_id))))
-        meta_fields["sample_id"].append(str(props.get("sample_id", f"structure-{structure_index}")))
-        meta_fields["parent_id"].append(str(props.get("parent_id", group_id)))
-        meta_fields["domain"].append(
-            str(props.get("domain", "periodic" if any(bool(x) for x in cfg.pbc) else "molecular"))
-        )
-        meta_fields["energy_reference"].append(str(props.get("energy_reference", "unknown")))
-        meta_fields["provenance_id"].append(str(props.get("provenance_id", "unknown")))
-
-    with h5py.File(output, "w") as handle:
-        handle.attrs["schema_version"] = HDF5_SCHEMA_VERSION
-        handle.attrs["created_at"] = _now()
-        handle.attrs["units_json"] = json.dumps(HDF5_UNITS, sort_keys=True)
-        handle.attrs["metadata_json"] = json.dumps(_checkpoint_safe(metadata or {}), sort_keys=True)
-        structures = handle.create_group("structures")
-        structures.create_dataset("atom_ptr", data=atom_ptr, compression="gzip")
-        structures.create_dataset("atomic_numbers", data=atomic_numbers, compression="gzip")
-        structures.create_dataset("positions", data=positions, compression="gzip")
-        structures.create_dataset("cell", data=cells, compression="gzip")
-        structures.create_dataset("pbc", data=pbc, compression="gzip")
-        labels = handle.create_group("labels")
-        masks = handle.create_group("masks")
-        for name, values in structure_values.items():
-            labels.create_dataset(name, data=values, compression="gzip")
-            masks.create_dataset(name, data=structure_masks[name], compression="gzip")
-        for name, values in atom_values.items():
-            labels.create_dataset(name, data=values, compression="gzip")
-            masks.create_dataset(name, data=atom_masks[name], compression="gzip")
-        metadata_group = handle.create_group("metadata")
-        string_dtype = h5py.string_dtype(encoding="utf-8")
-        for name, values in meta_fields.items():
-            metadata_group.create_dataset(name, data=np.asarray(values, dtype=object), dtype=string_dtype)
-    return str(output)
-
-
-def write_hdf5_dataset_stream(
-    configurations: Iterable[Configuration],
-    path: str,
-    *,
-    metadata: Optional[Dict[str, Any]] = None,
-    overwrite: bool = False,
-    chunk_structures: int = 256,
-) -> str:
-    """Write canonical HDF5 in bounded batches instead of materializing a corpus."""
-    if not HAS_H5PY:
-        raise RuntimeError("HDF5 support requires h5py")
-    output = Path(path).expanduser().resolve()
-    if output.exists() and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing dataset: {output}")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".building")
-    batch_size = max(1, int(chunk_structures))
-    structure_count = 0
-    atom_count = 0
-    elements: set = set()
-    split_counts: Dict[str, int] = {}
-    source_counts: Dict[str, int] = {}
-    label_counts = {
-        name: 0 for name in itertools.chain(HDF5_STRUCTURE_LABELS, HDF5_ATOM_LABELS)
-    }
-
-    with h5py.File(temporary, "w") as handle:
-        handle.attrs["schema_version"] = HDF5_SCHEMA_VERSION
-        handle.attrs["created_at"] = _now()
-        handle.attrs["units_json"] = json.dumps(HDF5_UNITS, sort_keys=True)
-        structures = handle.create_group("structures")
-        atom_ptr_ds = structures.create_dataset(
-            "atom_ptr", data=np.asarray([0], dtype=np.int64), maxshape=(None,), chunks=True
-        )
-        atomic_numbers_ds = structures.create_dataset(
-            "atomic_numbers", shape=(0,), maxshape=(None,), dtype=np.int16,
-            chunks=True, compression="gzip",
-        )
-        positions_ds = structures.create_dataset(
-            "positions", shape=(0, 3), maxshape=(None, 3), dtype=np.float64,
-            chunks=True, compression="gzip",
-        )
-        cell_ds = structures.create_dataset(
-            "cell", shape=(0, 3, 3), maxshape=(None, 3, 3), dtype=np.float64,
-            chunks=True, compression="gzip",
-        )
-        pbc_ds = structures.create_dataset(
-            "pbc", shape=(0, 3), maxshape=(None, 3), dtype=np.bool_,
-            chunks=True, compression="gzip",
-        )
-        labels = handle.create_group("labels")
-        masks = handle.create_group("masks")
-        structure_label_ds = {
-            name: labels.create_dataset(
-                name, shape=(0,) + shape, maxshape=(None,) + shape,
-                dtype=np.float64, chunks=True, compression="gzip", fillvalue=np.nan,
-            )
-            for name, shape in HDF5_STRUCTURE_LABELS.items()
-        }
-        atom_label_ds = {
-            name: labels.create_dataset(
-                name, shape=(0,) + shape, maxshape=(None,) + shape,
-                dtype=np.float64, chunks=True, compression="gzip", fillvalue=np.nan,
-            )
-            for name, shape in HDF5_ATOM_LABELS.items()
-        }
-        mask_ds = {
-            name: masks.create_dataset(
-                name, shape=(0,), maxshape=(None,), dtype=np.bool_,
-                chunks=True, compression="gzip", fillvalue=False,
-            )
-            for name in itertools.chain(HDF5_STRUCTURE_LABELS, HDF5_ATOM_LABELS)
-        }
-        metadata_group = handle.create_group("metadata")
-        string_dtype = h5py.string_dtype(encoding="utf-8")
-        metadata_ds = {
-            name: metadata_group.create_dataset(
-                name, shape=(0,), maxshape=(None,), dtype=string_dtype, chunks=True
-            )
-            for name in HDF5_METADATA_FIELDS
-        }
-
-        iterator = iter(configurations)
-        while True:
-            batch = list(itertools.islice(iterator, batch_size))
-            if not batch:
-                break
-            for offset, cfg in enumerate(batch):
-                _validate_configuration(cfg, context=f"HDF5 stream structure {structure_count + offset}")
-            active_structure_labels = {
-                name
-                for cfg in batch
-                for name in HDF5_STRUCTURE_LABELS
-                if name in (cfg.properties or {})
-                and float(cfg.property_weights.get(name, 1.0)) > 0.0
-            }
-            active_atom_labels = {
-                name
-                for cfg in batch
-                for name in HDF5_ATOM_LABELS
-                if name in (cfg.properties or {})
-                and float(cfg.property_weights.get(name, 1.0)) > 0.0
-            }
-            batch_structures = len(batch)
-            batch_atoms = sum(len(np.asarray(cfg.atomic_numbers).reshape(-1)) for cfg in batch)
-            structure_start, structure_end = structure_count, structure_count + batch_structures
-            atom_start, atom_end = atom_count, atom_count + batch_atoms
-
-            atom_ptr_ds.resize((structure_end + 1,))
-            atomic_numbers_ds.resize((atom_end,))
-            positions_ds.resize((atom_end, 3))
-            cell_ds.resize((structure_end, 3, 3))
-            pbc_ds.resize((structure_end, 3))
-            for name, shape in HDF5_STRUCTURE_LABELS.items():
-                structure_label_ds[name].resize((structure_end,) + shape)
-            for name, shape in HDF5_ATOM_LABELS.items():
-                atom_label_ds[name].resize((atom_end,) + shape)
-            for dataset in mask_ds.values():
-                dataset.resize((structure_end,))
-            for dataset in metadata_ds.values():
-                dataset.resize((structure_end,))
-
-            cursor = atom_start
-            pointer_values = np.empty((batch_structures,), dtype=np.int64)
-            batch_numbers = np.empty((batch_atoms,), dtype=np.int16)
-            batch_positions = np.empty((batch_atoms, 3), dtype=np.float64)
-            batch_cells = np.empty((batch_structures, 3, 3), dtype=np.float64)
-            batch_pbc = np.empty((batch_structures, 3), dtype=np.bool_)
-            batch_structure_values = {
-                name: np.full((batch_structures,) + shape, np.nan, dtype=np.float64)
-                for name, shape in HDF5_STRUCTURE_LABELS.items()
-                if name in active_structure_labels
-            }
-            batch_atom_values = {
-                name: np.full((batch_atoms,) + shape, np.nan, dtype=np.float64)
-                for name, shape in HDF5_ATOM_LABELS.items()
-                if name in active_atom_labels
-            }
-            batch_masks = {
-                name: np.zeros((batch_structures,), dtype=np.bool_)
-                for name in active_structure_labels | active_atom_labels
-            }
-            metadata_values = {name: [] for name in HDF5_METADATA_FIELDS}
-            for local_index, cfg in enumerate(batch):
-                numbers = np.asarray(cfg.atomic_numbers, dtype=np.int16).reshape(-1)
-                next_cursor = cursor + len(numbers)
-                local_atom_start = cursor - atom_start
-                local_atom_end = next_cursor - atom_start
-                batch_numbers[local_atom_start:local_atom_end] = numbers
-                batch_positions[local_atom_start:local_atom_end] = np.asarray(
-                    cfg.positions, dtype=np.float64
-                )
-                batch_cells[local_index] = np.asarray(cfg.cell, dtype=np.float64).reshape(3, 3)
-                batch_pbc[local_index] = np.asarray(cfg.pbc, dtype=np.bool_)
-                pointer_values[local_index] = next_cursor
-                elements.update(int(value) for value in numbers)
-                props = dict(cfg.properties or {})
-                for name, shape in HDF5_STRUCTURE_LABELS.items():
-                    if name not in props or float(cfg.property_weights.get(name, 1.0)) <= 0.0:
-                        continue
-                    batch_structure_values[name][local_index] = np.asarray(
-                        props[name], dtype=np.float64
-                    ).reshape(shape)
-                    batch_masks[name][local_index] = True
-                    label_counts[name] += 1
-                for name, shape in HDF5_ATOM_LABELS.items():
-                    if name not in props or float(cfg.property_weights.get(name, 1.0)) <= 0.0:
-                        continue
-                    batch_atom_values[name][local_atom_start:local_atom_end] = np.asarray(
-                        props[name], dtype=np.float64
-                    ).reshape((len(numbers),) + shape)
-                    batch_masks[name][local_index] = True
-                    label_counts[name] += 1
-                global_index = structure_start + local_index
-                group_id = str(props.get("group_id", f"structure-{global_index}"))
-                split_name = str(props.get("split", stable_split(group_id)))
-                source_name = str(props.get("source", "unknown"))
-                defaults = {
-                    "source": source_name,
-                    "method_id": str(props.get("method_id", "unknown")),
-                    "system_id": str(props.get("system_id", "unknown")),
-                    "group_id": group_id,
-                    "split": split_name,
-                    "sample_id": str(props.get("sample_id", f"structure-{global_index}")),
-                    "parent_id": str(props.get("parent_id", group_id)),
-                    "domain": str(
-                        props.get(
-                            "domain",
-                            "periodic" if any(bool(x) for x in cfg.pbc) else "molecular",
-                        )
-                    ),
-                    "energy_reference": str(props.get("energy_reference", "unknown")),
-                    "provenance_id": str(props.get("provenance_id", "unknown")),
-                }
-                for name in HDF5_METADATA_FIELDS:
-                    metadata_values[name].append(defaults[name])
-                split_counts[split_name] = split_counts.get(split_name, 0) + 1
-                source_counts[source_name] = source_counts.get(source_name, 0) + 1
-                cursor = next_cursor
-            atomic_numbers_ds[atom_start:atom_end] = batch_numbers
-            positions_ds[atom_start:atom_end] = batch_positions
-            cell_ds[structure_start:structure_end] = batch_cells
-            pbc_ds[structure_start:structure_end] = batch_pbc
-            atom_ptr_ds[structure_start + 1 : structure_end + 1] = pointer_values
-            for name, values in batch_structure_values.items():
-                structure_label_ds[name][structure_start:structure_end] = values
-            for name, values in batch_atom_values.items():
-                atom_label_ds[name][atom_start:atom_end] = values
-            for name, values in batch_masks.items():
-                mask_ds[name][structure_start:structure_end] = values
-            for name, values in metadata_values.items():
-                metadata_ds[name][structure_start:structure_end] = np.asarray(values, dtype=object)
-            structure_count = structure_end
-            atom_count = atom_end
-
-        metadata_payload = dict(metadata or {})
-        metadata_payload["writer_summary"] = {
-            "structures": structure_count,
-            "atoms": atom_count,
-            "elements": sorted(elements),
-            "labels": label_counts,
-            "splits": split_counts,
-            "sources": source_counts,
-        }
-        handle.attrs["metadata_json"] = json.dumps(
-            _checkpoint_safe(metadata_payload), sort_keys=True
-        )
-    temporary.replace(output)
-    return str(output)
 
 
 def iter_hdf5_configurations(
@@ -2057,6 +1745,72 @@ class HDF5StreamPlan:
         )
 
 
+def _curriculum_role_matches(value: str, mode: str) -> bool:
+    """Return whether one canonical record participates in a training stage."""
+    normalized = str(value or "all").strip().lower().replace("_", "-")
+    selected_mode = str(mode or "joint").strip().lower()
+    if normalized in {"", "all", "any", "legacy", "unknown", "mixed"}:
+        return True
+    tokens = {
+        token.strip()
+        for token in re.split(r"[,;+|/]", normalized)
+        if token.strip()
+    }
+    aliases = {
+        "base": {"base", "foundation", "l1", "ground"},
+        "response": {"response", "l2", "l3", "domain", "spin"},
+        "joint": {"joint", "mixed", "coupled"},
+    }
+    if selected_mode == "joint":
+        return bool(tokens & (aliases["base"] | aliases["response"] | aliases["joint"]))
+    return bool(tokens & aliases.get(selected_mode, {selected_mode}))
+
+
+def _filter_hdf5_stream_plan_for_mode(
+    plan: HDF5StreamPlan, mode: str
+) -> HDF5StreamPlan:
+    """Select stage-role indices while preserving legacy HDF5 behavior."""
+    roles = plan.metadata_values.get("curriculum_role")
+    if roles is None or not any(str(value).strip() for value in roles):
+        return plan
+    train = np.asarray(
+        [
+            int(index)
+            for index in plan.train_indices
+            if _curriculum_role_matches(roles[int(index)], mode)
+        ],
+        dtype=np.int64,
+    )
+    val = np.asarray(
+        [
+            int(index)
+            for index in plan.val_indices
+            if _curriculum_role_matches(roles[int(index)], mode)
+        ],
+        dtype=np.int64,
+    )
+    if train.size == 0 or val.size == 0:
+        raise ValueError(
+            f"Canonical curriculum role filter for mode={mode!r} produced "
+            f"train={train.size}, val={val.size}."
+        )
+    split_info = dict(plan.split_info)
+    split_info.update({
+        "curriculum_mode": str(mode),
+        "curriculum_filtered": True,
+        "train_structures": int(train.size),
+        "val_structures": int(val.size),
+        "train_groups": len({plan.group_ids[int(index)] for index in train}),
+        "val_groups": len({plan.group_ids[int(index)] for index in val}),
+    })
+    return replace(
+        plan,
+        train_indices=train,
+        val_indices=val,
+        split_info=split_info,
+    )
+
+
 def _group_stratified_hdf5_sample_indices(
     group_ids: Sequence[str], *, fraction: float, seed: int
 ) -> np.ndarray:
@@ -2116,8 +1870,16 @@ def prepare_hdf5_stream_plan(
     source_stat = Path(resolved).stat()
     with h5py.File(resolved, "r") as handle:
         schema = str(handle.attrs.get("schema_version", ""))
-        if schema != HDF5_SCHEMA_VERSION:
+        if schema not in {HDF5_SCHEMA_VERSION, COMPOSITE_HDF5_SCHEMA_VERSION}:
             raise ValueError(f"Unsupported HDF5 schema: {schema!r}")
+        missing_groups = [
+            name for name in HDF5_CANONICAL_ROOT_GROUPS if name not in handle
+        ]
+        if missing_groups:
+            raise ValueError(
+                "HDF5 file does not contain a canonical numerical payload: "
+                + ", ".join(missing_groups)
+            )
         structures = handle["structures"]
         metadata = handle["metadata"]
         masks = handle["masks"]
@@ -2131,7 +1893,7 @@ def prepare_hdf5_stream_plan(
         )
         metadata_values = {
             name: tuple(str(value) for value in metadata[name].asstr()[:])
-            for name in ("source", "method_id", "system_id")
+            for name in HDF5_METADATA_FIELDS
             if name in metadata
         }
         if len(group_ids) != n_structures or len(split_values) != n_structures:
@@ -2323,7 +2085,7 @@ def _read_hdf5_configuration_at(
         cell=np.asarray(structures["cell"][structure_index], dtype=float),
         pbc=tuple(bool(value) for value in structures["pbc"][structure_index]),
         config_type="Default",
-        head="Default",
+        head=str(props.get("method_id", "Default")),
     )
 
 
@@ -3131,6 +2893,340 @@ class HDF5AtomicDataDataset(Dataset):
         self.close()
 
 
+@dataclass
+class CompositeStreamPlan:
+    """Bounded-memory index for an OMat24-Parquet + canonical-HDF5 corpus."""
+
+    path: str
+    omat_root: str
+    source_files: Tuple[str, ...]
+    source_orders: np.ndarray
+    row_indices: np.ndarray
+    split_codes: np.ndarray
+    omat_atom_counts: np.ndarray
+    large_plan: HDF5StreamPlan
+    mode: str
+    train_omat_indices: np.ndarray
+    val_omat_indices: np.ndarray
+    train_large_indices: np.ndarray
+    val_large_indices: np.ndarray
+    elements: Tuple[int, ...]
+    label_counts: Dict[str, int]
+    split_info: Dict[str, Any]
+
+
+def _deterministic_subsample_indices(
+    indices: np.ndarray, fraction: float, seed: int, namespace: str
+) -> np.ndarray:
+    values = np.asarray(indices, dtype=np.int64)
+    if float(fraction) >= 1.0 or values.size <= 2:
+        return values
+    if not (0.0 < float(fraction) <= 1.0):
+        raise ValueError("sample_fraction must be in (0, 1]")
+    target = max(2, int(round(values.size * float(fraction))))
+    rng = np.random.default_rng(
+        int(hashlib.sha256(f"{namespace}|{seed}".encode()).hexdigest()[:16], 16)
+    )
+    return np.sort(rng.choice(values, size=target, replace=False)).astype(np.int64)
+
+
+def prepare_composite_stream_plan(
+    path: str,
+    *,
+    mode: str,
+    val_fraction: float,
+    seed: int,
+    sample_fraction: float = 1.0,
+) -> CompositeStreamPlan:
+    """Load Plus/Max selectors while numerical arrays remain disk-resident."""
+    composite = Path(path).expanduser().resolve()
+    with h5py.File(composite, "r") as handle:
+        if str(handle.attrs.get("schema_version", "")) != COMPOSITE_HDF5_SCHEMA_VERSION:
+            raise ValueError("Unsupported composite HDF5 schema")
+        omat = handle["sources/omat24"]
+        omat_root = _resolve_composite_source(composite, str(omat.attrs["root"]))
+        source_files = tuple(
+            str((omat_root / str(value)).resolve())
+            for value in omat["file_paths"].asstr()[:]
+        )
+        source_orders = np.asarray(handle["selection/source_order"][:], dtype=np.int64)
+        row_indices = np.asarray(handle["selection/row_index"][:], dtype=np.int64)
+        split_codes = np.asarray(handle["selection/split_code"][:], dtype=np.uint8)
+        omat_atom_counts = np.asarray(handle["selection/atom_count"][:], dtype=np.uint16)
+        large_group = handle["sources/neo_large"]
+        large_embedded = bool(large_group.attrs.get("embedded", False))
+        large_path = (
+            composite
+            if large_embedded
+            else _resolve_composite_source(composite, str(large_group.attrs["path"]))
+        )
+        metadata = json.loads(str(handle.attrs.get("metadata_json", "{}")))
+    for source in (*source_files, str(large_path)):
+        if not Path(source).is_file():
+            raise FileNotFoundError(f"Composite source is unavailable: {source}")
+
+    selected_mode = str(mode).strip().lower()
+    if selected_mode not in {"base", "response", "joint"}:
+        raise ValueError(f"Unsupported composite training mode: {mode!r}")
+    omat_train = np.flatnonzero(split_codes == 0).astype(np.int64)
+    omat_val = np.flatnonzero(split_codes == 1).astype(np.int64)
+    if selected_mode == "response":
+        omat_train = np.zeros((0,), dtype=np.int64)
+        omat_val = np.zeros((0,), dtype=np.int64)
+    elif float(sample_fraction) < 1.0:
+        omat_train = _deterministic_subsample_indices(
+            omat_train, sample_fraction, seed, f"{composite}:omat-train"
+        )
+        omat_val = _deterministic_subsample_indices(
+            omat_val, sample_fraction, seed, f"{composite}:omat-val"
+        )
+
+    large_plan = prepare_hdf5_stream_plan(
+        str(large_path), val_fraction=val_fraction, seed=seed,
+        sample_fraction=1.0, sample_seed=seed,
+    )
+    large_masks = large_plan.label_masks
+    large_roles = np.asarray(
+        [
+            _large_curriculum_role(large_masks, index)[1]
+            for index in range(len(large_plan.group_ids))
+        ],
+        dtype=object,
+    )
+    large_train = np.asarray(
+        [int(index) for index in large_plan.train_indices
+         if _curriculum_role_matches(str(large_roles[int(index)]), selected_mode)],
+        dtype=np.int64,
+    )
+    large_val = np.asarray(
+        [int(index) for index in large_plan.val_indices
+         if _curriculum_role_matches(str(large_roles[int(index)]), selected_mode)],
+        dtype=np.int64,
+    )
+    if float(sample_fraction) < 1.0:
+        large_train = _deterministic_subsample_indices(
+            large_train, sample_fraction, seed, f"{composite}:large-train:{selected_mode}"
+        )
+        large_val = _deterministic_subsample_indices(
+            large_val, sample_fraction, seed, f"{composite}:large-val:{selected_mode}"
+        )
+    if selected_mode == "response" and (large_train.size == 0 or large_val.size == 0):
+        raise ValueError("Composite response role has no train/validation records")
+    if selected_mode != "response" and (omat_train.size + large_train.size == 0):
+        raise ValueError("Composite stage has no training records")
+
+    elements = set(int(value) for value in large_plan.elements)
+    elements.update(
+        int(value) for value in metadata.get("omat24", {}).get("elements", [])
+    )
+    label_counts = dict(metadata.get("neo_large", {}).get("labels", {}))
+    omat_selected = int(omat_train.size + omat_val.size)
+    if selected_mode != "response":
+        for name in ("energy", "forces", "stress"):
+            label_counts[name] = int(label_counts.get(name, 0)) + omat_selected
+    split_info = {
+        "strategy": "composite_metadata_curriculum",
+        "curriculum_mode": selected_mode,
+        "train_structures": int(omat_train.size + large_train.size),
+        "val_structures": int(omat_val.size + large_val.size),
+        "train_omat24": int(omat_train.size),
+        "val_omat24": int(omat_val.size),
+        "train_large": int(large_train.size),
+        "val_large": int(large_val.size),
+        "test_structures_excluded": int(np.count_nonzero(split_codes == 2)),
+        "group_overlap": [],
+        "streaming": True,
+    }
+    return CompositeStreamPlan(
+        path=str(composite), omat_root=str(omat_root), source_files=source_files,
+        source_orders=source_orders, row_indices=row_indices, split_codes=split_codes,
+        omat_atom_counts=omat_atom_counts,
+        large_plan=large_plan, mode=selected_mode,
+        train_omat_indices=omat_train, val_omat_indices=omat_val,
+        train_large_indices=large_train, val_large_indices=large_val,
+        elements=tuple(sorted(elements)), label_counts={str(k): int(v) for k, v in label_counts.items()},
+        split_info=split_info,
+    )
+
+
+class CompositeAtomicDataDataset(Dataset):
+    """Random-access streamed graphs from OMat24 Parquet and Neo Large HDF5."""
+
+    def __init__(
+        self,
+        plan: CompositeStreamPlan,
+        omat_indices: Sequence[int],
+        large_indices: Sequence[int],
+        *,
+        z_table: AtomicNumberTable,
+        cutoff: float,
+    ) -> None:
+        self.plan = plan
+        self.omat_indices = np.asarray(omat_indices, dtype=np.int64)
+        self.large_indices = np.asarray(large_indices, dtype=np.int64)
+        self.z_table = z_table
+        self.cutoff = float(cutoff)
+        self._parquet_handles: Dict[int, Any] = {}
+        self._parquet_streams: Dict[int, Dict[str, Any]] = {}
+        self._large_handle = None
+        self._handle_pid: Optional[int] = None
+        self.curriculum_roles = np.concatenate([
+            np.full(self.omat_indices.size, "foundation", dtype=object),
+            np.full(self.large_indices.size, "response", dtype=object),
+        ])
+        self.atom_counts = np.concatenate([
+            plan.omat_atom_counts[self.omat_indices].astype(np.int64, copy=False),
+            (plan.large_plan.atom_ptr[self.large_indices + 1]
+             - plan.large_plan.atom_ptr[self.large_indices]).astype(np.int64, copy=False),
+        ])
+        self.edge_counts = None
+
+    def __len__(self) -> int:
+        return int(self.omat_indices.size + self.large_indices.size)
+
+    def _ensure_handles(self) -> None:
+        pid = os.getpid()
+        if self._handle_pid == pid and self._large_handle is not None:
+            return
+        self.close()
+        self._large_handle = h5py.File(self.plan.large_plan.path, "r")
+        self._handle_pid = pid
+
+    def _parquet_file(self, source_order: int) -> Any:
+        handle = self._parquet_handles.get(int(source_order))
+        if handle is None:
+            handle = _pyarrow_parquet.ParquetFile(
+                self.plan.source_files[int(source_order)]
+            )
+            self._parquet_handles[int(source_order)] = handle
+        return handle
+
+    def _parquet_row(self, source_order: int, row_index: int) -> Dict[str, Any]:
+        source = int(source_order)
+        target = int(row_index)
+        state = self._parquet_streams.get(source)
+        if state is None or target < int(state.get("batch_start", 0)):
+            state = {
+                "iterator": self._parquet_file(source).iter_batches(
+                    batch_size=2048, columns=list(OMAT24_PARQUET_COLUMNS)
+                ),
+                "next_start": 0,
+                "batch_start": 0,
+                "batch": None,
+            }
+            self._parquet_streams[source] = state
+        while True:
+            batch = state.get("batch")
+            start = int(state["batch_start"])
+            if batch is not None and start <= target < start + len(batch):
+                return batch.slice(target - start, 1).to_pylist()[0]
+            try:
+                batch = next(state["iterator"])
+            except StopIteration as exc:
+                raise IndexError(
+                    f"Parquet row {target} is outside source shard {source}"
+                ) from exc
+            state["batch_start"] = int(state["next_start"])
+            state["next_start"] = int(state["next_start"]) + len(batch)
+            state["batch"] = batch
+
+    def _configuration_at(self, position: int) -> Configuration:
+        if position < self.omat_indices.size:
+            selector = int(self.omat_indices[position])
+            source_order = int(self.plan.source_orders[selector])
+            row_index = int(self.plan.row_indices[selector])
+            row = self._parquet_row(source_order, row_index)
+            corpus_name = Path(self.plan.source_files[source_order]).parent.parent.name
+            return _omat24_configuration_from_row(row, corpus_name=corpus_name)
+        index = int(self.large_indices[position - self.omat_indices.size])
+        cfg = _read_hdf5_configuration_at(
+            self._large_handle, self.plan.large_plan, index, include_labels=True
+        )
+        role, curriculum = _large_curriculum_role(
+            self.plan.large_plan.label_masks, index
+        )
+        cfg.properties["dataset_role"] = role
+        cfg.properties["curriculum_role"] = curriculum
+        if self.plan.mode in {"response", "joint"} and "energy" in cfg.properties:
+            cfg.property_weights["energy"] = 0.0
+        return cfg
+
+    def __getitem__(self, item: int) -> AtomicData:
+        self._ensure_handles()
+        position = int(item)
+        return AtomicData.from_config(
+            self._configuration_at(position),
+            z_table=self.z_table,
+            cutoff=self.cutoff,
+        )
+
+    def __getitems__(self, items: Sequence[int]) -> List[AtomicData]:
+        self._ensure_handles()
+        return [
+            AtomicData.from_config(
+                self._configuration_at(int(item)),
+                z_table=self.z_table,
+                cutoff=self.cutoff,
+            )
+            for item in items
+        ]
+
+    def close(self) -> None:
+        if self._large_handle is not None:
+            try:
+                self._large_handle.close()
+            except Exception:
+                pass
+        self._large_handle = None
+        self._parquet_handles.clear()
+        self._parquet_streams.clear()
+        self._handle_pid = None
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_parquet_handles"] = {}
+        state["_parquet_streams"] = {}
+        state["_large_handle"] = None
+        state["_handle_pid"] = None
+        return state
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def fit_atomic_energies_from_composite_plan(
+    plan: CompositeStreamPlan,
+    zs: Sequence[int],
+    *,
+    max_samples: int = 1_000_000,
+) -> np.ndarray:
+    """Fit stable element references from a deterministic bounded composite sample."""
+    z_to_col = {int(value): index for index, value in enumerate(zs)}
+    normal = np.zeros((len(zs), len(zs)), dtype=np.float64)
+    rhs = np.zeros((len(zs),), dtype=np.float64)
+    with h5py.File(plan.path, "r") as handle:
+        reference = handle["atomic_reference"]
+        source_elements = np.asarray(reference["elements"][:], dtype=np.int16)
+        source_normal = np.asarray(reference["normal_matrix"][:], dtype=np.float64)
+        source_rhs = np.asarray(reference["rhs"][:], dtype=np.float64)
+    for source_row, atomic_number in enumerate(source_elements):
+        target_row = z_to_col.get(int(atomic_number))
+        if target_row is None:
+            continue
+        rhs[target_row] = source_rhs[source_row]
+        for source_column, other_number in enumerate(source_elements):
+            target_column = z_to_col.get(int(other_number))
+            if target_column is not None:
+                normal[target_row, target_column] = source_normal[
+                    source_row, source_column
+                ]
+    ridge = 1e-8 * max(1.0, float(np.trace(normal)) / max(1, len(zs)))
+    try:
+        return np.linalg.solve(normal + ridge * np.eye(len(zs)), rhs)
+    except np.linalg.LinAlgError:
+        return np.linalg.lstsq(normal + ridge * np.eye(len(zs)), rhs, rcond=None)[0]
+
+
 class _ThreadPrefetchLoader:
     """Overlap bounded CPU/HDF5 batch assembly with accelerator execution."""
 
@@ -3187,155 +3283,6 @@ class _ThreadPrefetchLoader:
             worker.join(timeout=2.0)
 
 
-def extxyz_to_hdf5(
-    input_path: str,
-    output_path: str,
-    *,
-    keys: Optional[DatasetKeys] = None,
-    overwrite: bool = False,
-    max_frames: Optional[int] = None,
-) -> str:
-    configs, _fields = load_extxyz_configurations(
-        input_path,
-        keys or DatasetKeys(),
-        require_energy=False,
-        require_forces=False,
-        require_field=False,
-        max_frames=max_frames,
-    )
-    split_diagnostics = assign_stable_group_splits(configs)
-    return write_hdf5_dataset(
-        configs,
-        output_path,
-        metadata={
-            "source_path": str(Path(input_path).resolve()),
-            "source_sha256": sha256_file(input_path),
-            "split_diagnostics": split_diagnostics,
-        },
-        overwrite=overwrite,
-    )
-
-
-def rebuild_qm7x_hdf5(
-    raw_path: str,
-    output_path: str,
-    *,
-    max_frames: Optional[int] = None,
-    overwrite: bool = False,
-) -> str:
-    """Rebuild QM7-X without the undocumented polarizability scaling in old extXYZ files."""
-    if not HAS_H5PY:
-        raise RuntimeError("QM7-X conversion requires h5py")
-    bohr_to_ang = 0.529177210903
-    hartree_bohr6_to_ev_ang6 = 27.211386245988 * bohr_to_ang**6
-    raw_file = Path(raw_path).expanduser().resolve()
-
-    def sample_references(raw: Any) -> List[Tuple[str, str]]:
-        molecule_ids = sorted(
-            (str(name) for name in raw.keys()),
-            key=lambda value: int(value) if value.isdigit() else value,
-        )
-        if max_frames is None:
-            return [
-                (molecule_id, str(conformer_id))
-                for molecule_id in molecule_ids
-                for conformer_id in sorted(raw[molecule_id].keys())
-            ]
-        conformer_lists = {
-            molecule_id: sorted(str(name) for name in raw[molecule_id].keys())
-            for molecule_id in molecule_ids
-        }
-        references: List[Tuple[str, str]] = []
-        conformer_index = 0
-        while len(references) < max(0, int(max_frames)):
-            added = False
-            for molecule_id in molecule_ids:
-                conformers = conformer_lists[molecule_id]
-                if conformer_index >= len(conformers):
-                    continue
-                references.append((molecule_id, conformers[conformer_index]))
-                added = True
-                if len(references) >= int(max_frames):
-                    break
-            if not added:
-                break
-            conformer_index += 1
-        return references
-
-    def configurations() -> Iterable[Configuration]:
-        with h5py.File(raw_file, "r") as raw:
-            for molecule_id, conformer_id in sample_references(raw):
-                sample = raw[molecule_id][conformer_id]
-                base_energy = float(np.asarray(sample["ePBE0"]).reshape(-1)[0])
-                dispersion_energy = float(np.asarray(sample["eMBD"]).reshape(-1)[0])
-                total_energy = float(np.asarray(sample["ePBE0+MBD"]).reshape(-1)[0])
-                props: Dict[str, Any] = {
-                    "energy": total_energy,
-                    "energy_base": base_energy,
-                    "energy_dispersion": dispersion_energy,
-                    "forces": np.asarray(sample["totFOR"], dtype=float),
-                    "forces_base": np.asarray(sample["pbe0FOR"], dtype=float),
-                    "forces_dispersion": np.asarray(sample["vdwFOR"], dtype=float),
-                    "field": np.zeros(3, dtype=float),
-                    "dipole": np.asarray(sample["vDIP"], dtype=float).reshape(3),
-                    "polarizability": np.asarray(sample["mTPOL"], dtype=float).reshape(3, 3)
-                    * bohr_to_ang**3,
-                    "charges": np.asarray(sample["hCHG"], dtype=float).reshape(-1),
-                    "atomic_dipoles": np.asarray(sample["hVDIP"], dtype=float).reshape(-1, 3)
-                    * bohr_to_ang,
-                    "atomic_polarizability": np.eye(3)[None, :, :]
-                    * (
-                        np.asarray(sample["atPOL"], dtype=float).reshape(-1, 1, 1)
-                        * bohr_to_ang**3
-                    ),
-                    "c6": np.asarray(sample["atC6"], dtype=float).reshape(-1)
-                    * hartree_bohr6_to_ev_ang6,
-                    "total_charge": 0.0,
-                    "source": "QM7-X",
-                    "method_id": "PBE0+MBD",
-                    "system_id": molecule_id,
-                    "group_id": f"QM7-X:{molecule_id}",
-                    "sample_id": f"QM7-X:{molecule_id}:{conformer_id}",
-                    "parent_id": molecule_id,
-                    "domain": "molecular",
-                    "energy_reference": "QM7-X:PBE0+MBD:absolute",
-                    "provenance_id": f"QM7-X:{molecule_id}/{conformer_id}",
-                }
-                props["split"] = stable_split(props["group_id"])
-                cfg = Configuration(
-                    atomic_numbers=np.asarray(sample["atNUM"], dtype=int).reshape(-1),
-                    positions=np.asarray(sample["atXYZ"], dtype=float).reshape(-1, 3),
-                    properties=props,
-                    property_weights={
-                        name: 1.0
-                        for name in props
-                        if name in HDF5_STRUCTURE_LABELS or name in HDF5_ATOM_LABELS
-                    },
-                    cell=np.eye(3) * 100.0,
-                    pbc=(False, False, False),
-                    config_type="QM7-X",
-                    head="QM7-X:PBE0+MBD",
-                )
-                _validate_configuration(cfg, context=f"QM7-X/{molecule_id}/{conformer_id}")
-                yield cfg
-
-    return write_hdf5_dataset_stream(
-        configurations(),
-        output_path,
-        metadata={
-            "dataset": "QM7-X",
-            "raw_path": str(raw_file),
-            "raw_sha256": sha256_file(str(raw_file)),
-            "polarizability_conversion": "bohr^3 to angstrom^3",
-            "atomic_dipole_conversion": "hVDIP e*bohr multiplied by 0.529177210903",
-            "c6_conversion": "Hartree*bohr^6 to eV*angstrom^6",
-            "energy_semantics": "energy=ePBE0+MBD; energy_base=ePBE0; energy_dispersion=eMBD",
-            "force_semantics": "forces=totFOR; forces_base=pbe0FOR; forces_dispersion=vdwFOR",
-            "split_strategy": "stable hash of QM7-X molecule id",
-        },
-        overwrite=overwrite,
-    )
-
 
 def _validate_configuration(cfg: Configuration, *, context: str) -> None:
     atomic_numbers = np.asarray(cfg.atomic_numbers, dtype=int).reshape(-1)
@@ -3355,3504 +3302,264 @@ def _validate_configuration(cfg: Configuration, *, context: str) -> None:
             raise ValueError(f"{context}: label {name!r} contains non-finite values")
 
 
-def _iter_extxyz_records(
-    path: str,
-    *,
-    start_index: int = 0,
-    end_index: Optional[int] = None,
-    selected_indices: Optional[set] = None,
-) -> Iterable[Tuple[int, Dict[str, Any], np.ndarray, np.ndarray, Dict[str, np.ndarray]]]:
-    """Yield selected extXYZ frames without retaining the rest of the file."""
-    first = max(0, int(start_index))
-    last = None if end_index is None else max(first, int(end_index))
-    selected = None if selected_indices is None else {int(value) for value in selected_indices}
-    with _open_text(str(Path(path).expanduser())) as handle:
-        frame_index = 0
-        while True:
-            line = handle.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            atom_count = int(line)
-            comment = handle.readline()
-            if not comment:
-                raise EOFError(f"Truncated extXYZ comment at frame {frame_index}: {path}")
-            wanted = frame_index >= first and (last is None or frame_index < last)
-            if wanted and selected is not None:
-                wanted = frame_index in selected
-            if not wanted:
-                for _ in range(atom_count):
-                    if not handle.readline():
-                        raise EOFError(
-                            f"Truncated extXYZ atom block at frame {frame_index}: {path}"
-                        )
-                frame_index += 1
-                if last is not None and frame_index >= last:
-                    break
-                continue
-            rows = [handle.readline() for _ in range(atom_count)]
-            if any(not row for row in rows):
-                raise EOFError(f"Truncated extXYZ atom block at frame {frame_index}: {path}")
-            if wanted:
-                try:
-                    info = key_val_str_to_dict(comment.strip()) if "=" in comment else {}
-                except Exception as exc:
-                    raise ValueError(f"Cannot parse extXYZ comment at frame {frame_index}") from exc
-                properties = _parse_properties_spec(
-                    info.get("Properties", "species:S:1:pos:R:3")
-                )
-                symbols: List[str] = []
-                explicit_numbers: List[int] = []
-                positions = np.zeros((atom_count, 3), dtype=float)
-                arrays: Dict[str, np.ndarray] = {}
-                aliases: Dict[str, Tuple[set, Optional[int]]] = {
-                    "forces": ({"forces", "force", "F"}, 3),
-                    "charges": ({"charges", "charge", "q", "hCHG"}, 1),
-                    "atomic_dipoles": ({"atomic_dipoles", "hVDIP"}, 3),
-                    "atomic_polarizability": ({"atomic_polarizability", "atPOL"}, None),
-                    "c6": ({"c6", "C6", "atC6"}, 1),
-                    "bec": ({"bec", "BEC"}, 9),
-                    "spins": ({"spins", "spin"}, 3),
-                    "magnetic_moments": ({"magmoms", "magmom", "magnetic_moments"}, None),
-                    "effective_field": ({"effective_field", "spin_field"}, 3),
-                }
-                for atom_index, row in enumerate(rows):
-                    tokens = row.split()
-                    cursor = 0
-                    for name, _type, width in properties:
-                        values = tokens[cursor : cursor + width]
-                        cursor += width
-                        if len(values) != width:
-                            raise ValueError(
-                                f"Frame {frame_index} atom {atom_index}: short {name!r} field"
-                            )
-                        if name in ("species", "symbol") and width == 1:
-                            symbols.append(str(values[0]).capitalize())
-                        elif name in ("Z", "atomic_number", "atomic_numbers") and width == 1:
-                            explicit_numbers.append(int(float(values[0])))
-                        elif name in ("pos", "positions") and width == 3:
-                            positions[atom_index] = [float(value) for value in values]
-                        else:
-                            for canonical, (names, expected_width) in aliases.items():
-                                if name not in names or (
-                                    expected_width is not None and width != expected_width
-                                ):
-                                    continue
-                                if canonical not in arrays:
-                                    arrays[canonical] = np.zeros((atom_count, width), dtype=float)
-                                arrays[canonical][atom_index] = [float(value) for value in values]
-                                break
-                    if cursor != len(tokens):
-                        raise ValueError(
-                            f"Frame {frame_index} atom {atom_index}: Properties consumes "
-                            f"{cursor} of {len(tokens)} columns"
-                        )
-                if explicit_numbers:
-                    numbers = np.asarray(explicit_numbers, dtype=int)
-                else:
-                    numbers = np.asarray(
-                        [ASE_ATOMIC_NUMBERS[symbol] for symbol in symbols], dtype=int
-                    )
-                if "bec" in arrays:
-                    arrays["bec"] = arrays["bec"].reshape(atom_count, 3, 3)
-                if "atomic_polarizability" in arrays:
-                    value = arrays["atomic_polarizability"]
-                    if value.shape[1] == 9:
-                        arrays["atomic_polarizability"] = value.reshape(atom_count, 3, 3)
-                    elif value.shape[1] == 1:
-                        arrays["atomic_polarizability"] = (
-                            np.eye(3)[None, :, :] * value.reshape(atom_count, 1, 1)
-                        )
-                yield frame_index, info, numbers, positions, arrays
-            frame_index += 1
-            if last is not None and frame_index >= last:
-                break
 
-
-def _configuration_from_extxyz_record(
-    frame_index: int,
-    info: Dict[str, Any],
-    atomic_numbers: np.ndarray,
-    positions: np.ndarray,
-    arrays: Dict[str, np.ndarray],
-) -> Configuration:
-    props: Dict[str, Any] = {}
-    weights: Dict[str, float] = {}
-    if "energy" in info:
-        props["energy"] = float(info["energy"])
-        weights["energy"] = 1.0
-    if "forces" in arrays:
-        props["forces"] = np.asarray(arrays["forces"], dtype=float).reshape(-1, 3)
-        weights["forces"] = 1.0
-    if "field" in info:
-        props["field"] = parse_vector3(info["field"], name="field")
-        weights["field"] = 1.0
-    if "dipole" in info:
-        props["dipole"] = parse_vector3(info["dipole"], name="dipole")
-        weights["dipole"] = 1.0
-    if "polarizability" in info:
-        props["polarizability"] = parse_matrix3x3(
-            info["polarizability"], name="polarizability"
-        )
-        weights["polarizability"] = 1.0
-    if "total_charge" in info:
-        props["total_charge"] = float(info["total_charge"])
-        weights["total_charge"] = 1.0
-    for name in HDF5_ATOM_LABELS:
-        if name in arrays:
-            value = np.asarray(arrays[name], dtype=float)
-            if name in ("charges", "c6"):
-                value = value.reshape(-1)
-            elif name == "magnetic_moments" and value.shape[1] == 1:
-                value = np.pad(value, ((0, 0), (0, 2)))
-            props[name] = value
-            weights[name] = 1.0
-    if "Lattice" in info:
-        cell = np.asarray(info["Lattice"], dtype=float).reshape(3, 3)
-        pbc = _parse_pbc(info.get("pbc", (True, True, True)))
-    else:
-        cell = np.eye(3, dtype=float) * 100.0
-        pbc = _parse_pbc(info.get("pbc", (False, False, False)))
-    return Configuration(
-        atomic_numbers=np.asarray(atomic_numbers, dtype=int).reshape(-1),
-        positions=np.asarray(positions, dtype=float).reshape(-1, 3),
-        properties=props,
-        property_weights=weights,
-        cell=cell,
-        pbc=pbc,
-        config_type="extXYZ",
-        head="Default",
-    )
-
-
-def _geometry_group_hash(cfg: Configuration, *, decimals: int = 7) -> str:
-    digest = hashlib.sha256()
-    digest.update(np.asarray(cfg.atomic_numbers, dtype=np.int16).reshape(-1).tobytes())
-    digest.update(np.round(np.asarray(cfg.positions, dtype=np.float64), decimals).tobytes())
-    digest.update(np.round(np.asarray(cfg.cell, dtype=np.float64), decimals).tobytes())
-    digest.update(np.asarray(cfg.pbc, dtype=np.bool_).tobytes())
-    return digest.hexdigest()
-
-
-def _so3lr_parent_id(dataset_name: str, sample_id: str) -> str:
-    if dataset_name == "DES15K":
-        match = re.match(r"^(DES15K-\d+)(?:-\d+)?$", sample_id)
-        return match.group(1) if match else sample_id
-    if dataset_name == "TorsionNet500":
-        match = re.match(r"^(fragment_\d+)_conf_\d+$", sample_id)
-        return match.group(1) if match else sample_id
-    if dataset_name == "SPICE_dipeptides":
-        match = re.match(r"^([A-Z]{3}-[A-Z]{3})\d+$", sample_id)
-        return match.group(1) if match else sample_id
-    return sample_id
-
-
-def _finite_float(value: Any) -> Optional[float]:
-    """Return a finite float, treating dataset sentinels such as ``na`` as absent."""
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if math.isfinite(result) else None
-
-
-def _iter_json_array(path: str, *, chunk_size: int = 1024 * 1024) -> Iterable[Dict[str, Any]]:
-    """Stream a top-level JSON array while accepting non-standard NaN tokens.
-
-    Several official materials archives are large JSON arrays emitted by the
-    standard Python encoder with ``allow_nan=True``.  ``ijson`` rejects those
-    files, whereas ``json.JSONDecoder`` applies the same NaN semantics as the
-    producer and can still be used with bounded memory through ``raw_decode``.
-    """
-    decoder = json.JSONDecoder()
-    buffer = ""
-    started = False
-    eof = False
-    with Path(path).expanduser().open("r", encoding="utf-8") as handle:
-        while True:
-            if not eof:
-                part = handle.read(max(4096, int(chunk_size)))
-                eof = not part
-                buffer += part
-            cursor = 0
-            if not started:
-                while cursor < len(buffer) and buffer[cursor].isspace():
-                    cursor += 1
-                if cursor >= len(buffer):
-                    if eof:
-                        raise ValueError(f"Empty JSON archive: {path}")
-                    continue
-                if buffer[cursor] != "[":
-                    raise ValueError(f"Expected a top-level JSON array: {path}")
-                cursor += 1
-                started = True
-            decoded = False
-            while True:
-                while cursor < len(buffer) and (
-                    buffer[cursor].isspace() or buffer[cursor] == ","
-                ):
-                    cursor += 1
-                if cursor < len(buffer) and buffer[cursor] == "]":
-                    return
-                if cursor >= len(buffer):
-                    break
-                try:
-                    value, end = decoder.raw_decode(buffer, cursor)
-                except json.JSONDecodeError:
-                    break
-                if not isinstance(value, dict):
-                    raise ValueError(f"Expected JSON objects in array: {path}")
-                yield value
-                cursor = end
-                decoded = True
-            buffer = buffer[cursor:]
-            if eof:
-                raise ValueError(f"Truncated JSON archive: {path}")
-            if not decoded and len(buffer) > 128 * 1024 * 1024:
-                raise ValueError(f"One JSON record is unexpectedly large: {path}")
-
-
-def extract_verified_zip_member(
-    archive_path: str,
-    output_directory: str,
-    *,
-    expected_md5: Optional[str] = None,
-    member: Optional[str] = None,
-    overwrite: bool = False,
-) -> str:
-    """Verify and safely extract one regular file from a downloaded ZIP."""
-    archive = Path(archive_path).expanduser().resolve()
-    if expected_md5:
-        digest = hashlib.md5(archive.read_bytes()).hexdigest()
-        if digest.lower() != str(expected_md5).lower():
-            raise ValueError(
-                f"MD5 mismatch for {archive}: expected {expected_md5}, got {digest}"
-            )
-    root = Path(output_directory).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive, "r") as zipped:
-        regular = [
-            info for info in zipped.infolist()
-            if not info.is_dir() and not Path(info.filename).is_absolute()
-        ]
-        if member is None:
-            if len(regular) != 1:
-                raise ValueError("ZIP contains multiple files; specify the member name")
-            info = regular[0]
-        else:
-            matches = [info for info in regular if info.filename == member]
-            if len(matches) != 1:
-                raise KeyError(f"ZIP member not found: {member}")
-            info = matches[0]
-        if ".." in Path(info.filename).parts:
-            raise ValueError(f"Unsafe ZIP member path: {info.filename}")
-        destination = root / Path(info.filename).name
-        if destination.exists() and not overwrite:
-            raise FileExistsError(f"Refusing to overwrite extracted file: {destination}")
-        temporary = destination.with_name(destination.name + ".extracting")
-        with zipped.open(info, "r") as source, temporary.open("wb") as target:
-            while True:
-                chunk = source.read(8 * 1024 * 1024)
-                if not chunk:
-                    break
-                target.write(chunk)
-        temporary.replace(destination)
-    return str(destination)
-
-
-def scan_jarvis_multi_element_candidates(
-    raw_json: str,
-    index_path: str,
-    *,
-    min_elements: int = 2,
-    max_atoms: int = 160,
-    log: Callable[[str], None] = print,
-) -> Dict[str, Any]:
-    """Index physically valid complex structures in the official JARVIS-DFT JSON."""
-    output = Path(index_path).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".building")
-    scanned = 0
-    eligible = 0
-    strata: Dict[str, int] = {}
-    elements: Dict[str, int] = {}
-    property_counts: Dict[str, int] = {}
-    with temporary.open("w", encoding="utf-8") as writer:
-        for record in _iter_json_array(raw_json):
-            scanned += 1
-            atoms = dict(record.get("atoms") or {})
-            symbols = [str(value) for value in atoms.get("elements") or []]
-            coordinates = np.asarray(atoms.get("coords") or [], dtype=float)
-            lattice = np.asarray(atoms.get("lattice_mat") or [], dtype=float)
-            unique = sorted(set(symbols), key=lambda value: ASE_ATOMIC_NUMBERS.get(value, 999))
-            energy_per_atom = _finite_float(record.get("optb88vdw_total_energy"))
-            if (
-                len(unique) < int(min_elements)
-                or not symbols
-                or len(symbols) > int(max_atoms)
-                or any(value not in ASE_ATOMIC_NUMBERS for value in unique)
-                or coordinates.shape != (len(symbols), 3)
-                or lattice.shape != (3, 3)
-                or not np.isfinite(coordinates).all()
-                or not np.isfinite(lattice).all()
-                or abs(float(np.linalg.det(lattice))) <= 1e-8
-                or energy_per_atom is None
-            ):
-                continue
-            complexity = (
-                "binary" if len(unique) == 2
-                else "ternary" if len(unique) == 3
-                else "quaternary+"
-            )
-            size_class = (
-                "small" if len(symbols) <= 24
-                else "medium" if len(symbols) <= 64
-                else "large"
-            )
-            stratum = f"{complexity}|{size_class}"
-            available = ["energy"]
-            if _finite_float(record.get("magmom_outcar")) is not None:
-                available.append("total_magnetic_moment_metadata")
-            if all(_finite_float(record.get(name)) is not None for name in ("epsx", "epsy", "epsz")):
-                available.append("dielectric_diagonal_metadata")
-            descriptor = {
-                "jid": str(record.get("jid")),
-                "formula": str(record.get("formula", "unknown")),
-                "atom_count": len(symbols),
-                "elements": unique,
-                "element_count": len(unique),
-                "stratum": stratum,
-                "available_properties": available,
-                "rank": hashlib.sha256(
-                    f"neo-jarvis|{record.get('jid')}|{record.get('formula')}".encode()
-                ).hexdigest(),
-            }
-            writer.write(json.dumps(descriptor, sort_keys=True) + "\n")
-            eligible += 1
-            strata[stratum] = strata.get(stratum, 0) + 1
-            for symbol in unique:
-                elements[symbol] = elements.get(symbol, 0) + 1
-            for name in available:
-                property_counts[name] = property_counts.get(name, 0) + 1
-            if scanned % 20000 == 0:
-                log(f"[{_now()}] JARVIS scan: records={scanned} eligible={eligible}")
-    temporary.replace(output)
-    return {
-        "source": str(Path(raw_json).expanduser().resolve()),
-        "records_scanned": scanned,
-        "eligible_multi_element_structures": eligible,
-        "min_elements": int(min_elements),
-        "max_atoms": int(max_atoms),
-        "strata": dict(sorted(strata.items())),
-        "elements": dict(sorted(elements.items(), key=lambda item: ASE_ATOMIC_NUMBERS[item[0]])),
-        "available_property_counts": dict(sorted(property_counts.items())),
-        "index_path": str(output),
-        "index_sha256": sha256_file(str(output)),
-    }
-
-
-def select_jarvis_multi_element_candidates(
-    index_path: str,
-    selection_path: str,
-    *,
-    target_structures: int = 24000,
-) -> Dict[str, Any]:
-    """Select a deterministic complexity/size-balanced JARVIS subset."""
-    candidates = [
-        json.loads(line)
-        for line in Path(index_path).expanduser().read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    target = min(max(0, int(target_structures)), len(candidates))
-    selected: List[Dict[str, Any]] = []
-    selected_ids: set = set()
-
-    element_frequency: Dict[str, int] = {}
-    for item in candidates:
-        for symbol in item["elements"]:
-            element_frequency[symbol] = element_frequency.get(symbol, 0) + 1
-    for symbol in sorted(
-        element_frequency,
-        key=lambda value: (element_frequency[value], ASE_ATOMIC_NUMBERS[value]),
-    ):
-        choices = sorted(
-            (item for item in candidates if symbol in item["elements"]),
-            key=lambda item: str(item["rank"]),
-        )
-        if choices and choices[0]["jid"] not in selected_ids:
-            selected.append(choices[0])
-            selected_ids.add(choices[0]["jid"])
-
-    by_stratum: Dict[str, List[Dict[str, Any]]] = {}
-    for item in candidates:
-        if item["jid"] not in selected_ids:
-            by_stratum.setdefault(str(item["stratum"]), []).append(item)
-    for values in by_stratum.values():
-        values.sort(key=lambda item: str(item["rank"]))
-    strata = sorted(by_stratum)
-    cursors = {name: 0 for name in strata}
-    while len(selected) < target:
-        progress = False
-        for stratum in strata:
-            cursor = cursors[stratum]
-            values = by_stratum[stratum]
-            while cursor < len(values) and values[cursor]["jid"] in selected_ids:
-                cursor += 1
-            cursors[stratum] = cursor
-            if cursor >= len(values):
-                continue
-            item = values[cursor]
-            cursors[stratum] = cursor + 1
-            selected.append(item)
-            selected_ids.add(item["jid"])
-            progress = True
-            if len(selected) >= target:
-                break
-        if not progress:
-            break
-    selected.sort(key=lambda item: str(item["jid"]))
-    output = Path(selection_path).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        "".join(json.dumps(item, sort_keys=True) + "\n" for item in selected),
-        encoding="utf-8",
-    )
-    return {
-        "selected_structures": len(selected),
-        "selected_materials": len(selected_ids),
-        "selection_path": str(output),
-        "selection_sha256": sha256_file(str(output)),
-        "strata": dict(sorted(collections.Counter(item["stratum"] for item in selected).items())),
-        "elements": sorted(
-            {symbol for item in selected for symbol in item["elements"]},
-            key=lambda value: ASE_ATOMIC_NUMBERS[value],
-        ),
-    }
-
-
-def rebuild_jarvis_multi_element_hdf5(
-    raw_json: str,
-    selection_path: str,
-    output_path: str,
-    *,
-    overwrite: bool = False,
-) -> str:
-    """Build a JARVIS OptB88vdW energy shard without inventing atom-wise labels."""
-    selected = {
-        str(item["jid"]): item
-        for item in (
-            json.loads(line)
-            for line in Path(selection_path).expanduser().read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        )
-    }
-    decoded = 0
-
-    def configurations() -> Iterable[Configuration]:
-        nonlocal decoded
-        for record in _iter_json_array(raw_json):
-            jid = str(record.get("jid"))
-            descriptor = selected.get(jid)
-            if descriptor is None:
-                continue
-            atoms = dict(record["atoms"])
-            symbols = [str(value) for value in atoms["elements"]]
-            energy_per_atom = _finite_float(record.get("optb88vdw_total_energy"))
-            if energy_per_atom is None:
-                raise ValueError(f"Selected JARVIS record has no finite energy: {jid}")
-            props: Dict[str, Any] = {
-                # JARVIS stores OptB88vdW energy per atom; the model target is total energy.
-                "energy": float(energy_per_atom) * len(symbols),
-                "source": "JARVIS-DFT-3D-v2025.09",
-                "method_id": "VASP-OptB88vdW",
-                "system_id": jid,
-                "group_id": f"JARVIS:{jid}",
-                "sample_id": f"JARVIS:{jid}",
-                "parent_id": jid,
-                "domain": "periodic",
-                "energy_reference": "JARVIS:OptB88vdW:absolute",
-                "provenance_id": f"figshare:10.6084/m9.figshare.6815699.v11#{jid}",
-            }
-            props["split"] = stable_split(props["group_id"])
-            cfg = Configuration(
-                atomic_numbers=np.asarray([ASE_ATOMIC_NUMBERS[value] for value in symbols], dtype=int),
-                positions=np.asarray(atoms["coords"], dtype=float).reshape(-1, 3),
-                properties=props,
-                property_weights={"energy": 1.0},
-                cell=np.asarray(atoms["lattice_mat"], dtype=float).reshape(3, 3),
-                pbc=(True, True, True),
-                config_type="JARVIS-DFT-3D",
-                head="JARVIS:VASP-OptB88vdW",
-            )
-            _validate_configuration(cfg, context=f"JARVIS/{jid}")
-            decoded += 1
-            yield cfg
-        if decoded != len(selected):
-            raise ValueError(f"Decoded {decoded} JARVIS structures, expected {len(selected)}")
-
-    return write_hdf5_dataset_stream(
-        configurations(),
-        output_path,
-        metadata={
-            "dataset": "JARVIS-DFT 3D complex multi-element subset",
-            "raw_path": str(Path(raw_json).expanduser().resolve()),
-            "raw_sha256": sha256_file(raw_json),
-            "selection_path": str(Path(selection_path).expanduser().resolve()),
-            "selection_sha256": sha256_file(selection_path),
-            "figshare_article": "10.6084/m9.figshare.6815699.v11",
-            "figshare_file_id": 64391379,
-            "license": "CC-BY-4.0",
-            "energy_conversion": "optb88vdw_total_energy (eV/atom) multiplied by atom count",
-            "explicitly_absent_labels": [
-                "forces", "charges", "polarizability", "magnetic_moments", "spins"
-            ],
-            "metadata_not_mapped_to_model_targets": [
-                "magmom_outcar (structure total, not atom-wise)",
-                "epsx/epsy/epsz (dimensionless dielectric response, not molecular polarizability)",
-            ],
-        },
-        overwrite=overwrite,
-    )
-
-
-def select_jarvis_dfpt_candidates(
-    raw_json: str,
-    selection_path: str,
-    *,
-    target_structures: int = 300,
-    min_elements: int = 2,
-    max_atoms: int = 80,
-) -> Dict[str, Any]:
-    """Select complex JARVIS records that expose an official DFPT raw archive."""
-    candidates: List[Dict[str, Any]] = []
-    for record in _iter_json_array(raw_json):
-        atoms = dict(record.get("atoms") or {})
-        symbols = [str(value) for value in atoms.get("elements") or []]
-        unique = sorted(set(symbols), key=lambda value: ASE_ATOMIC_NUMBERS.get(value, 999))
-        if (
-            len(unique) < int(min_elements)
-            or not symbols
-            or len(symbols) > int(max_atoms)
-            or any(value not in ASE_ATOMIC_NUMBERS for value in unique)
-        ):
-            continue
-        archive_url = None
-        archive_name = None
-        for raw_file in record.get("raw_files") or []:
-            if not isinstance(raw_file, str) or not raw_file.startswith("DFPT,"):
-                continue
-            parts = raw_file.split(",", 2)
-            if len(parts) == 3 and parts[2].startswith("https://"):
-                archive_name, archive_url = parts[1], parts[2]
-                break
-        if archive_url is None:
-            continue
-        complexity = (
-            "binary" if len(unique) == 2
-            else "ternary" if len(unique) == 3
-            else "quaternary+"
-        )
-        size_class = "small" if len(symbols) <= 24 else "medium"
-        candidates.append({
-            "jid": str(record["jid"]),
-            "formula": str(record.get("formula", "unknown")),
-            "atom_count": len(symbols),
-            "elements": unique,
-            "element_count": len(unique),
-            "stratum": f"{complexity}|{size_class}",
-            "archive_name": str(archive_name),
-            "archive_url": str(archive_url),
-            "rank": hashlib.sha256(f"neo-jarvis-dfpt|{record['jid']}".encode()).hexdigest(),
-        })
-    target = min(max(0, int(target_structures)), len(candidates))
-    by_stratum: Dict[str, List[Dict[str, Any]]] = {}
-    for item in candidates:
-        by_stratum.setdefault(item["stratum"], []).append(item)
-    for values in by_stratum.values():
-        values.sort(key=lambda item: str(item["rank"]))
-    selected: List[Dict[str, Any]] = []
-    cursor = 0
-    strata = sorted(by_stratum)
-    while len(selected) < target:
-        progress = False
-        for stratum in strata:
-            values = by_stratum[stratum]
-            if cursor >= len(values):
-                continue
-            selected.append(values[cursor])
-            progress = True
-            if len(selected) >= target:
-                break
-        if not progress:
-            break
-        cursor += 1
-    selected.sort(key=lambda item: str(item["jid"]))
-    output = Path(selection_path).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        "".join(json.dumps(item, sort_keys=True) + "\n" for item in selected),
-        encoding="utf-8",
-    )
-    return {
-        "candidate_structures": len(candidates),
-        "selected_structures": len(selected),
-        "selection_path": str(output),
-        "selection_sha256": sha256_file(str(output)),
-        "strata": dict(sorted(collections.Counter(item["stratum"] for item in selected).items())),
-        "elements": sorted(
-            {symbol for item in selected for symbol in item["elements"]},
-            key=lambda value: ASE_ATOMIC_NUMBERS[value],
-        ),
-    }
-
-
-def download_jarvis_dfpt_archives(
-    selection_path: str,
-    output_directory: str,
-    *,
-    proxy: Optional[str] = None,
-    retries: int = 4,
-    log: Callable[[str], None] = print,
-) -> Dict[str, Any]:
-    """Resume-download selected JARVIS DFPT archives and record SHA256 provenance."""
-    root = Path(output_directory).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    selections = [
-        json.loads(line)
-        for line in Path(selection_path).expanduser().read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy else urllib.request.ProxyHandler()
-    )
-    completed: List[Dict[str, Any]] = []
-    failures: List[Dict[str, str]] = []
-    for index, item in enumerate(selections, start=1):
-        destination = root / f"{item['jid']}.zip"
-        temporary = destination.with_name(destination.name + ".part")
-        if destination.is_file() and zipfile.is_zipfile(destination):
-            completed.append({
-                "jid": item["jid"], "path": str(destination),
-                "bytes": destination.stat().st_size, "sha256": sha256_file(str(destination)),
-                "url": item["archive_url"],
-            })
-            continue
-        error = "unknown download failure"
-        for attempt in range(max(1, int(retries))):
-            try:
-                offset = temporary.stat().st_size if temporary.exists() else 0
-                headers = {"User-Agent": "E3MU-Neo-Dataset/1.0"}
-                if offset:
-                    headers["Range"] = f"bytes={offset}-"
-                with opener.open(urllib.request.Request(item["archive_url"], headers=headers), timeout=120) as response:
-                    append = offset > 0 and int(getattr(response, "status", 200)) == 206
-                    with temporary.open("ab" if append else "wb") as handle:
-                        while True:
-                            chunk = response.read(8 * 1024 * 1024)
-                            if not chunk:
-                                break
-                            handle.write(chunk)
-                if not zipfile.is_zipfile(temporary):
-                    raise ValueError("downloaded file is not a complete ZIP archive")
-                temporary.replace(destination)
-                completed.append({
-                    "jid": item["jid"], "path": str(destination),
-                    "bytes": destination.stat().st_size, "sha256": sha256_file(str(destination)),
-                    "url": item["archive_url"],
-                })
-                error = ""
-                break
-            except Exception as exc:
-                error = str(exc)
-                time.sleep(min(8, 2 ** attempt))
-        if error:
-            failures.append({"jid": str(item["jid"]), "error": error})
-        if index % 10 == 0 or index == len(selections):
-            log(
-                f"[{_now()}] JARVIS DFPT download: {index}/{len(selections)} "
-                f"complete={len(completed)} failed={len(failures)}"
-            )
-    return {
-        "selection_path": str(Path(selection_path).expanduser().resolve()),
-        "output_directory": str(root),
-        "completed": completed,
-        "failures": failures,
-        "total_bytes": sum(int(item["bytes"]) for item in completed),
-    }
-
-
-def _parse_jarvis_dfpt_archive(path: str, item: Dict[str, Any]) -> Configuration:
-    """Parse geometry and per-ion Born charges from a JARVIS vasprun.xml ZIP."""
-    archive = Path(path).expanduser().resolve()
-    with zipfile.ZipFile(archive, "r") as zipped:
-        members = {Path(name).name: name for name in zipped.namelist()}
-        if "vasprun.xml" not in members:
-            raise KeyError(f"JARVIS DFPT archive has no vasprun.xml: {archive}")
-        with zipped.open(members["vasprun.xml"], "r") as handle:
-            xml_bytes = handle.read()
-        poscar_text = (
-            zipped.read(members["POSCAR"]).decode("utf-8", errors="replace")
-            if "POSCAR" in members else ""
-        )
-    # One published archive contains a zero-filled filesystem hole between two
-    # complete XML elements.  Removing only NUL bytes restores the exact text;
-    # all parsed tensor values remain unchanged.
-    if b"\x00" in xml_bytes:
-        xml_bytes = xml_bytes.replace(b"\x00", b"")
-    root = ET.fromstring(xml_bytes)
-    atom_array = root.find(".//atominfo/array[@name='atoms']/set")
-    if atom_array is None:
-        raise ValueError(f"No atom table in {archive}")
-    symbols = [str(row.findall("c")[0].text).strip() for row in atom_array.findall("rc")]
-    if any(symbol not in ASE_ATOMIC_NUMBERS for symbol in symbols):
-        # Two official XML files truncate ``Zr`` to ``r``.  POSCAR preserves
-        # the authoritative species/count header, so use it only to repair the
-        # malformed element strings while retaining XML geometry and tensors.
-        lines = [line.strip() for line in poscar_text.splitlines() if line.strip()]
-        if len(lines) < 7:
-            raise ValueError(f"Invalid species names and no usable POSCAR in {archive}")
-        species = lines[5].split()
-        try:
-            counts = [int(value) for value in lines[6].split()]
-        except ValueError as exc:
-            raise ValueError(f"Invalid POSCAR species counts in {archive}") from exc
-        repaired = [symbol for symbol, count in zip(species, counts) for _ in range(count)]
-        if len(repaired) != len(symbols) or any(value not in ASE_ATOMIC_NUMBERS for value in repaired):
-            raise ValueError(f"Cannot repair XML element names from POSCAR in {archive}")
-        symbols = repaired
-    structures = root.findall(".//structure")
-    structure = next(
-        (value for value in structures if value.get("name") == "finalpos"),
-        structures[-1] if structures else None,
-    )
-    if structure is None:
-        raise ValueError(f"No structure in {archive}")
-    basis_node = structure.find(".//crystal/varray[@name='basis']")
-    position_node = structure.find(".//varray[@name='positions']")
-    born_array = root.find(".//array[@name='born_charges']")
-    if basis_node is None or position_node is None or born_array is None:
-        raise ValueError(f"Incomplete DFPT tensor/structure data in {archive}")
-
-    def vectors(node: Any) -> np.ndarray:
-        return np.asarray(
-            [[float(value) for value in str(row.text).split()] for row in node.findall("v")],
-            dtype=float,
-        )
-
-    cell = vectors(basis_node).reshape(3, 3)
-    fractional = vectors(position_node).reshape(-1, 3)
-    born_blocks = [vectors(block).reshape(3, 3) for block in born_array.findall("set")]
-    bec = np.asarray(born_blocks, dtype=float)
-    if len(symbols) != len(fractional) or bec.shape != (len(symbols), 3, 3):
-        raise ValueError(f"DFPT atom/BEC count mismatch in {archive}")
-    if not np.isfinite(cell).all() or not np.isfinite(fractional).all() or not np.isfinite(bec).all():
-        raise ValueError(f"Non-finite DFPT values in {archive}")
-    # The acoustic sum rule should be close to zero, but retain the published
-    # tensor rather than projecting/correcting the scientific label.
-    residual = float(np.max(np.abs(np.sum(bec, axis=0))))
-    props: Dict[str, Any] = {
-        "field": np.zeros(3, dtype=float),
-        "bec": bec,
-        "total_charge": 0.0,
-        "source": "JARVIS-DFT-DFPT-v2025.09",
-        "method_id": "VASP-DFPT-PBE",
-        "system_id": str(item["jid"]),
-        "group_id": f"JARVIS-DFPT:{item['jid']}",
-        "sample_id": f"JARVIS-DFPT:{item['jid']}",
-        "parent_id": str(item["jid"]),
-        "domain": "periodic-electric-response",
-        "energy_reference": "masked:DFPT-response-only",
-        "provenance_id": f"figshare:{item['archive_url'].rsplit('/', 1)[-1]}#{item['jid']}",
-        "bec_acoustic_sum_residual_max": residual,
-    }
-    props["split"] = stable_split(props["group_id"])
-    cfg = Configuration(
-        atomic_numbers=np.asarray([ASE_ATOMIC_NUMBERS[value] for value in symbols], dtype=int),
-        positions=fractional @ cell,
-        properties=props,
-        property_weights={"field": 1.0, "bec": 1.0, "total_charge": 1.0},
-        cell=cell,
-        pbc=(True, True, True),
-        config_type="JARVIS-DFT-DFPT",
-        head="JARVIS:VASP-DFPT-PBE",
-    )
-    _validate_configuration(cfg, context=f"JARVIS-DFPT/{item['jid']}")
-    return cfg
-
-
-def rebuild_jarvis_dfpt_hdf5(
-    selection_path: str,
-    archive_directory: str,
-    output_path: str,
-    *,
-    overwrite: bool = False,
-    max_abs_bec: float = 50.0,
-    max_acoustic_sum_residual: float = 0.5,
-) -> str:
-    """Convert downloaded JARVIS raw DFPT archives into a multi-element BEC shard."""
-    selections = [
-        json.loads(line)
-        for line in Path(selection_path).expanduser().read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    archive_root = Path(archive_directory).expanduser().resolve()
-    missing = [item["jid"] for item in selections if not (archive_root / f"{item['jid']}.zip").is_file()]
-    if missing:
-        raise FileNotFoundError(f"Missing {len(missing)} JARVIS DFPT archives; first: {missing[:5]}")
-
-    rejected: List[Dict[str, Any]] = []
-
-    def configurations() -> Iterable[Configuration]:
-        for item in selections:
-            cfg = _parse_jarvis_dfpt_archive(
-                str(archive_root / f"{item['jid']}.zip"), item
-            )
-            bec = np.asarray(cfg.properties["bec"], dtype=float)
-            max_value = float(np.max(np.abs(bec)))
-            residual = float(cfg.properties["bec_acoustic_sum_residual_max"])
-            if max_value > float(max_abs_bec) or residual > float(max_acoustic_sum_residual):
-                rejected.append({
-                    "jid": item["jid"],
-                    "max_abs_bec": max_value,
-                    "acoustic_sum_residual_max": residual,
-                    "reason": "published DFPT tensor exceeds conservative numerical sanity bounds",
-                })
-                continue
-            yield cfg
-
-    output = write_hdf5_dataset_stream(
-        configurations(),
-        output_path,
-        metadata={
-            "dataset": "JARVIS-DFT complex multi-element Born effective charges",
-            "selection_path": str(Path(selection_path).expanduser().resolve()),
-            "selection_sha256": sha256_file(selection_path),
-            "archive_directory": str(archive_root),
-            "archive_sha256": {
-                item["jid"]: sha256_file(str(archive_root / f"{item['jid']}.zip"))
-                for item in selections
-            },
-            "figshare_article": "10.6084/m9.figshare.6815699.v11",
-            "license": "CC-BY-4.0",
-            "label_policy": "Published per-ion 3x3 born_charges from vasprun.xml; no ASR correction",
-            "energy_policy": "DFPT energy and force records are masked from the shared loss",
-            "sanity_filter": {
-                "max_abs_bec": float(max_abs_bec),
-                "max_acoustic_sum_residual": float(max_acoustic_sum_residual),
-                "rejected_records": rejected,
-            },
-        },
-        overwrite=overwrite,
-    )
-    return output
-
-
-def _so3lr_leaf(group: Any) -> Any:
-    if "atNUM" in group:
-        return group
-    child_names = list(group.keys())
-    if len(child_names) != 1 or "atNUM" not in group[child_names[0]]:
-        raise ValueError(f"Unexpected SO3LR HDF5 group layout: {group.name}")
-    return group[child_names[0]]
-
-
-def rebuild_so3lr_hdf5(
-    raw_path: str,
-    output_path: str,
-    *,
-    dataset_name: Optional[str] = None,
-    max_frames: Optional[int] = None,
-    overwrite: bool = False,
-) -> str:
-    """Convert an official SO3LR HDF5 source without discarding atomic labels."""
-    if not HAS_H5PY:
-        raise RuntimeError("SO3LR conversion requires h5py")
-    raw_file = Path(raw_path).expanduser().resolve()
-    inferred_name = raw_file.stem
-    if inferred_name.lower() == "des15k":
-        inferred_name = "DES15K"
-    elif inferred_name.lower() == "torsionnet500":
-        inferred_name = "TorsionNet500"
-    elif inferred_name.lower() == "spice_dipeptides":
-        inferred_name = "SPICE_dipeptides"
-    source_name = str(dataset_name or inferred_name)
-    bohr_to_angstrom = 0.529177210903
-    configurations: List[Configuration] = []
-    with h5py.File(raw_file, "r") as raw:
-        sample_ids = sorted(str(name) for name in raw.keys())
-        if max_frames is not None:
-            limit = max(0, int(max_frames))
-            sample_ids = sorted(
-                sample_ids,
-                key=lambda name: hashlib.sha256(f"neo-so3lr|{source_name}|{name}".encode()).hexdigest(),
-            )[:limit]
-        for sample_id in sample_ids:
-            sample = _so3lr_leaf(raw[sample_id])
-            numbers = np.asarray(sample["atNUM"], dtype=int).reshape(-1)
-            positions = np.asarray(sample["atXYZ"], dtype=float).reshape(-1, 3)
-            total_energy = float(np.asarray(sample["ePBE0+MBD"]).reshape(-1)[0])
-            base_energy = float(np.asarray(sample["ePBE0"]).reshape(-1)[0])
-            total_forces = np.asarray(sample["totFOR"], dtype=float).reshape(-1, 3)
-            base_forces = np.asarray(sample["pbe0FOR"], dtype=float).reshape(-1, 3)
-            hirshfeld_charges = np.asarray(sample["hCHG"], dtype=float).reshape(-1)
-            integer_total_charge = float(np.rint(np.sum(hirshfeld_charges)))
-            parent_id = _so3lr_parent_id(source_name, sample_id)
-            props: Dict[str, Any] = {
-                "energy": total_energy,
-                "energy_base": base_energy,
-                "energy_dispersion": total_energy - base_energy,
-                "forces": total_forces,
-                "forces_base": base_forces,
-                "forces_dispersion": total_forces - base_forces,
-                "field": np.zeros(3, dtype=float),
-                "dipole": np.asarray(sample["vDIP"], dtype=float).reshape(3),
-                "charges": hirshfeld_charges,
-                "atomic_dipoles": np.asarray(sample["hVDIP"], dtype=float).reshape(-1, 3)
-                * bohr_to_angstrom,
-                "total_charge": integer_total_charge,
-                "source": source_name,
-                "method_id": "PBE0+MBD/tight",
-                "system_id": sample_id,
-                "group_id": f"{source_name}:{parent_id}",
-                "sample_id": f"{source_name}:{sample_id}",
-                "parent_id": parent_id,
-                "domain": "molecular",
-                "energy_reference": f"{source_name}:PBE0+MBD/tight:absolute",
-                "provenance_id": "zenodo:10.5281/zenodo.14779793",
-            }
-            cfg = Configuration(
-                atomic_numbers=numbers,
-                positions=positions,
-                properties=props,
-                property_weights={
-                    name: 1.0
-                    for name in props
-                    if name in HDF5_STRUCTURE_LABELS or name in HDF5_ATOM_LABELS
-                },
-                cell=np.eye(3, dtype=float) * 100.0,
-                pbc=(False, False, False),
-                config_type=source_name,
-                head=f"{source_name}:PBE0+MBD/tight",
-            )
-            _validate_configuration(cfg, context=f"{source_name}/{sample_id}")
-            configurations.append(cfg)
-    split_diagnostics = assign_stable_group_splits(configurations)
-    return write_hdf5_dataset(
-        configurations,
-        output_path,
-        metadata={
-            "dataset": source_name,
-            "raw_path": str(raw_file),
-            "raw_sha256": sha256_file(str(raw_file)),
-            "doi": "10.5281/zenodo.14779793",
-            "license": "CC-BY-4.0",
-            "atomic_dipole_conversion": "hVDIP e*bohr multiplied by 0.529177210903",
-            "total_charge_semantics": "nearest integer to the sum of Hirshfeld atomic charges",
-            "energy_decomposition": "energy_dispersion = ePBE0+MBD - ePBE0",
-            "force_decomposition": "forces_dispersion = totFOR - pbe0FOR",
-            "split_diagnostics": split_diagnostics,
-        },
-        overwrite=overwrite,
-    )
-
-
-def rebuild_deepspin_hdf5(
-    raw_directory: str,
-    output_path: str,
-    *,
-    max_frames: Optional[int] = None,
-    overwrite: bool = False,
-) -> str:
-    """Convert the official DeepSPIN NiO pseudo-atom representation."""
-    raw_dir = Path(raw_directory).expanduser().resolve()
-    required = {name: raw_dir / name for name in ("box.raw", "coord.raw", "energy.raw", "force.raw", "type.raw")}
-    missing = [str(path) for path in required.values() if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"DeepSPIN raw files are missing: {missing}")
-    boxes = np.loadtxt(required["box.raw"], ndmin=2, dtype=float)
-    coordinates = np.loadtxt(required["coord.raw"], ndmin=2, dtype=float)
-    energies = np.loadtxt(required["energy.raw"], ndmin=1, dtype=float).reshape(-1)
-    all_forces = np.loadtxt(required["force.raw"], ndmin=2, dtype=float)
-    types = np.loadtxt(required["type.raw"], ndmin=1, dtype=int).reshape(-1)
-    if not (len(boxes) == len(coordinates) == len(energies) == len(all_forces)):
-        raise ValueError("DeepSPIN raw files have inconsistent frame counts")
-    if len(types) != 48 or tuple(np.bincount(types, minlength=3)) != (16, 16, 16):
-        raise ValueError("DeepSPIN NiO type.raw must contain 16 Ni, 16 O, and 16 pseudo-atoms")
-    frame_count = len(energies) if max_frames is None else min(len(energies), max(0, int(max_frames)))
-    virtual_length = 0.4
-    spin_magnitude = 1.2737
-    configurations: List[Configuration] = []
-    spin_norm_errors: List[float] = []
-    virtual_length_errors: List[float] = []
-    for index in range(frame_count):
-        cell = boxes[index].reshape(3, 3)
-        coords = coordinates[index].reshape(48, 3)
-        force = all_forces[index].reshape(48, 3)
-        real_positions = coords[:32]
-        pseudo_positions = coords[32:]
-        displacement = pseudo_positions - real_positions[:16]
-        fractional = np.linalg.solve(cell.T, displacement.T).T
-        fractional -= np.rint(fractional)
-        displacement = fractional @ cell
-        lengths = np.linalg.norm(displacement, axis=1)
-        if np.any(lengths <= 1e-12):
-            raise ValueError(f"DeepSPIN frame {index}: zero pseudo-atom displacement")
-        spins = np.zeros((32, 3), dtype=float)
-        spins[:16] = displacement / lengths[:, None]
-        magnetic_moments = spins * spin_magnitude
-        effective_field = np.zeros((32, 3), dtype=float)
-        effective_field[:16] = force[32:] * virtual_length
-        block = index // 20
-        group_id = f"DeepSPIN-NiO:block-{block:03d}"
-        props: Dict[str, Any] = {
-            "energy": float(energies[index]),
-            "forces": force[:32],
-            "spins": spins,
-            "magnetic_moments": magnetic_moments,
-            "effective_field": effective_field,
-            "source": "DeepSPIN-NiO",
-            "method_id": "DeltaSpin/VASP/noncollinear-DFT",
-            "system_id": f"DeepSPIN-NiO/frame-{index:03d}",
-            "group_id": group_id,
-            "split": "train" if block < 4 else "val",
-            "sample_id": f"DeepSPIN-NiO:{index:03d}",
-            "parent_id": group_id,
-            "domain": "periodic-spin",
-            "energy_reference": "DeepSPIN-NiO:DeltaSpin:absolute",
-            "provenance_id": "github:yangtengleo/DeepSPIN@526ade353906f21cf4d8cb32db3d53ce83e1ed53",
-        }
-        cfg = Configuration(
-            atomic_numbers=np.asarray([28] * 16 + [8] * 16, dtype=int),
-            positions=real_positions,
-            properties=props,
-            property_weights={
-                name: 1.0
-                for name in props
-                if name in HDF5_STRUCTURE_LABELS or name in HDF5_ATOM_LABELS
-            },
-            cell=cell,
-            pbc=(True, True, True),
-            config_type="DeepSPIN-NiO",
-            head="DeepSPIN-NiO:DeltaSpin",
-        )
-        _validate_configuration(cfg, context=f"DeepSPIN/frame-{index}")
-        spin_norm_errors.append(float(np.max(np.abs(np.linalg.norm(spins[:16], axis=1) - 1.0))))
-        virtual_length_errors.append(float(np.max(np.abs(lengths - virtual_length))))
-        configurations.append(cfg)
-    return write_hdf5_dataset(
-        configurations,
-        output_path,
-        metadata={
-            "dataset": "DeepSPIN-NiO",
-            "raw_directory": str(raw_dir),
-            "raw_sha256": {name: sha256_file(str(path)) for name, path in required.items()},
-            "repository": "https://github.com/yangtengleo/DeepSPIN",
-            "commit": "526ade353906f21cf4d8cb32db3d53ce83e1ed53",
-            "license": "GPL-3.0",
-            "virtual_length_angstrom": virtual_length,
-            "spin_magnitude_mu_B": spin_magnitude,
-            "effective_field_conversion": "0.4 * pseudo_atom_force (eV/spin)",
-            "split_strategy": "author five 20-frame blocks; blocks 0-3 train, block 4 val",
-            "max_spin_unit_norm_error": max(spin_norm_errors, default=0.0),
-            "max_virtual_length_error_angstrom": max(virtual_length_errors, default=0.0),
-        },
-        overwrite=overwrite,
-    )
-
-
-def _mptrj_site_element(site: Dict[str, Any]) -> str:
-    species = list(site.get("species") or [])
-    if len(species) != 1 or float(species[0].get("occu", 0.0)) != 1.0:
-        raise ValueError("Neo MPtrj does not accept disordered or partially occupied sites")
-    element = str(species[0].get("element", ""))
-    if element not in ASE_ATOMIC_NUMBERS:
-        raise ValueError(f"Unknown MPtrj element: {element!r}")
-    return element
-
-
-def _mptrj_record_descriptor(
-    mp_id: str,
-    frame_id: str,
-    record: Dict[str, Any],
-    *,
-    min_elements: int,
-    min_abs_moment: float,
-    max_atoms: int,
-) -> Optional[Dict[str, Any]]:
-    structure = dict(record.get("structure") or {})
-    sites = list(structure.get("sites") or [])
-    atom_count = len(sites)
-    if atom_count <= 0 or atom_count > int(max_atoms):
-        return None
-    try:
-        symbols = [_mptrj_site_element(site) for site in sites]
-        moments = np.asarray(record.get("magmom"), dtype=float).reshape(-1)
-    except Exception:
-        return None
-    if len(moments) != atom_count or not np.isfinite(moments).all():
-        return None
-    magnetic_mask = np.abs(moments) >= float(min_abs_moment)
-    if not np.any(magnetic_mask):
-        return None
-    unique_symbols = sorted(set(symbols), key=lambda symbol: ASE_ATOMIC_NUMBERS[symbol])
-    if len(unique_symbols) < int(min_elements):
-        return None
-    has_positive = bool(np.any(moments[magnetic_mask] > 0.0))
-    has_negative = bool(np.any(moments[magnetic_mask] < 0.0))
-    sign_class = "mixed-sign" if has_positive and has_negative else "single-sign"
-    complexity = "binary" if len(unique_symbols) == 2 else "ternary" if len(unique_symbols) == 3 else "quaternary+"
-    size_class = "small" if atom_count <= 24 else "medium" if atom_count <= 64 else "large"
-    magnetic_elements = sorted(
-        {
-            symbols[index]
-            for index in np.flatnonzero(magnetic_mask)
-        },
-        key=lambda symbol: ASE_ATOMIC_NUMBERS[symbol],
-    )
-    return {
-        "mp_id": str(mp_id),
-        "frame_id": str(frame_id),
-        "atom_count": atom_count,
-        "elements": unique_symbols,
-        "magnetic_elements": magnetic_elements,
-        "element_count": len(unique_symbols),
-        "magnetic_sites": int(np.count_nonzero(magnetic_mask)),
-        "max_abs_moment": float(np.max(np.abs(moments))),
-        "mean_abs_moment": float(np.mean(np.abs(moments[magnetic_mask]))),
-        "stratum": f"{complexity}|{size_class}|{sign_class}",
-        "rank": hashlib.sha256(f"neo-mptrj|{mp_id}|{frame_id}".encode()).hexdigest(),
-    }
-
-
-def scan_mptrj_magnetic_candidates(
-    raw_json: str,
-    index_path: str,
-    *,
-    min_elements: int = 2,
-    min_abs_moment: float = 0.05,
-    max_atoms: int = 160,
-    log: Callable[[str], None] = print,
-) -> Dict[str, Any]:
-    """Stream the official MPtrj JSON and retain one best magnetic frame per mp_id."""
-    if not HAS_IJSON:
-        raise RuntimeError("MPtrj streaming requires ijson>=3.3,<4")
-    source = Path(raw_json).expanduser().resolve()
-    output = Path(index_path).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".building")
-    materials_scanned = 0
-    frames_scanned = 0
-    candidates = 0
-    stratum_counts: Dict[str, int] = {}
-    element_counts: Dict[str, int] = {}
-    with source.open("rb") as handle, temporary.open("w", encoding="utf-8") as writer:
-        for mp_id, family in ijson.kvitems(handle, ""):
-            materials_scanned += 1
-            best: Optional[Dict[str, Any]] = None
-            for frame_id, record in dict(family).items():
-                frames_scanned += 1
-                descriptor = _mptrj_record_descriptor(
-                    str(mp_id), str(frame_id), record,
-                    min_elements=int(min_elements),
-                    min_abs_moment=float(min_abs_moment),
-                    max_atoms=int(max_atoms),
-                )
-                if descriptor is None:
-                    continue
-                if best is None or (
-                    descriptor["magnetic_sites"],
-                    descriptor["element_count"],
-                    descriptor["max_abs_moment"],
-                    descriptor["rank"],
-                ) > (
-                    best["magnetic_sites"],
-                    best["element_count"],
-                    best["max_abs_moment"],
-                    best["rank"],
-                ):
-                    best = descriptor
-            del family
-            if best is not None:
-                writer.write(json.dumps(best, sort_keys=True) + "\n")
-                candidates += 1
-                stratum = str(best["stratum"])
-                stratum_counts[stratum] = stratum_counts.get(stratum, 0) + 1
-                for element in best["elements"]:
-                    element_counts[element] = element_counts.get(element, 0) + 1
-            if materials_scanned % 5000 == 0:
-                log(
-                    f"[{_now()}] MPtrj scan: materials={materials_scanned} "
-                    f"frames={frames_scanned} candidates={candidates}"
-                )
-    temporary.replace(output)
-    result = {
-        "source": str(source),
-        "source_md5_expected": "50ead5f27f9a4f6beb7564c4188f1e9f",
-        "materials_scanned": materials_scanned,
-        "frames_scanned": frames_scanned,
-        "candidate_materials": candidates,
-        "min_elements": int(min_elements),
-        "min_abs_moment": float(min_abs_moment),
-        "max_atoms": int(max_atoms),
-        "strata": dict(sorted(stratum_counts.items())),
-        "elements": dict(sorted(element_counts.items(), key=lambda item: ASE_ATOMIC_NUMBERS[item[0]])),
-        "index_path": str(output),
-        "index_sha256": sha256_file(str(output)),
-    }
-    log(f"[{_now()}] MPtrj candidate scan complete: {json.dumps(result, sort_keys=True)}")
-    return result
-
-
-def select_mptrj_magnetic_candidates(
-    index_path: str,
-    selection_path: str,
-    *,
-    target_structures: int = 12000,
-) -> Dict[str, Any]:
-    """Select a deterministic, stratum-balanced, multi-element MPtrj subset."""
-    candidates = [
-        json.loads(line)
-        for line in Path(index_path).expanduser().read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    target = min(max(0, int(target_structures)), len(candidates))
-    by_stratum: Dict[str, List[Dict[str, Any]]] = {}
-    for item in candidates:
-        by_stratum.setdefault(str(item["stratum"]), []).append(item)
-    for values in by_stratum.values():
-        values.sort(key=lambda item: str(item["rank"]))
-    selected: List[Dict[str, Any]] = []
-    selected_ids: set = set()
-    strata = sorted(by_stratum)
-    while len(selected) < target:
-        made_progress = False
-        for stratum in strata:
-            values = by_stratum[stratum]
-            while values and values[0]["mp_id"] in selected_ids:
-                values.pop(0)
-            if not values:
-                continue
-            item = values.pop(0)
-            selected.append(item)
-            selected_ids.add(item["mp_id"])
-            made_progress = True
-            if len(selected) >= target:
-                break
-        if not made_progress:
-            break
-    selected.sort(key=lambda item: (item["mp_id"], item["frame_id"]))
-    output = Path(selection_path).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        "".join(json.dumps(item, sort_keys=True) + "\n" for item in selected),
-        encoding="utf-8",
-    )
-    stratum_counts: Dict[str, int] = {}
-    element_counts: Dict[str, int] = {}
-    for item in selected:
-        stratum_counts[item["stratum"]] = stratum_counts.get(item["stratum"], 0) + 1
-        for element in item["elements"]:
-            element_counts[element] = element_counts.get(element, 0) + 1
-    return {
-        "selected_structures": len(selected),
-        "selected_materials": len(selected_ids),
-        "selection_path": str(output),
-        "selection_sha256": sha256_file(str(output)),
-        "strata": dict(sorted(stratum_counts.items())),
-        "elements": dict(sorted(element_counts.items(), key=lambda item: ASE_ATOMIC_NUMBERS[item[0]])),
-    }
-
-
-def _configuration_from_mptrj_record(
-    mp_id: str,
-    frame_id: str,
-    record: Dict[str, Any],
-    *,
-    min_abs_moment: float,
-) -> Configuration:
-    structure = dict(record["structure"])
-    sites = list(structure["sites"])
-    symbols = [_mptrj_site_element(site) for site in sites]
-    numbers = np.asarray([ASE_ATOMIC_NUMBERS[symbol] for symbol in symbols], dtype=int)
-    positions = np.asarray([site["xyz"] for site in sites], dtype=float).reshape(-1, 3)
-    cell = np.asarray(structure["lattice"]["matrix"], dtype=float).reshape(3, 3)
-    moments_scalar = np.asarray(record["magmom"], dtype=float).reshape(-1)
-    magnetic_mask = np.abs(moments_scalar) >= float(min_abs_moment)
-    spins = np.zeros((len(numbers), 3), dtype=float)
-    spins[magnetic_mask, 2] = np.sign(moments_scalar[magnetic_mask])
-    moments = np.zeros((len(numbers), 3), dtype=float)
-    moments[magnetic_mask, 2] = moments_scalar[magnetic_mask]
-    corrected_energy = float(record["corrected_total_energy"])
-    props: Dict[str, Any] = {
-        "energy": corrected_energy,
-        "forces": np.asarray(record["force"], dtype=float).reshape(-1, 3),
-        "spins": spins,
-        "magnetic_moments": moments,
-        "source": "MPtrj-v2022.9-magnetic",
-        "method_id": "MP-GGA/GGA+U:MP2020-compatible",
-        "system_id": str(mp_id),
-        "group_id": f"MPtrj:{mp_id}",
-        "sample_id": f"MPtrj:{mp_id}:{frame_id}",
-        "parent_id": str(mp_id),
-        "domain": "periodic-collinear-spin",
-        "energy_reference": "MPtrj:corrected_total_energy:MP2020-compatible",
-        "provenance_id": f"figshare:10.6084/m9.figshare.23713842.v2#{mp_id}/{frame_id}",
-    }
-    cfg = Configuration(
-        atomic_numbers=numbers,
-        positions=positions,
-        properties=props,
-        property_weights={
-            name: 1.0
-            for name in props
-            if name in HDF5_STRUCTURE_LABELS or name in HDF5_ATOM_LABELS
-        },
-        cell=cell,
-        pbc=(True, True, True),
-        config_type="MPtrj-magnetic",
-        head="MPtrj:MP2020-compatible",
-    )
-    _validate_configuration(cfg, context=f"MPtrj/{mp_id}/{frame_id}")
-    return cfg
-
-
-def rebuild_mptrj_magnetic_hdf5(
-    raw_json: str,
-    selection_path: str,
-    output_path: str,
-    *,
-    min_abs_moment: float = 0.05,
-    overwrite: bool = False,
-    log: Callable[[str], None] = print,
-) -> str:
-    """Decode only selected MPtrj material families and write canonical HDF5."""
-    if not HAS_IJSON:
-        raise RuntimeError("MPtrj streaming requires ijson>=3.3,<4")
-    selections = [
-        json.loads(line)
-        for line in Path(selection_path).expanduser().read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    selected = {str(item["mp_id"]): str(item["frame_id"]) for item in selections}
-    decoded = 0
-
-    def configurations() -> Iterable[Configuration]:
-        nonlocal decoded
-        with Path(raw_json).expanduser().open("rb") as handle:
-            for mp_id, family in ijson.kvitems(handle, ""):
-                frame_id = selected.get(str(mp_id))
-                if frame_id is None:
-                    del family
-                    continue
-                record = dict(family).get(frame_id)
-                if record is None:
-                    raise KeyError(f"Selected MPtrj frame is missing: {mp_id}/{frame_id}")
-                cfg = _configuration_from_mptrj_record(
-                    str(mp_id), frame_id, record, min_abs_moment=float(min_abs_moment)
-                )
-                cfg.properties["split"] = stable_split(cfg.properties["group_id"])
-                decoded += 1
-                if decoded % 1000 == 0:
-                    log(f"[{_now()}] MPtrj decode: {decoded}/{len(selected)} structures")
-                yield cfg
-                del family
-
-    result = write_hdf5_dataset_stream(
-        configurations(),
-        output_path,
-        metadata={
-            "dataset": "MPtrj-v2022.9 magnetic multi-element subset",
-            "raw_path": str(Path(raw_json).expanduser().resolve()),
-            "raw_md5": "50ead5f27f9a4f6beb7564c4188f1e9f",
-            "selection_path": str(Path(selection_path).expanduser().resolve()),
-            "selection_sha256": sha256_file(selection_path),
-            "doi": "10.6084/m9.figshare.23713842.v2",
-            "license": "MIT",
-            "energy_label": "corrected_total_energy after MP2020 compatibility",
-            "spin_encoding": "z component is sign of site-wise collinear magmom; zero below threshold",
-            "magnetic_moment_unit": "mu_B",
-            "min_abs_moment": float(min_abs_moment),
-            "explicitly_absent_labels": ["effective_field", "J_effective", "Di", "DMI_effective"],
-        },
-        overwrite=overwrite,
-    )
-    if decoded != len(selected):
-        raise ValueError(f"Decoded {decoded} MPtrj structures, expected {len(selected)}")
-    return result
-
-
-def _configuration_from_mptrj_large_record(
-    mp_id: str,
-    frame_id: str,
-    record: Dict[str, Any],
-    *,
-    min_abs_moment: float,
-) -> Configuration:
-    """Convert a general MPtrj trajectory frame, preserving spin labels when present."""
-    structure = dict(record["structure"])
-    sites = list(structure["sites"])
-    symbols = [_mptrj_site_element(site) for site in sites]
-    numbers = np.asarray([ASE_ATOMIC_NUMBERS[symbol] for symbol in symbols], dtype=int)
-    positions = np.asarray([site["xyz"] for site in sites], dtype=float).reshape(-1, 3)
-    cell = np.asarray(structure["lattice"]["matrix"], dtype=float).reshape(3, 3)
-    props: Dict[str, Any] = {
-        "energy": float(record["corrected_total_energy"]),
-        "forces": np.asarray(record["force"], dtype=float).reshape(-1, 3),
-        "source": "MPtrj-v2022.9-large",
-        "method_id": "MP-GGA/GGA+U:MP2020-compatible",
-        "system_id": str(mp_id),
-        "group_id": f"MPtrj:{mp_id}",
-        "sample_id": f"MPtrj:{mp_id}:{frame_id}",
-        "parent_id": str(mp_id),
-        "domain": "periodic",
-        "energy_reference": "MPtrj:corrected_total_energy:MP2020-compatible",
-        "provenance_id": f"figshare:10.6084/m9.figshare.23713842.v2#{mp_id}/{frame_id}",
-    }
-    raw_moments = record.get("magmom")
-    if raw_moments is not None:
-        try:
-            moments_scalar = np.asarray(raw_moments, dtype=float).reshape(-1)
-        except Exception:
-            moments_scalar = np.empty((0,), dtype=float)
-        if len(moments_scalar) == len(numbers) and np.isfinite(moments_scalar).all():
-            magnetic_mask = np.abs(moments_scalar) >= float(min_abs_moment)
-            if np.any(magnetic_mask):
-                spins = np.zeros((len(numbers), 3), dtype=float)
-                spins[magnetic_mask, 2] = np.sign(moments_scalar[magnetic_mask])
-                moments = np.zeros((len(numbers), 3), dtype=float)
-                moments[magnetic_mask, 2] = moments_scalar[magnetic_mask]
-                props["spins"] = spins
-                props["magnetic_moments"] = moments
-                props["domain"] = "periodic-collinear-spin"
-    props["split"] = stable_split(props["group_id"])
-    cfg = Configuration(
-        atomic_numbers=numbers,
-        positions=positions,
-        properties=props,
-        property_weights={
-            name: 1.0
-            for name in props
-            if name in HDF5_STRUCTURE_LABELS or name in HDF5_ATOM_LABELS
-        },
-        cell=cell,
-        pbc=(True, True, True),
-        config_type="MPtrj-large",
-        head="MPtrj:MP2020-compatible",
-    )
-    _validate_configuration(cfg, context=f"MPtrj-large/{mp_id}/{frame_id}")
-    if cfg.properties["forces"].shape != (len(numbers), 3):
-        raise ValueError(f"MPtrj-large/{mp_id}/{frame_id}: force shape does not match atoms")
-    return cfg
-
-
-def rebuild_mptrj_large_hdf5(
-    raw_json: str,
-    output_path: str,
-    *,
-    required_hdf5: Sequence[str] = (),
-    max_per_material: int = 4,
-    min_elements: int = 2,
-    max_atoms: int = 160,
-    min_abs_moment: float = 0.05,
-    overwrite: bool = False,
-    report_path: Optional[str] = None,
-    log: Callable[[str], None] = print,
-) -> Dict[str, Any]:
-    """Build a trajectory-rich MPtrj shard while retaining required canonical samples."""
-    if not HAS_IJSON:
-        raise RuntimeError("MPtrj streaming requires ijson>=3.3,<4")
-    if int(max_per_material) < 1:
-        raise ValueError("max_per_material must be at least 1")
-    required_samples: set = set()
-    required_by_material: Dict[str, set] = {}
-    required_sources: List[Dict[str, Any]] = []
-    for raw_path in required_hdf5:
-        path = str(Path(raw_path).expanduser().resolve())
-        if not _is_hdf5_path(path):
-            raise ValueError(f"Required sample source is not HDF5: {path}")
-        with h5py.File(path, "r") as handle:
-            sample_ids = [str(value) for value in handle["metadata/sample_id"].asstr()[:]]
-        mptrj_ids = [value for value in sample_ids if value.startswith("MPtrj:")]
-        for sample_id in mptrj_ids:
-            rest = sample_id[len("MPtrj:"):]
-            if ":" not in rest:
-                raise ValueError(f"Cannot parse required MPtrj sample ID: {sample_id}")
-            mp_id, frame_id = rest.split(":", 1)
-            required_samples.add(sample_id)
-            required_by_material.setdefault(mp_id, set()).add(frame_id)
-        required_sources.append({
-            "path": path,
-            "sha256": sha256_file(path),
-            "mptrj_samples": len(mptrj_ids),
-        })
-
-    counters: Dict[str, int] = {
-        "materials_scanned": 0,
-        "frames_scanned": 0,
-        "eligible_frames": 0,
-        "selected_structures": 0,
-        "selected_magnetic_structures": 0,
-    }
-    matched_required: set = set()
-    element_counts: Dict[str, int] = {}
-    source = Path(raw_json).expanduser().resolve()
-
-    def configurations() -> Iterable[Configuration]:
-        with source.open("rb") as handle:
-            for mp_id_raw, family_raw in ijson.kvitems(handle, ""):
-                mp_id = str(mp_id_raw)
-                counters["materials_scanned"] += 1
-                family = dict(family_raw)
-                candidates: List[Tuple[str, str, Dict[str, Any], bool]] = []
-                required_frames = required_by_material.get(mp_id, set())
-                for frame_id_raw, record_raw in family.items():
-                    frame_id = str(frame_id_raw)
-                    record = dict(record_raw)
-                    counters["frames_scanned"] += 1
-                    try:
-                        structure = dict(record.get("structure") or {})
-                        sites = list(structure.get("sites") or [])
-                        if not (0 < len(sites) <= int(max_atoms)):
-                            continue
-                        symbols = [_mptrj_site_element(site) for site in sites]
-                        if len(set(symbols)) < int(min_elements):
-                            continue
-                        energy = float(record["corrected_total_energy"])
-                        forces = np.asarray(record["force"], dtype=float)
-                        if not math.isfinite(energy) or forces.shape != (len(sites), 3):
-                            continue
-                        if not np.isfinite(forces).all():
-                            continue
-                    except Exception:
-                        continue
-                    counters["eligible_frames"] += 1
-                    sample_id = f"MPtrj:{mp_id}:{frame_id}"
-                    required = frame_id in required_frames
-                    rank = hashlib.sha256(
-                        f"neo-large-mptrj|{mp_id}|{frame_id}".encode()
-                    ).hexdigest()
-                    candidates.append((rank, frame_id, record, required))
-
-                required_candidates = sorted(
-                    (item for item in candidates if item[3]), key=lambda item: item[1]
-                )
-                optional_candidates = sorted(
-                    (item for item in candidates if not item[3]), key=lambda item: item[0]
-                )
-                material_limit = max(int(max_per_material), len(required_candidates))
-                selected = required_candidates + optional_candidates[
-                    : max(0, material_limit - len(required_candidates))
-                ]
-                for _rank, frame_id, record, required in selected:
-                    cfg = _configuration_from_mptrj_large_record(
-                        mp_id,
-                        frame_id,
-                        record,
-                        min_abs_moment=float(min_abs_moment),
-                    )
-                    counters["selected_structures"] += 1
-                    if "spins" in cfg.properties:
-                        counters["selected_magnetic_structures"] += 1
-                    if required:
-                        matched_required.add(str(cfg.properties["sample_id"]))
-                    for number in np.unique(cfg.atomic_numbers):
-                        symbol = ASE_CHEMICAL_SYMBOLS[int(number)]
-                        element_counts[symbol] = element_counts.get(symbol, 0) + 1
-                    yield cfg
-                del family, candidates, selected
-                if counters["materials_scanned"] % 5000 == 0:
-                    log(
-                        f"[{_now()}] MPtrj large build: "
-                        f"materials={counters['materials_scanned']} "
-                        f"frames={counters['frames_scanned']} "
-                        f"selected={counters['selected_structures']} "
-                        f"required={len(matched_required)}/{len(required_samples)}"
-                    )
-
-    output = write_hdf5_dataset_stream(
-        configurations(),
-        output_path,
-        metadata={
-            "dataset": "MPtrj-v2022.9 trajectory-rich large multi-element shard",
-            "raw_path": str(source),
-            "raw_md5_expected": "50ead5f27f9a4f6beb7564c4188f1e9f",
-            "doi": "10.6084/m9.figshare.23713842.v2",
-            "license": "MIT",
-            "selection": {
-                "max_per_material": int(max_per_material),
-                "min_elements": int(min_elements),
-                "max_atoms": int(max_atoms),
-                "rank": "SHA256(neo-large-mptrj|mp_id|frame_id)",
-                "required_samples_always_retained": True,
-            },
-            "required_sources": required_sources,
-            "energy_label": "corrected_total_energy after MP2020 compatibility",
-            "split_strategy": "stable hash of MPtrj mp_id; all trajectory frames remain in one split",
-            "missing_magmom_policy": "Spin and magnetic-moment masks are absent, never filled with zero targets",
-        },
-        overwrite=overwrite,
-    )
-    missing_required = sorted(required_samples - matched_required)
-    if missing_required:
-        raise ValueError(
-            f"Large MPtrj build did not retain {len(missing_required)} required samples; "
-            f"first missing IDs: {missing_required[:10]}"
-        )
-    summary = hdf5_dataset_summary(output)
-    report: Dict[str, Any] = {
-        "output": output,
-        "summary": summary,
-        "counters": dict(counters),
-        "required_samples": len(required_samples),
-        "matched_required_samples": len(matched_required),
-        "required_sources": required_sources,
-        "elements": dict(sorted(element_counts.items(), key=lambda item: ASE_ATOMIC_NUMBERS[item[0]])),
-    }
-    if report_path:
-        destination = Path(report_path).expanduser().resolve()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            json.dumps(_checkpoint_safe(report), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-    return report
-
-
-def select_static_mptrj_parquet_rows(
-    parquet_directory: str,
-    selection_path: str,
-    *,
-    source_rows: int = 200000,
-    target_materials: int = 40000,
-    min_elements: int = 2,
-    max_atoms: int = 160,
-) -> Dict[str, Any]:
-    """Recover and select provenance IDs for the MPtrj prefix in static.extxyz."""
-    if not HAS_PYARROW:
-        raise RuntimeError("MPtrj Parquet ID recovery requires pyarrow>=16")
-    root = Path(parquet_directory).expanduser().resolve()
-    shards = sorted(root.glob("*.parquet"))
-    if not shards:
-        raise FileNotFoundError(f"No Parquet shards found under {root}")
-    columns = [
-        "numbers", "energy", "corrected_total_energy", "mp_id", "task_id",
-        "calc_id", "ionic_step", "num_atoms",
-    ]
-    best_by_material: Dict[str, Dict[str, Any]] = {}
-    global_index = 0
-    for shard in shards:
-        parquet = _pyarrow_parquet.ParquetFile(shard)
-        for batch in parquet.iter_batches(batch_size=4096, columns=columns):
-            for row in batch.to_pylist():
-                if global_index >= int(source_rows):
-                    break
-                numbers = np.asarray(row["numbers"], dtype=int).reshape(-1)
-                elements_z = sorted(int(value) for value in np.unique(numbers))
-                atom_count = int(row.get("num_atoms") or len(numbers))
-                raw_energy = float(row["energy"])
-                corrected_energy = float(row["corrected_total_energy"])
-                if (
-                    len(elements_z) >= int(min_elements)
-                    and 0 < atom_count <= int(max_atoms)
-                    and len(numbers) == atom_count
-                    and math.isfinite(raw_energy)
-                    and math.isfinite(corrected_energy)
-                ):
-                    mp_id = str(row["mp_id"])
-                    task_id = str(row["task_id"])
-                    calc_id = int(row["calc_id"])
-                    ionic_step = int(row["ionic_step"])
-                    frame_id = f"{task_id}-{calc_id}-{ionic_step}"
-                    rank = hashlib.sha256(
-                        f"neo-static|{mp_id}|{frame_id}|{global_index}".encode()
-                    ).hexdigest()
-                    element_count = len(elements_z)
-                    complexity = (
-                        "binary" if element_count == 2
-                        else "ternary" if element_count == 3
-                        else "quaternary+"
-                    )
-                    size_class = (
-                        "small" if atom_count <= 24
-                        else "medium" if atom_count <= 64
-                        else "large"
-                    )
-                    candidate = {
-                        "extxyz_index": global_index,
-                        "mp_id": mp_id,
-                        "task_id": task_id,
-                        "calc_id": calc_id,
-                        "ionic_step": ionic_step,
-                        "frame_id": frame_id,
-                        "atom_count": atom_count,
-                        "elements": [ASE_CHEMICAL_SYMBOLS[value] for value in elements_z],
-                        "raw_energy": raw_energy,
-                        "corrected_total_energy": corrected_energy,
-                        "stratum": f"{complexity}|{size_class}",
-                        "rank": rank,
-                    }
-                    previous = best_by_material.get(mp_id)
-                    if previous is None or rank < str(previous["rank"]):
-                        best_by_material[mp_id] = candidate
-                global_index += 1
-            if global_index >= int(source_rows):
-                break
-        if global_index >= int(source_rows):
-            break
-    if global_index != int(source_rows):
-        raise ValueError(
-            f"Parquet shards contain only {global_index} rows; expected {source_rows}"
-        )
-    candidates = list(best_by_material.values())
-    target = min(max(0, int(target_materials)), len(candidates))
-    selected: List[Dict[str, Any]] = []
-    selected_materials: set = set()
-
-    element_frequency: Dict[str, int] = {}
-    for item in candidates:
-        for element in item["elements"]:
-            element_frequency[element] = element_frequency.get(element, 0) + 1
-    for element in sorted(
-        element_frequency,
-        key=lambda symbol: (element_frequency[symbol], ASE_ATOMIC_NUMBERS[symbol]),
-    ):
-        choices = [item for item in candidates if element in item["elements"]]
-        choices.sort(key=lambda item: str(item["rank"]))
-        if choices and choices[0]["mp_id"] not in selected_materials:
-            selected.append(choices[0])
-            selected_materials.add(choices[0]["mp_id"])
-            if len(selected) >= target:
-                break
-
-    by_stratum: Dict[str, List[Dict[str, Any]]] = {}
-    for item in candidates:
-        if item["mp_id"] in selected_materials:
-            continue
-        by_stratum.setdefault(str(item["stratum"]), []).append(item)
-    for values in by_stratum.values():
-        values.sort(key=lambda item: str(item["rank"]))
-    strata = sorted(by_stratum)
-    cursors = {name: 0 for name in strata}
-    while len(selected) < target:
-        progress = False
-        for stratum in strata:
-            cursor = cursors[stratum]
-            values = by_stratum[stratum]
-            while cursor < len(values) and values[cursor]["mp_id"] in selected_materials:
-                cursor += 1
-            cursors[stratum] = cursor
-            if cursor >= len(values):
-                continue
-            item = values[cursor]
-            cursors[stratum] = cursor + 1
-            selected.append(item)
-            selected_materials.add(item["mp_id"])
-            progress = True
-            if len(selected) >= target:
-                break
-        if not progress:
-            break
-    selected.sort(key=lambda item: int(item["extxyz_index"]))
-    output = Path(selection_path).expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        "".join(json.dumps(item, sort_keys=True) + "\n" for item in selected),
-        encoding="utf-8",
-    )
-    selected_elements = sorted(
-        {element for item in selected for element in item["elements"]},
-        key=lambda symbol: ASE_ATOMIC_NUMBERS[symbol],
-    )
-    return {
-        "source_rows": global_index,
-        "candidate_materials": len(candidates),
-        "selected_materials": len(selected),
-        "elements": selected_elements,
-        "selection_path": str(output),
-        "selection_sha256": sha256_file(str(output)),
-        "parquet_shards": [str(path) for path in shards],
-    }
-
-
-def rebuild_static_mptrj_hdf5(
-    static_extxyz: str,
-    parquet_directory: str,
-    selection_path: str,
-    output_path: str,
-    *,
-    overwrite: bool = False,
-) -> str:
-    """Rebuild selected static MPtrj frames with exact IDs and corrected energies."""
-    selections = [
-        json.loads(line)
-        for line in Path(selection_path).expanduser().read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    by_index = {int(item["extxyz_index"]): item for item in selections}
-    selected_indices = set(by_index)
-
-    def configurations() -> Iterable[Configuration]:
-        decoded = 0
-        for record in _iter_extxyz_records(
-            static_extxyz,
-            start_index=0,
-            end_index=200000,
-            selected_indices=selected_indices,
-        ):
-            frame_index = int(record[0])
-            item = by_index[frame_index]
-            cfg = _configuration_from_extxyz_record(*record)
-            if len(cfg.atomic_numbers) != int(item["atom_count"]):
-                raise ValueError(f"Static/Parquet atom-count mismatch at frame {frame_index}")
-            extxyz_energy = float(cfg.properties.get("energy", math.nan))
-            if not math.isclose(
-                extxyz_energy, float(item["raw_energy"]), rel_tol=0.0, abs_tol=5e-6
-            ):
-                raise ValueError(
-                    f"Static/Parquet raw-energy mismatch at frame {frame_index}: "
-                    f"{extxyz_energy} vs {item['raw_energy']}"
-                )
-            cfg.properties["energy"] = float(item["corrected_total_energy"])
-            cfg.properties.update({
-                "source": "MPtrj-static-recovered",
-                "method_id": "MP-GGA/GGA+U:MP2020-compatible",
-                "system_id": str(item["mp_id"]),
-                "group_id": f"MPtrj:{item['mp_id']}",
-                "sample_id": f"MPtrj:{item['mp_id']}:{item['frame_id']}",
-                "parent_id": str(item["mp_id"]),
-                "domain": "periodic",
-                "energy_reference": "MPtrj:corrected_total_energy:MP2020-compatible",
-                "provenance_id": (
-                    f"local-static+parquet:{item['mp_id']}/{item['frame_id']}"
-                ),
-            })
-            cfg.properties["split"] = stable_split(cfg.properties["group_id"])
-            cfg.head = "MPtrj:MP2020-compatible"
-            _validate_configuration(cfg, context=f"static/MPtrj/{frame_index}")
-            decoded += 1
-            yield cfg
-        if decoded != len(selections):
-            raise ValueError(f"Decoded {decoded} static frames, expected {len(selections)}")
-
-    parquet_root = Path(parquet_directory).expanduser().resolve()
-    return write_hdf5_dataset_stream(
-        configurations(),
-        output_path,
-        metadata={
-            "dataset": "MPtrj static multi-element recovered subset",
-            "static_path": str(Path(static_extxyz).expanduser().resolve()),
-            "static_sha256": sha256_file(static_extxyz),
-            "static_mptrj_prefix_frames": 200000,
-            "parquet_directory": str(parquet_root),
-            "parquet_shards": [
-                {"path": str(path), "sha256": sha256_file(str(path))}
-                for path in sorted(parquet_root.glob("*.parquet"))
-            ],
-            "selection_path": str(Path(selection_path).expanduser().resolve()),
-            "selection_sha256": sha256_file(selection_path),
-            "energy_replacement": "static raw energy replaced by Parquet corrected_total_energy",
-            "split_strategy": "stable hash of recovered mp_id",
-        },
-        overwrite=overwrite,
-    )
-
-
-def rebuild_scfnn_from_combined_extxyz(
-    static_extxyz: str,
-    response_extxyz: str,
-    output_path: str,
-    *,
-    overwrite: bool = False,
-) -> str:
-    """Recover the unique zero- and finite-field SCFNN water-box tail segments."""
-    def configurations() -> Iterable[Configuration]:
-        for role, path, start, end in (
-            ("zero-field", static_extxyz, 200000, 201590),
-            ("finite-field", response_extxyz, 101993, 105179),
-        ):
-            for record in _iter_extxyz_records(path, start_index=start, end_index=end):
-                frame_index = int(record[0])
-                cfg = _configuration_from_extxyz_record(*record)
-                geometry_hash = _geometry_group_hash(cfg)
-                cfg.properties.update({
-                    "source": f"SCFNN/{role}",
-                    "method_id": "SCFNN-water/CP2K-DFT",
-                    "system_id": f"SCFNN:{geometry_hash}",
-                    "group_id": f"SCFNN:{geometry_hash}",
-                    "sample_id": f"SCFNN:{role}:{frame_index}",
-                    "parent_id": geometry_hash,
-                    "domain": "periodic-electric-field",
-                    "energy_reference": "SCFNN:CP2K-DFT:absolute",
-                    "provenance_id": f"local-{role}:{Path(path).name}#{frame_index}",
-                    "total_charge": 0.0,
-                })
-                cfg.property_weights["total_charge"] = 1.0
-                cfg.properties["split"] = stable_split(cfg.properties["group_id"])
-                cfg.head = "SCFNN:CP2K-DFT"
-                _validate_configuration(cfg, context=f"SCFNN/{role}/{frame_index}")
-                yield cfg
-
-    return write_hdf5_dataset_stream(
-        configurations(),
-        output_path,
-        metadata={
-            "dataset": "SCFNN water zero- and finite-field response",
-            "static_path": str(Path(static_extxyz).expanduser().resolve()),
-            "static_sha256": sha256_file(static_extxyz),
-            "static_frame_range": [200000, 201590],
-            "response_path": str(Path(response_extxyz).expanduser().resolve()),
-            "response_sha256": sha256_file(response_extxyz),
-            "response_frame_range": [101993, 105179],
-            "grouping": "SHA256 of Z, positions, cell, and PBC rounded to 1e-7",
-            "split_strategy": "field variants share geometry group and split",
-        },
-        overwrite=overwrite,
-    )
-
-
-def rebuild_bec_from_combined_response(
-    response_extxyz: str,
-    output_path: str,
-    *,
-    overwrite: bool = False,
-) -> str:
-    """Recover the 550 real DFPT Born-effective-charge structures."""
-    source_ordinals: Dict[str, int] = {}
-
-    def configurations() -> Iterable[Configuration]:
-        for record in _iter_extxyz_records(
-            response_extxyz, start_index=105179, end_index=105729
-        ):
-            frame_index, info = int(record[0]), record[1]
-            cfg = _configuration_from_extxyz_record(*record)
-            if "bec" not in cfg.properties:
-                raise ValueError(f"BEC frame {frame_index} has no BEC tensor")
-            source = str(info.get("source", "BEC/unknown"))
-            ordinal = source_ordinals.get(source, 0)
-            source_ordinals[source] = ordinal + 1
-            system = source.split("/", 1)[-1]
-            parent_id = f"{system}:{ordinal:06d}"
-            cfg.properties.update({
-                "source": source,
-                "method_id": "VASP-DFPT-BEC",
-                "system_id": parent_id,
-                "group_id": f"BEC:{parent_id}",
-                "sample_id": f"BEC:{parent_id}",
-                "parent_id": parent_id,
-                "domain": "periodic-electric-response",
-                "energy_reference": f"BEC:{system}:dataset-provided",
-                "provenance_id": f"local-response:{Path(response_extxyz).name}#{frame_index}",
-                "total_charge": 0.0,
-            })
-            cfg.property_weights["total_charge"] = 1.0
-            cfg.properties["split"] = stable_split(cfg.properties["group_id"])
-            cfg.head = f"BEC:{system}:VASP-DFPT"
-            _validate_configuration(cfg, context=f"BEC/{frame_index}")
-            yield cfg
-
-    output = write_hdf5_dataset_stream(
-        configurations(),
-        output_path,
-        metadata={
-            "dataset": "MLFF_and_BEC DFPT subset",
-            "response_path": str(Path(response_extxyz).expanduser().resolve()),
-            "response_sha256": sha256_file(response_extxyz),
-            "frame_range": [105179, 105729],
-            "source_expected": {"BEC/H2O": 100, "BEC/MAPbI3": 300, "BEC/dimer": 150},
-            "split_strategy": "stable hash of source system and source ordinal",
-        },
-        overwrite=overwrite,
-    )
-    if source_ordinals != {"BEC/H2O": 100, "BEC/MAPbI3": 300, "BEC/dimer": 150}:
-        raise ValueError(f"Unexpected BEC source counts: {source_ordinals}")
-    return output
-
-
-def _ranked_hdf5_indices(
-    path: str,
-    *,
-    target_structures: Optional[int],
-    target_groups: Optional[int],
-    max_per_group: Optional[int],
-    seed: int,
-) -> List[int]:
-    if not HAS_H5PY:
-        raise RuntimeError("Neo mixed-dataset selection requires h5py")
-    with h5py.File(path, "r") as handle:
-        groups = [str(value) for value in handle["metadata/group_id"].asstr()[:]]
-        samples = [str(value) for value in handle["metadata/sample_id"].asstr()[:]]
-    by_group: Dict[str, List[int]] = {}
-    for index, group in enumerate(groups):
-        by_group.setdefault(group, []).append(index)
-    selected: List[int] = []
-    group_order = sorted(
-        by_group,
-        key=lambda group: hashlib.sha256(f"neo-mixed-group|{seed}|{group}".encode()).hexdigest(),
-    )
-    if target_groups is not None:
-        group_order = group_order[: max(0, int(target_groups))]
-    for group in group_order:
-        values = sorted(
-            by_group[group],
-            key=lambda index: hashlib.sha256(
-                f"neo-mixed-frame|{seed}|{samples[index]}".encode()
-            ).hexdigest(),
-        )
-        if max_per_group is not None:
-            values = values[: max(0, int(max_per_group))]
-        selected.extend(values)
-    if target_structures is not None and len(selected) > int(target_structures):
-        target = max(0, int(target_structures))
-        selected = sorted(
-            selected,
-            key=lambda index: hashlib.sha256(
-                f"neo-mixed-target|{seed}|{samples[index]}".encode()
-            ).hexdigest(),
-        )[:target]
-    return sorted(selected)
-
-
-_NEO_TIER_LABEL_FAMILIES: Dict[str, Tuple[str, ...]] = {
-    "energy_force": ("energy", "forces"),
-    "spin": ("spins", "magnetic_moments"),
-    "effective_spin_field": ("effective_field",),
-    "charge_response": ("charges", "atomic_dipoles"),
-    "electric_response": ("field", "dipole", "total_charge"),
-    "polarization_dispersion": ("polarizability", "atomic_polarizability", "c6"),
-    "born_effective_charge": ("bec",),
-}
-
-
-def _allocate_bounded_temperature_quotas(
-    capacities: Dict[Any, int],
-    total: int,
-    *,
-    temperature: float,
-    minimum: int = 0,
-) -> Dict[Any, int]:
-    """Allocate an exact capped quota with deterministic largest remainders."""
-    usable = {key: max(0, int(value)) for key, value in capacities.items() if int(value) > 0}
-    requested = max(0, int(total))
-    if requested > sum(usable.values()):
-        raise ValueError(
-            f"Cannot allocate {requested} samples from capacity {sum(usable.values())}"
-        )
-    keys = sorted(usable, key=lambda value: str(value))
-    floor_value = max(0, int(minimum))
-    quotas = {key: min(usable[key], floor_value) for key in keys}
-    if sum(quotas.values()) > requested:
-        quotas = {key: 0 for key in keys}
-        for key in sorted(
-            keys,
-            key=lambda value: (
-                -float(usable[value]) ** max(0.0, float(temperature)),
-                str(value),
-            ),
-        )[:requested]:
-            quotas[key] = 1
-        return quotas
-
-    remaining = requested - sum(quotas.values())
-    exponent = max(0.0, float(temperature))
-    while remaining > 0:
-        active = [key for key in keys if quotas[key] < usable[key]]
-        if not active:
-            break
-        weights = {
-            key: float(usable[key]) ** exponent if exponent > 0.0 else 1.0
-            for key in active
-        }
-        denominator = sum(weights.values())
-        ideal = {key: remaining * weights[key] / denominator for key in active}
-        grants = {
-            key: min(usable[key] - quotas[key], int(math.floor(ideal[key])))
-            for key in active
-        }
-        granted = sum(grants.values())
-        if granted:
-            for key, value in grants.items():
-                quotas[key] += value
-            remaining -= granted
-            continue
-        order = sorted(
-            active,
-            key=lambda key: (-(ideal[key] - math.floor(ideal[key])), str(key)),
-        )
-        for key in order:
-            if remaining <= 0:
-                break
-            if quotas[key] < usable[key]:
-                quotas[key] += 1
-                remaining -= 1
-    if remaining:
-        raise RuntimeError(f"Quota allocation left {remaining} samples unassigned")
-    return quotas
-
-
-def _distribution_js_divergence(
-    left: Dict[Any, int], right: Dict[Any, int]
-) -> float:
-    """Return Jensen-Shannon divergence in bits for two count distributions."""
-    keys = sorted(set(left) | set(right), key=lambda value: str(value))
-    left_total = float(sum(max(0, int(left.get(key, 0))) for key in keys))
-    right_total = float(sum(max(0, int(right.get(key, 0))) for key in keys))
-    if left_total <= 0.0 or right_total <= 0.0:
-        return 0.0
-    p = np.asarray([max(0, int(left.get(key, 0))) / left_total for key in keys], dtype=float)
-    q = np.asarray([max(0, int(right.get(key, 0))) / right_total for key in keys], dtype=float)
-    midpoint = 0.5 * (p + q)
-
-    def kl(values: np.ndarray) -> float:
-        active = values > 0.0
-        return float(np.sum(values[active] * np.log2(values[active] / midpoint[active])))
-
-    return 0.5 * (kl(p) + kl(q))
-
-
-def select_neo_stratified_hdf5_indices(
-    path: str,
-    *,
-    target_structures: int,
-    seed: int = 20260720,
-    source_temperature: float = 0.5,
-    min_per_source: int = 3,
-    max_per_group: int = 2,
-    preserve_sources_up_to: int = 128,
-) -> Tuple[List[int], Dict[str, Any]]:
-    """Select a reproducible, source-balanced and coverage-constrained Neo tier."""
-    if not HAS_H5PY:
-        raise RuntimeError("Neo tier selection requires h5py")
-    source_path = str(Path(path).expanduser().resolve())
-    with h5py.File(source_path, "r") as handle:
-        atom_ptr = np.asarray(handle["structures/atom_ptr"], dtype=np.int64)
-        atomic_numbers = np.asarray(handle["structures/atomic_numbers"], dtype=np.int16)
-        sources = [str(value) for value in handle["metadata/source"].asstr()[:]]
-        splits = [str(value) for value in handle["metadata/split"].asstr()[:]]
-        groups = [str(value) for value in handle["metadata/group_id"].asstr()[:]]
-        samples = [str(value) for value in handle["metadata/sample_id"].asstr()[:]]
-        masks = {
-            name: np.asarray(handle[f"masks/{name}"], dtype=bool)
-            for labels in _NEO_TIER_LABEL_FAMILIES.values()
-            for name in labels
-            if f"masks/{name}" in handle
-        }
-    structure_count = len(sources)
-    requested = int(target_structures)
-    if not (0 < requested <= structure_count):
-        raise ValueError(
-            f"target_structures must be in [1, {structure_count}], got {requested}"
-        )
-    group_limit = max(1, int(max_per_group))
-    rank_values = [
-        hashlib.sha256(f"neo-tier|{int(seed)}|{sample}".encode()).hexdigest()
-        for sample in samples
-    ]
-    atom_counts = np.diff(atom_ptr)
-    unique_elements: List[Tuple[int, ...]] = []
-    complexity: List[str] = []
-    size_class: List[str] = []
-    label_signatures: List[str] = []
-    family_active: Dict[str, np.ndarray] = {}
-    for family, labels in _NEO_TIER_LABEL_FAMILIES.items():
-        active = np.zeros((structure_count,), dtype=bool)
-        for label in labels:
-            if label in masks:
-                active |= masks[label]
-        family_active[family] = active
-    for index, atom_count in enumerate(atom_counts):
-        values = tuple(
-            int(value)
-            for value in np.unique(
-                atomic_numbers[int(atom_ptr[index]) : int(atom_ptr[index + 1])]
-            )
-        )
-        unique_elements.append(values)
-        element_count = len(values)
-        complexity.append(
-            "unary" if element_count == 1
-            else "binary" if element_count == 2
-            else "ternary" if element_count == 3
-            else "quaternary+"
-        )
-        size_class.append(
-            "small_1_24" if int(atom_count) <= 24
-            else "medium_25_64" if int(atom_count) <= 64
-            else "large_65_plus"
-        )
-        active_names = [
-            family for family, active in family_active.items() if bool(active[index])
-        ]
-        label_signatures.append("+".join(active_names) if active_names else "geometry")
-
-    raw_source_counts = dict(collections.Counter(sources))
-    rare_source_limit = max(0, int(preserve_sources_up_to))
-    source_group_counts: Dict[str, Dict[str, int]] = collections.defaultdict(
-        lambda: collections.Counter()
-    )
-    for source, group in zip(sources, groups):
-        source_group_counts[source][group] += 1
-    source_capacities = {
-        source: (
-            count
-            if rare_source_limit and count <= rare_source_limit
-            else sum(min(group_limit, value) for value in source_group_counts[source].values())
-        )
-        for source, count in raw_source_counts.items()
-    }
-    desired_source_quotas = _allocate_bounded_temperature_quotas(
-        source_capacities,
-        requested,
-        temperature=float(source_temperature),
-        minimum=max(0, int(min_per_source)),
-    )
-    protected_source_floor = {
-        source: (
-            raw_source_counts[source]
-            if rare_source_limit and raw_source_counts[source] <= rare_source_limit
-            else min(count, max(0, int(min_per_source)))
-        )
-        for source, count in source_capacities.items()
-    }
-    for source, floor_count in protected_source_floor.items():
-        desired_source_quotas[source] = max(
-            desired_source_quotas.get(source, 0), floor_count
-        )
-    quota_excess = sum(desired_source_quotas.values()) - requested
-    while quota_excess > 0:
-        reducible = [
-            source for source in desired_source_quotas
-            if desired_source_quotas[source] > protected_source_floor[source]
-        ]
-        if not reducible:
-            raise ValueError(
-                "target_structures is too small for complete rare-source preservation"
-            )
-        source = max(
-            reducible,
-            key=lambda value: (
-                desired_source_quotas[value] - protected_source_floor[value],
-                desired_source_quotas[value],
-                str(value),
-            ),
-        )
-        desired_source_quotas[source] -= 1
-        quota_excess -= 1
-    token_candidates: Dict[Tuple[Any, ...], List[int]] = collections.defaultdict(list)
-    source_strata: Dict[str, Dict[Tuple[str, str, str, str], List[int]]] = (
-        collections.defaultdict(lambda: collections.defaultdict(list))
-    )
-    for index in range(structure_count):
-        source = sources[index]
-        split_name = splits[index]
-        token_candidates[("source_split", source, split_name)].append(index)
-        token_candidates[("shape_split", complexity[index], size_class[index], split_name)].append(index)
-        for family, active in family_active.items():
-            if bool(active[index]):
-                token_candidates[("label_split", family, split_name)].append(index)
-        for atomic_number in unique_elements[index]:
-            token_candidates[("element_split", atomic_number, split_name)].append(index)
-        source_strata[source][
-            (split_name, complexity[index], size_class[index], label_signatures[index])
-        ].append(index)
-
-    selected: set = set()
-    selected_by_group: Dict[str, int] = collections.Counter()
-    selected_by_source: Dict[str, int] = collections.Counter()
-
-    def add(index: int) -> bool:
-        if index in selected:
-            return True
-        group = groups[index]
-        source = sources[index]
-        effective_group_limit = (
-            raw_source_counts[source]
-            if rare_source_limit and raw_source_counts[source] <= rare_source_limit
-            else group_limit
-        )
-        if selected_by_group[group] >= effective_group_limit:
-            return False
-        selected.add(index)
-        selected_by_group[group] += 1
-        selected_by_source[source] += 1
-        return True
-
-    token_order = {"source_split": 0, "label_split": 1, "element_split": 2, "shape_split": 3}
-    for token in sorted(
-        token_candidates,
-        key=lambda value: (token_order.get(str(value[0]), 99), str(value)),
-    ):
-        for index in sorted(token_candidates[token], key=lambda value: rank_values[value]):
-            if add(index):
-                break
-    if len(selected) > requested:
-        raise ValueError(
-            f"Coverage constraints require {len(selected)} structures, above target {requested}"
-        )
-
-    source_quotas = dict(desired_source_quotas)
-    for source, count in selected_by_source.items():
-        source_quotas[source] = max(source_quotas.get(source, 0), int(count))
-    excess = sum(source_quotas.values()) - requested
-    while excess > 0:
-        reducible = [
-            source for source in source_quotas
-            if source_quotas[source] > selected_by_source.get(source, 0)
-        ]
-        if not reducible:
-            raise ValueError("Coverage constraints cannot fit the requested source quotas")
-        source = max(
-            reducible,
-            key=lambda value: (
-                source_quotas[value] - selected_by_source.get(value, 0),
-                source_quotas[value],
-                str(value),
-            ),
-        )
-        source_quotas[source] -= 1
-        excess -= 1
-
-    for source in sorted(source_strata):
-        needed = source_quotas.get(source, 0) - selected_by_source.get(source, 0)
-        if needed <= 0:
-            continue
-        buckets = source_strata[source]
-        capacities = {
-            key: sum(1 for index in values if index not in selected)
-            for key, values in buckets.items()
-        }
-        capacities = {key: value for key, value in capacities.items() if value > 0}
-        bucket_quotas = _allocate_bounded_temperature_quotas(
-            capacities,
-            needed,
-            temperature=1.0,
-            minimum=1 if needed >= len(capacities) else 0,
-        )
-        for key in sorted(bucket_quotas, key=lambda value: str(value)):
-            remaining = bucket_quotas[key]
-            for index in sorted(buckets[key], key=lambda value: rank_values[value]):
-                if remaining <= 0:
-                    break
-                was_selected = index in selected
-                if add(index) and not was_selected:
-                    remaining -= 1
-        remaining = source_quotas.get(source, 0) - selected_by_source.get(source, 0)
-        if remaining > 0:
-            all_source = sorted(
-                (index for values in buckets.values() for index in values),
-                key=lambda value: rank_values[value],
-            )
-            for index in all_source:
-                if remaining <= 0:
-                    break
-                was_selected = index in selected
-                if add(index) and not was_selected:
-                    remaining -= 1
-
-    if len(selected) < requested:
-        for index in sorted(range(structure_count), key=lambda value: rank_values[value]):
-            if len(selected) >= requested:
-                break
-            add(index)
-    if len(selected) != requested:
-        raise ValueError(
-            f"Group cap selected {len(selected)} structures, expected {requested}; "
-            "increase max_per_group"
-        )
-
-    selected_indices = sorted(int(value) for value in selected)
-    selected_nonrare_groups: Dict[str, int] = collections.Counter()
-    selected_rare_groups: Dict[str, int] = collections.Counter()
-    for index in selected_indices:
-        target = (
-            selected_rare_groups
-            if rare_source_limit and raw_source_counts[sources[index]] <= rare_source_limit
-            else selected_nonrare_groups
-        )
-        target[groups[index]] += 1
-    selected_sources = dict(collections.Counter(sources[index] for index in selected_indices))
-    selected_splits = dict(collections.Counter(splits[index] for index in selected_indices))
-    selected_complexity = dict(collections.Counter(complexity[index] for index in selected_indices))
-    selected_sizes = dict(collections.Counter(size_class[index] for index in selected_indices))
-    selected_families = {
-        family: int(sum(bool(active[index]) for index in selected_indices))
-        for family, active in family_active.items()
-    }
-    parent_splits = dict(collections.Counter(splits))
-    parent_complexity = dict(collections.Counter(complexity))
-    parent_sizes = dict(collections.Counter(size_class))
-    elements_by_split: Dict[str, set] = collections.defaultdict(set)
-    for index in selected_indices:
-        elements_by_split[splits[index]].update(unique_elements[index])
-    train_elements = set(elements_by_split.get("train", set()))
-    evaluation_elements = set(elements_by_split.get("val", set())) | set(
-        elements_by_split.get("test", set())
-    )
-    all_parent_elements = set(int(value) for value in np.unique(atomic_numbers))
-    all_selected_elements = set().union(*elements_by_split.values()) if elements_by_split else set()
-    report = {
-        "strategy": "deterministic_temperature_source_and_coverage_stratification",
-        "seed": int(seed),
-        "target_structures": requested,
-        "selected_structures": len(selected_indices),
-        "source_temperature": float(source_temperature),
-        "min_per_source": int(min_per_source),
-        "max_per_group": group_limit,
-        "preserve_sources_up_to": rare_source_limit,
-        "fully_preserved_sources": sorted(
-            source for source, count in raw_source_counts.items()
-            if rare_source_limit and count <= rare_source_limit
-        ),
-        "groups": len(selected_by_group),
-        "max_selected_per_group": max(selected_by_group.values()) if selected_by_group else 0,
-        "max_selected_per_nonrare_group": (
-            max(selected_nonrare_groups.values()) if selected_nonrare_groups else 0
-        ),
-        "max_selected_per_fully_preserved_group": (
-            max(selected_rare_groups.values()) if selected_rare_groups else 0
-        ),
-        "selected_sample_ids_unique": len({samples[index] for index in selected_indices})
-        == len(selected_indices),
-        "parent_source_counts": dict(sorted(raw_source_counts.items())),
-        "source_selection_capacities": dict(sorted(source_capacities.items())),
-        "target_source_quotas": dict(sorted(source_quotas.items())),
-        "selected_source_counts": dict(sorted(selected_sources.items())),
-        "parent_splits": dict(sorted(parent_splits.items())),
-        "selected_splits": dict(sorted(selected_splits.items())),
-        "selected_label_families": dict(sorted(selected_families.items())),
-        "selected_complexity": dict(sorted(selected_complexity.items())),
-        "selected_size_classes": dict(sorted(selected_sizes.items())),
-        "source_js_to_temperature_target_bits": _distribution_js_divergence(
-            selected_sources, source_quotas
-        ),
-        "split_js_to_parent_bits": _distribution_js_divergence(selected_splits, parent_splits),
-        "complexity_js_to_parent_bits": _distribution_js_divergence(
-            selected_complexity, parent_complexity
-        ),
-        "size_js_to_parent_bits": _distribution_js_divergence(selected_sizes, parent_sizes),
-        "parent_elements": sorted(all_parent_elements),
-        "selected_elements": sorted(all_selected_elements),
-        "element_coverage_fraction": (
-            len(all_selected_elements) / len(all_parent_elements) if all_parent_elements else 1.0
-        ),
-        "elements_by_split": {
-            split_name: sorted(values) for split_name, values in sorted(elements_by_split.items())
-        },
-        "evaluation_elements_missing_from_train": sorted(evaluation_elements - train_elements),
-    }
-    return selected_indices, report
-
-
-def build_neo_stratified_tier(
-    input_path: str,
-    output_path: str,
-    *,
-    target_mib: float,
-    seed: int = 20260720,
-    source_temperature: float = 0.5,
-    min_per_source: int = 3,
-    max_per_group: int = 2,
-    preserve_sources_up_to: int = 128,
-    tolerance_fraction: float = 0.05,
-    max_calibration_rounds: int = 4,
-    overwrite: bool = False,
-    report_path: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Build a size-calibrated Neo tier without changing any selected labels."""
-    source = Path(input_path).expanduser().resolve()
-    destination = Path(output_path).expanduser().resolve()
-    if source == destination:
-        raise ValueError("Tier output must not overwrite its parent dataset")
-    if destination.exists() and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing dataset: {destination}")
-    target_bytes = int(round(float(target_mib) * 1024.0 * 1024.0))
-    if target_bytes <= 0:
-        raise ValueError("target_mib must be positive")
-    with h5py.File(source, "r") as handle:
-        parent_structures = int(len(handle["structures/atom_ptr"]) - 1)
-    parent_bytes = int(source.stat().st_size)
-    target_structures = max(
-        1,
-        min(parent_structures, int(round(parent_structures * target_bytes / parent_bytes))),
-    )
-    attempts: List[Dict[str, Any]] = []
-    final_selection: Dict[str, Any] = {}
-    rounds = max(1, int(max_calibration_rounds))
-    for attempt in range(1, rounds + 1):
-        indices, selection = select_neo_stratified_hdf5_indices(
-            str(source),
-            target_structures=target_structures,
-            seed=int(seed),
-            source_temperature=float(source_temperature),
-            min_per_source=int(min_per_source),
-            max_per_group=int(max_per_group),
-            preserve_sources_up_to=int(preserve_sources_up_to),
-        )
-        metadata = {
-            "dataset": f"Neo size-calibrated stratified tier ({float(target_mib):g} MiB target)",
-            "corpus_role": "portable-stratified-tier",
-            "parent_path": str(source),
-            "parent_sha256": sha256_file(str(source)),
-            "target_mib": float(target_mib),
-            "selection": selection,
-            "missing_label_policy": "Preserve parent masks and values; never synthesize labels",
-        }
-        write_hdf5_dataset_stream(
-            iter_hdf5_configurations(str(source), selected_indices=indices),
-            str(destination),
-            metadata=metadata,
-            overwrite=bool(overwrite or attempt > 1),
-        )
-        actual_bytes = int(destination.stat().st_size)
-        relative_error = (actual_bytes - target_bytes) / target_bytes
-        attempts.append({
-            "round": attempt,
-            "structures": len(indices),
-            "bytes": actual_bytes,
-            "mib": actual_bytes / (1024.0 * 1024.0),
-            "relative_size_error": relative_error,
-        })
-        final_selection = selection
-        if abs(relative_error) <= max(0.0, float(tolerance_fraction)):
-            break
-        proposed = int(round(len(indices) * target_bytes / max(1, actual_bytes)))
-        proposed = max(1, min(parent_structures, proposed))
-        if proposed == target_structures:
-            proposed += -1 if actual_bytes > target_bytes else 1
-            proposed = max(1, min(parent_structures, proposed))
-        if proposed == target_structures:
-            break
-        target_structures = proposed
-    validation = validate_neo_hdf5(str(destination))
-    result = {
-        "output": str(destination),
-        "parent": str(source),
-        "target_mib": float(target_mib),
-        "actual_bytes": int(destination.stat().st_size),
-        "actual_mib": destination.stat().st_size / (1024.0 * 1024.0),
-        "attempts": attempts,
-        "selection": final_selection,
-        "validation": validation,
-    }
-    if report_path:
-        report = Path(report_path).expanduser().resolve()
-        report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_text(
-            json.dumps(_checkpoint_safe(result), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-    return result
-
-
-def audit_neo_tier_hierarchy(
-    tiers: Sequence[Tuple[str, str]],
-    *,
-    output_path: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Audit ordered nested tiers from smallest through the reference corpus."""
-    if not tiers:
-        raise ValueError("At least one dataset tier is required")
-    tier_reports: List[Dict[str, Any]] = []
-    sample_sets: List[set] = []
-    for name, raw_path in tiers:
-        path = Path(raw_path).expanduser().resolve()
-        validation = validate_neo_hdf5(str(path))
-        with h5py.File(path, "r") as handle:
-            sample_ids = [str(value) for value in handle["metadata/sample_id"].asstr()[:]]
-            splits = [str(value) for value in handle["metadata/split"].asstr()[:]]
-            atom_ptr = np.asarray(handle["structures/atom_ptr"], dtype=np.int64)
-            atomic_numbers = np.asarray(
-                handle["structures/atomic_numbers"], dtype=np.int16
-            )
-        ids = set(sample_ids)
-        sample_sets.append(ids)
-        elements_by_split: Dict[str, set] = collections.defaultdict(set)
-        for index, split_name in enumerate(splits):
-            elements_by_split[split_name].update(
-                int(value)
-                for value in np.unique(
-                    atomic_numbers[int(atom_ptr[index]) : int(atom_ptr[index + 1])]
-                )
-            )
-        train_elements = set(elements_by_split.get("train", set()))
-        evaluation_elements = set(elements_by_split.get("val", set())) | set(
-            elements_by_split.get("test", set())
-        )
-        tier_reports.append({
-            "name": str(name),
-            "path": str(path),
-            "bytes": int(path.stat().st_size),
-            "decimal_mb": path.stat().st_size / 1_000_000.0,
-            "mib": path.stat().st_size / (1024.0 * 1024.0),
-            "structures": int(validation["structures"]),
-            "atoms": int(validation["atoms"]),
-            "groups": int(validation["groups"]),
-            "sha256": str(validation["sha256"]),
-            "valid": bool(validation["valid"]),
-            "errors": list(validation["errors"]),
-            "warnings": list(validation["warnings"]),
-            "sample_ids_unique": len(ids) == len(sample_ids),
-            "sources": dict(validation["sources"]),
-            "active_labels": sorted(
-                name for name, count in validation["label_counts"].items() if int(count) > 0
-            ),
-            "elements": list(validation["elements"]),
-            "elements_by_split": {
-                split_name: sorted(values)
-                for split_name, values in sorted(elements_by_split.items())
-            },
-            "evaluation_elements_missing_from_train": sorted(
-                evaluation_elements - train_elements
-            ),
-            "splits": dict(validation["splits"]),
-            "composition": dict(validation["composition"]),
-        })
-    nesting: List[Dict[str, Any]] = []
-    for index in range(len(tiers) - 1):
-        missing = sorted(sample_sets[index] - sample_sets[index + 1])
-        nesting.append({
-            "subset": str(tiers[index][0]),
-            "superset": str(tiers[index + 1][0]),
-            "subset_samples": len(sample_sets[index]),
-            "matched_samples": len(sample_sets[index]) - len(missing),
-            "missing_samples": len(missing),
-            "first_missing_sample_ids": missing[:10],
-            "is_nested": not missing,
-        })
-    reference_sources = set(tier_reports[-1]["sources"])
-    reference_labels = set(tier_reports[-1]["active_labels"])
-    for report in tier_reports:
-        report["source_coverage_fraction"] = (
-            len(set(report["sources"]) & reference_sources) / len(reference_sources)
-            if reference_sources else 1.0
-        )
-        report["active_label_coverage_fraction"] = (
-            len(set(report["active_labels"]) & reference_labels) / len(reference_labels)
-            if reference_labels else 1.0
-        )
-    result = {
-        "strategy": "ordered_nested_tier_audit",
-        "tiers": tier_reports,
-        "nesting": nesting,
-        "all_valid": all(report["valid"] for report in tier_reports),
-        "all_sample_ids_unique": all(
-            report["sample_ids_unique"] for report in tier_reports
-        ),
-        "all_nested": all(item["is_nested"] for item in nesting),
-        "all_reference_sources_covered": all(
-            math.isclose(float(report["source_coverage_fraction"]), 1.0)
-            for report in tier_reports
-        ),
-        "all_reference_active_labels_covered": all(
-            math.isclose(float(report["active_label_coverage_fraction"]), 1.0)
-            for report in tier_reports
-        ),
-        "all_evaluation_elements_seen_in_train": all(
-            not report["evaluation_elements_missing_from_train"]
-            for report in tier_reports
-        ),
-        "generalization_scope": (
-            "Coverage and leakage audit only; predictive generalization requires "
-            "converged held-out model evaluation."
-        ),
-    }
-    if output_path:
-        output = Path(output_path).expanduser().resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(
-            json.dumps(_checkpoint_safe(result), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-    return result
-
-
-def _copy_configuration_with_label_policy(
-    cfg: Configuration,
-    *,
-    keep_labels: set,
-    source_prefix: str,
-) -> Configuration:
-    props = dict(cfg.properties)
-    weights = dict(cfg.property_weights)
-    for name in itertools.chain(HDF5_STRUCTURE_LABELS, HDF5_ATOM_LABELS):
-        if name not in keep_labels:
-            props.pop(name, None)
-            weights.pop(name, None)
-    original_group = str(props.get("group_id", "unknown"))
-    original_sample = str(props.get("sample_id", "unknown"))
-    # Canonical source shards already namespace their IDs. Preserving MPtrj IDs
-    # across the static and magnetic shards prevents material-family leakage.
-    props["group_id"] = original_group
-    props["sample_id"] = original_sample
-    if str(props.get("split", "")).lower() not in ("train", "val", "test"):
-        props["split"] = stable_split(props["group_id"])
-    return Configuration(
-        atomic_numbers=np.asarray(cfg.atomic_numbers, dtype=int),
-        positions=np.asarray(cfg.positions, dtype=float),
-        properties=props,
-        property_weights=weights,
-        cell=np.asarray(cfg.cell, dtype=float),
-        pbc=tuple(bool(value) for value in cfg.pbc),
-        weight=cfg.weight,
-        config_type=cfg.config_type,
-        head=cfg.head,
-    )
-
-
-def build_neo_mixed_dataset(
-    source_specs: Sequence[Dict[str, Any]],
-    output_path: str,
-    *,
-    seed: int = 20260719,
-    overwrite: bool = False,
-    dataset_name: str = "Neo balanced L1-L3 mixed-granularity training corpus",
-    corpus_role: str = "balanced-training",
-    metadata_extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Build a directly trainable mixed corpus with explicit source label policies."""
-    source_report: List[Dict[str, Any]] = []
-    prepared_sources: List[Tuple[str, str, List[int], set]] = []
-    for source_index, raw_spec in enumerate(source_specs):
-        spec = dict(raw_spec)
-        path = str(Path(spec["path"]).expanduser().resolve())
-        source_prefix = str(spec.get("name", f"source-{source_index}"))
-        indices = _ranked_hdf5_indices(
-            path,
-            target_structures=spec.get("target_structures"),
-            target_groups=spec.get("target_groups"),
-            max_per_group=spec.get("max_per_group"),
-            seed=int(seed) + source_index,
-        )
-        keep_labels = set(str(name) for name in spec.get("keep_labels", []))
-        prepared_sources.append((source_prefix, path, indices, keep_labels))
-        source_report.append({
-            "name": source_prefix,
-            "path": path,
-            "sha256": sha256_file(path),
-            "selected_indices": len(indices),
-            "structures_kept": 0,
-            "duplicate_sample_ids_skipped": 0,
-            "max_per_group": spec.get("max_per_group"),
-            "target_groups": spec.get("target_groups"),
-            "target_structures": spec.get("target_structures"),
-            "keep_labels": sorted(keep_labels),
-            "deduplicate_by": str(spec.get("deduplicate_by", "sample_id")),
-            "label_counts": {},
-        })
-    if not any(item["selected_indices"] for item in source_report):
-        raise ValueError("Neo mixed build selected no configurations")
-
-    def configurations() -> Iterable[Configuration]:
-        emitted_keys: set = set()
-        for source_index, (source_prefix, path, indices, keep_labels) in enumerate(prepared_sources):
-            spec = dict(source_specs[source_index])
-            report = source_report[source_index]
-            duplicate_key_name = str(spec.get("deduplicate_by", "sample_id"))
-            for cfg in iter_hdf5_configurations(path, selected_indices=indices):
-                filtered = _copy_configuration_with_label_policy(
-                    cfg, keep_labels=keep_labels, source_prefix=source_prefix
-                )
-                duplicate_key = str(filtered.properties.get(duplicate_key_name, ""))
-                if duplicate_key in emitted_keys:
-                    report["duplicate_sample_ids_skipped"] += 1
-                    continue
-                emitted_keys.add(duplicate_key)
-                sample_id = str(filtered.properties["sample_id"])
-                _validate_configuration(filtered, context=f"Neo mixed/{sample_id}")
-                report["structures_kept"] += 1
-                label_counts = report["label_counts"]
-                for name in itertools.chain(HDF5_STRUCTURE_LABELS, HDF5_ATOM_LABELS):
-                    if name in filtered.properties and float(
-                        filtered.property_weights.get(name, 1.0)
-                    ) > 0.0:
-                        label_counts[name] = int(label_counts.get(name, 0)) + 1
-                yield filtered
-
-    build_metadata: Dict[str, Any] = {
-        "dataset": str(dataset_name),
-        "corpus_role": str(corpus_role),
-        "manifest_version": NEO_MANIFEST_VERSION,
-        "seed": int(seed),
-        "source_policies": source_report,
-        "energy_policy": (
-            "Only sources explicitly retaining energy supervise the shared energy loss; "
-            "incompatible absolute references are masked."
-        ),
-        "domain_policy": (
-            "Default mixed preset uses QEq/Spin/FiLM; PME, DEQ, and molecular D4 "
-            "remain disabled and are trained with domain-specific source shards."
-        ),
-    }
-    if metadata_extra:
-        build_metadata.update(dict(metadata_extra))
-    output = write_hdf5_dataset_stream(
-        configurations(),
-        output_path,
-        metadata=build_metadata,
-        overwrite=overwrite,
-    )
-    summary = hdf5_dataset_summary(output)
-    result = {
-        "output": output,
-        "summary": summary,
-        "sources": source_report,
-    }
-    return result
-
-
-def build_neo_smoke_dataset(
-    source_specs: Sequence[Dict[str, Any]],
-    output_path: str,
-    *,
-    per_source_split: int = 2,
-    overwrite: bool = False,
-) -> Dict[str, Any]:
-    """Build a tiny deterministic corpus with every source represented per split."""
-    selected: List[Configuration] = []
-    source_report: List[Dict[str, Any]] = []
-    count = max(1, int(per_source_split))
-    for source_index, raw_spec in enumerate(source_specs):
-        spec = dict(raw_spec)
-        path = str(Path(spec["path"]).expanduser().resolve())
-        keep_labels = set(str(name) for name in spec.get("keep_labels", []))
-        by_split: Dict[str, List[int]] = {"train": [], "val": [], "test": []}
-        with h5py.File(path, "r") as handle:
-            split_values = handle["metadata/split"].asstr()[:]
-            groups = handle["metadata/group_id"].asstr()[:]
-            samples = handle["metadata/sample_id"].asstr()[:]
-            masks = handle["masks"]
-            useful = np.zeros((len(split_values),), dtype=bool)
-            for label in keep_labels:
-                if label in masks:
-                    useful |= np.asarray(masks[label], dtype=bool)
-            indices = list(range(len(split_values)))
-            indices.sort(
-                key=lambda index: hashlib.sha256(
-                    f"neo-smoke|{source_index}|{groups[index]}|{samples[index]}".encode()
-                ).hexdigest()
-            )
-            for index in indices:
-                split_name = str(split_values[index])
-                if split_name not in by_split or not useful[index]:
-                    continue
-                if len(by_split[split_name]) < count:
-                    by_split[split_name].append(index)
-        source_counts: Dict[str, int] = {}
-        for split_name, indices in by_split.items():
-            for cfg in iter_hdf5_configurations(path, selected_indices=indices):
-                filtered = _copy_configuration_with_label_policy(
-                    cfg,
-                    keep_labels=keep_labels,
-                    source_prefix=str(spec.get("name", f"source-{source_index}")),
-                )
-                filtered.properties["split"] = split_name
-                selected.append(filtered)
-                source_counts[split_name] = source_counts.get(split_name, 0) + 1
-        source_report.append({
-            "name": str(spec.get("name", f"source-{source_index}")),
-            "path": path,
-            "keep_labels": sorted(keep_labels),
-            "splits": source_counts,
-        })
-    output = write_hdf5_dataset_stream(
-        selected,
-        output_path,
-        metadata={
-            "dataset": "Neo balanced rare-target functional smoke corpus",
-            "source_policies": source_report,
-            "purpose": "forward/backward, short-training, and memory-regression checks",
-        },
-        overwrite=overwrite,
-    )
-    validation = validate_neo_hdf5(output)
-    return {"output": output, "validation": validation, "sources": source_report}
-
-
-def validate_neo_hdf5(path: str) -> Dict[str, Any]:
-    """Validate finite labels, masks, group splits, charge sums, and spin geometry."""
-    if not HAS_H5PY:
-        raise RuntimeError("Neo validation requires h5py")
-    report: Dict[str, Any] = {
-        "path": str(Path(path).expanduser().resolve()),
-        "sha256": sha256_file(path),
-        "errors": [],
-        "warnings": [],
-    }
-    with h5py.File(path, "r") as handle:
-        ptr = np.asarray(handle["structures/atom_ptr"], dtype=np.int64)
-        numbers = np.asarray(handle["structures/atomic_numbers"], dtype=int)
-        positions = np.asarray(handle["structures/positions"], dtype=float)
-        pbc = np.asarray(handle["structures/pbc"], dtype=bool)
-        groups = [str(value) for value in handle["metadata/group_id"].asstr()[:]]
-        splits = [str(value) for value in handle["metadata/split"].asstr()[:]]
-        sources = [str(value) for value in handle["metadata/source"].asstr()[:]]
-        structure_count = len(ptr) - 1
-        if ptr.shape != (structure_count + 1,) or ptr[0] != 0 or ptr[-1] != len(numbers):
-            report["errors"].append("atom_ptr is inconsistent with atomic_numbers")
-        if np.any(np.diff(ptr) <= 0):
-            report["errors"].append("one or more structures have no atoms")
-        if positions.shape != (len(numbers), 3) or not np.isfinite(positions).all():
-            report["errors"].append("positions are non-finite or have the wrong shape")
-        if np.any(numbers <= 0) or np.any(numbers >= len(ASE_CHEMICAL_SYMBOLS)):
-            report["errors"].append("atomic numbers are outside the ASE element table")
-        group_split: Dict[str, str] = {}
-        split_conflicts: List[str] = []
-        for group, split_name in zip(groups, splits):
-            previous = group_split.setdefault(group, split_name)
-            if previous != split_name:
-                split_conflicts.append(group)
-        if split_conflicts:
-            report["errors"].append(
-                f"{len(set(split_conflicts))} group IDs cross split boundaries"
-            )
-        label_counts: Dict[str, int] = {}
-        for name in handle["masks"].keys():
-            mask = np.asarray(handle[f"masks/{name}"], dtype=bool)
-            label_counts[name] = int(mask.sum())
-            if mask.shape != (structure_count,):
-                report["errors"].append(f"mask {name} has the wrong shape")
-                continue
-            values = handle[f"labels/{name}"]
-            if name in HDF5_STRUCTURE_LABELS:
-                labeled = np.asarray(values[mask], dtype=float)
-            else:
-                atom_mask = np.zeros((len(numbers),), dtype=bool)
-                for index in np.flatnonzero(mask):
-                    atom_mask[int(ptr[index]) : int(ptr[index + 1])] = True
-                labeled = np.asarray(values[atom_mask], dtype=float)
-            if labeled.size and not np.isfinite(labeled).all():
-                report["errors"].append(f"label {name} contains non-finite values under its mask")
-        charge_residual_max = 0.0
-        if label_counts.get("charges", 0) and label_counts.get("total_charge", 0):
-            charge_mask = np.asarray(handle["masks/charges"], dtype=bool)
-            total_mask = np.asarray(handle["masks/total_charge"], dtype=bool)
-            charge_values = handle["labels/charges"]
-            total_values = handle["labels/total_charge"]
-            for index in np.flatnonzero(charge_mask & total_mask):
-                residual = abs(
-                    float(np.asarray(charge_values[int(ptr[index]) : int(ptr[index + 1])]).sum())
-                    - float(total_values[index])
-                )
-                charge_residual_max = max(charge_residual_max, residual)
-            if charge_residual_max > 0.01:
-                report["warnings"].append(
-                    f"Hirshfeld charge sums differ from integer total charge by up to {charge_residual_max:.6g} e"
-                )
-        spin_norm_error = 0.0
-        spin_mask_count = label_counts.get("spins", 0)
-        if spin_mask_count:
-            spin_mask = np.asarray(handle["masks/spins"], dtype=bool)
-            spins = handle["labels/spins"]
-            for index in np.flatnonzero(spin_mask):
-                values = np.asarray(spins[int(ptr[index]) : int(ptr[index + 1])], dtype=float)
-                norms = np.linalg.norm(values, axis=1)
-                active = norms > 1e-12
-                if np.any(active):
-                    spin_norm_error = max(
-                        spin_norm_error, float(np.max(np.abs(norms[active] - 1.0)))
-                    )
-        bec_acoustic_sum_residual = 0.0
-        if label_counts.get("bec", 0):
-            bec_mask = np.asarray(handle["masks/bec"], dtype=bool)
-            bec_values = handle["labels/bec"]
-            for index in np.flatnonzero(bec_mask):
-                tensor_sum = np.asarray(
-                    bec_values[int(ptr[index]) : int(ptr[index + 1])], dtype=float
-                ).sum(axis=0)
-                bec_acoustic_sum_residual = max(
-                    bec_acoustic_sum_residual,
-                    float(np.max(np.abs(tensor_sum))),
-                )
-            if bec_acoustic_sum_residual > 1.0:
-                report["warnings"].append(
-                    "Published BEC tensors violate the acoustic sum rule by up to "
-                    f"{bec_acoustic_sum_residual:.6g} e; labels were not projected or altered"
-                )
-        report.update({
-            "valid": not report["errors"],
-            "structures": structure_count,
-            "atoms": int(len(numbers)),
-            "elements": sorted(int(value) for value in np.unique(numbers)),
-            "periodic_structures": int(np.count_nonzero(np.any(pbc, axis=1))),
-            "sources": dict(sorted(collections.Counter(sources).items())),
-            "splits": dict(sorted(collections.Counter(splits).items())),
-            "groups": len(group_split),
-            "label_counts": label_counts,
-            "charge_sum_residual_max_e": charge_residual_max,
-            "active_spin_norm_max_error": spin_norm_error,
-            "bec_acoustic_sum_residual_max_e": bec_acoustic_sum_residual,
-            "composition": _composition_statistics(ptr, numbers),
-        })
-    return report
-
-
-def _composition_statistics(atom_ptr: np.ndarray, numbers: np.ndarray) -> Dict[str, Any]:
-    """Summarize per-structure chemical and size complexity."""
-    complexity = {"unary": 0, "binary": 0, "ternary": 0, "quaternary+": 0}
-    sizes = {"small_1_24": 0, "medium_25_64": 0, "large_65_plus": 0}
-    atom_counts = np.diff(np.asarray(atom_ptr, dtype=np.int64))
-    element_frequency: Dict[int, int] = {}
-    for index, atom_count in enumerate(atom_counts):
-        start, end = int(atom_ptr[index]), int(atom_ptr[index + 1])
-        unique = np.unique(numbers[start:end])
-        element_count = len(unique)
-        key = (
-            "unary" if element_count == 1
-            else "binary" if element_count == 2
-            else "ternary" if element_count == 3
-            else "quaternary+"
-        )
-        complexity[key] += 1
-        size_key = (
-            "small_1_24" if atom_count <= 24
-            else "medium_25_64" if atom_count <= 64
-            else "large_65_plus"
-        )
-        sizes[size_key] += 1
-        for atomic_number in unique:
-            value = int(atomic_number)
-            element_frequency[value] = element_frequency.get(value, 0) + 1
-    return {
-        "complexity": complexity,
-        "size_classes": sizes,
-        "multi_element_structures": int(len(atom_counts) - complexity["unary"]),
-        "atom_count_min": int(atom_counts.min()) if len(atom_counts) else 0,
-        "atom_count_median": float(np.median(atom_counts)) if len(atom_counts) else 0.0,
-        "atom_count_max": int(atom_counts.max()) if len(atom_counts) else 0,
-        "element_structure_frequency": {
-            ASE_CHEMICAL_SYMBOLS[value]: int(count)
-            for value, count in sorted(element_frequency.items())
-        },
-    }
-
-
-def hdf5_dataset_summary(path: str) -> Dict[str, Any]:
-    if not HAS_H5PY:
-        raise RuntimeError("HDF5 support requires h5py")
-    with h5py.File(path, "r") as handle:
-        ptr = np.asarray(handle["structures/atom_ptr"], dtype=np.int64)
-        z = np.asarray(handle["structures/atomic_numbers"], dtype=int)
-        pbc = np.asarray(handle["structures/pbc"], dtype=bool)
-        masks = handle["masks"]
-        groups = handle["metadata/group_id"].asstr()[:]
-        sources = handle["metadata/source"].asstr()[:]
-        return {
-            "schema_version": str(handle.attrs.get("schema_version", "")),
-            "structures": int(len(ptr) - 1),
-            "atoms": int(ptr[-1]),
-            "elements": sorted(int(x) for x in np.unique(z)),
-            "labels": {name: int(np.asarray(masks[name], dtype=bool).sum()) for name in masks.keys()},
-            "splits": {
-                str(key): int(value)
-                for key, value in zip(
-                    *np.unique(handle["metadata/split"].asstr()[:], return_counts=True)
-                )
-            },
-            "groups": len(set(str(value) for value in groups)),
-            "periodic_structures": int(np.count_nonzero(np.any(pbc, axis=1))),
-            "sources": dict(sorted(collections.Counter(str(value) for value in sources).items())),
-            "composition": _composition_statistics(ptr, z),
-            "sha256": sha256_file(path),
-        }
-
-
-NEO_HF_TIER_PATHS: Dict[str, str] = {
-    "tiny": "canonical/neo_tiny_l1_l2_l3.h5",
-    "small": "canonical/neo_small_l1_l2_l3.h5",
-    "standard": "canonical/neo_mixed_l1_l2_l3.h5",
-    "large": "canonical/neo_large_l1_l2_l3.h5",
-}
-NEO_HF_REQUIRED_DOCUMENTS: Tuple[str, ...] = (
-    "README.md",
-    "SOURCES_AND_PROCESSING.md",
-    "DATA_SCHEMA.md",
-    "LICENSES_AND_ATTRIBUTION.md",
-    "HUGGINGFACE_UPLOAD.md",
+OMAT24_PARQUET_COLUMNS: Tuple[str, ...] = (
+    "configuration_id",
+    "configuration_hash",
+    "structure_hash",
+    "names",
+    "method",
+    "software",
+    "energy",
+    "atomic_forces",
+    "cauchy_stress",
+    "cauchy_stress_volume_normalized",
+    "atomic_numbers",
+    "positions",
+    "cell",
+    "pbc",
 )
-_NEO_HF_ALLOWED_RIGHTS_STATUSES = {
-    "allowed",
-    "allowed_with_attribution",
-    "allowed_with_conditions",
-}
 
 
-def _neo_release_safe_value(value: Any, neo_root: Path) -> Any:
-    """Remove workstation-only paths and transport details from release JSON."""
-    if isinstance(value, dict):
-        return {
-            str(key): _neo_release_safe_value(item, neo_root)
-            for key, item in value.items()
-            if str(key) not in {"proxy_used", "notice_source"}
-        }
-    if isinstance(value, (list, tuple)):
-        return [_neo_release_safe_value(item, neo_root) for item in value]
-    if not isinstance(value, str):
-        return value
-    if value.startswith("Datasets/Neo/"):
-        return value[len("Datasets/Neo/") :]
-    candidate = Path(value).expanduser()
-    if not candidate.is_absolute():
-        return value
-    resolved = candidate.resolve(strict=False)
-    root = neo_root.resolve()
-    project_root = root.parent.parent if root.parent.name == "Datasets" else None
-    try:
-        return resolved.relative_to(root).as_posix()
-    except ValueError:
-        pass
-    if project_root is not None:
-        try:
-            return resolved.relative_to(project_root).as_posix()
-        except ValueError:
-            pass
-    return f"<external-source>/{resolved.name}"
+def _omat24_material_id(row: Dict[str, Any]) -> str:
+    names = row.get("names") or []
+    name = str(names[0]) if names else ""
+    match = re.search(r"OMat24__(agm[0-9]+)_", name)
+    return match.group(1) if match else str(row.get("configuration_id", "unknown"))
 
 
-def _copy_neo_release_metadata(source: Path, destination: Path, neo_root: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.suffix.lower() == ".json":
-        payload = json.loads(source.read_text(encoding="utf-8"))
-        portable = _neo_release_safe_value(payload, neo_root)
-        destination.write_text(
-            json.dumps(_checkpoint_safe(portable), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+def _omat24_configuration_from_row(
+    row: Dict[str, Any], *, corpus_name: str
+) -> Configuration:
+    """Decode one ColabFit OMat24 row without changing numerical values."""
+    numbers = np.asarray(row["atomic_numbers"], dtype=np.int16).reshape(-1)
+    positions = np.asarray(row["positions"], dtype=np.float64).reshape(-1, 3)
+    forces = np.asarray(row["atomic_forces"], dtype=np.float64).reshape(-1, 3)
+    if len(numbers) == 0 or positions.shape != (len(numbers), 3):
+        raise ValueError("OMat24 row has inconsistent atoms/positions")
+    if forces.shape != positions.shape:
+        raise ValueError("OMat24 row has inconsistent positions/forces")
+    configuration_id = str(row["configuration_id"])
+    material_id = _omat24_material_id(row)
+    source = f"OMat24/{corpus_name}"
+    group_id = f"OMat24:{material_id}"
+    props: Dict[str, Any] = {
+        "energy": float(row["energy"]),
+        "forces": forces,
+        "source": source,
+        "method_id": f"OMat24:{row.get('method') or 'PBE+U'}",
+        "system_id": material_id,
+        "group_id": group_id,
+        "split": stable_split(group_id),
+        "sample_id": f"OMat24:{configuration_id}",
+        "parent_id": material_id,
+        "domain": "periodic",
+        "energy_reference": "OMat24:VASP-PBE+U:absolute",
+        "provenance_id": (
+            f"ColabFit:{corpus_name}:{configuration_id}:"
+            f"{row.get('configuration_hash') or row.get('structure_hash') or 'unknown'}"
+        ),
+        "dataset_role": "l1-foundation",
+        "curriculum_role": "base+joint",
+    }
+    weights: Dict[str, float] = {"energy": 1.0, "forces": 1.0}
+    if row.get("cauchy_stress") is not None:
+        stress = np.asarray(row["cauchy_stress"], dtype=np.float64).reshape(3, 3)
+        props["stress"] = 0.5 * (stress + stress.T)
+        props["stress_volume_normalized"] = float(
+            bool(row.get("cauchy_stress_volume_normalized"))
         )
-    else:
-        shutil.copy2(source, destination)
+        weights.update({"stress": 1.0, "stress_volume_normalized": 1.0})
+    cfg = Configuration(
+        atomic_numbers=numbers,
+        positions=positions,
+        properties=props,
+        property_weights=weights,
+        cell=np.asarray(row["cell"], dtype=np.float64).reshape(3, 3),
+        pbc=tuple(bool(value) for value in row["pbc"]),
+        head=str(props["method_id"]),
+    )
+    _validate_configuration(cfg, context=f"OMat24/{configuration_id}")
+    return cfg
 
 
-def _neo_release_rights_issues(
-    registry: Dict[str, Any],
-    tier_sources: Dict[str, Sequence[str]],
-) -> List[Dict[str, Any]]:
-    aliases: Dict[str, Dict[str, Any]] = {}
-    for entry in registry.get("sources", []):
-        for source_id in entry.get("neo_source_ids", []):
-            aliases[str(source_id)] = dict(entry)
-    source_tiers: Dict[str, List[str]] = {}
-    for tier, sources in tier_sources.items():
-        for source_id in sources:
-            source_tiers.setdefault(str(source_id), []).append(str(tier))
-    issues: List[Dict[str, Any]] = []
-    for source_id, tiers in sorted(source_tiers.items()):
-        entry = aliases.get(source_id)
-        if entry is None:
-            issues.append({
-                "source_id": source_id,
-                "registry_id": None,
-                "status": "unregistered",
-                "tiers": sorted(set(tiers)),
-                "reason": "No source-rights registry entry exists.",
-            })
-            continue
-        status = str(entry.get("redistribution_status", "unregistered"))
-        if status not in _NEO_HF_ALLOWED_RIGHTS_STATUSES:
-            issues.append({
-                "source_id": source_id,
-                "registry_id": str(entry.get("id", "unknown")),
-                "status": status,
-                "tiers": sorted(set(tiers)),
-                "reason": str(
-                    entry.get(
-                        "release_reason",
-                        "Source terms do not currently authorize an unqualified public release.",
-                    )
-                ),
-            })
-    return issues
+def _large_curriculum_role(
+    label_masks: Dict[str, np.ndarray], index: int
+) -> Tuple[str, str]:
+    response_labels = {
+        "field", "dipole", "polarizability", "charges", "atomic_dipoles",
+        "atomic_polarizability", "c6", "bec", "spins", "magnetic_moments",
+        "effective_field", "J_effective", "Di", "Di_effective", "DMI_effective",
+    }
+    active_response = any(
+        bool(mask[int(index)])
+        for name, mask in label_masks.items()
+        if name in response_labels
+    )
+    active_local = any(
+        bool(label_masks[name][int(index)])
+        for name in ("energy", "forces")
+        if name in label_masks
+    )
+    if active_response:
+        return "l1-l2-l3-response", "response+joint"
+    if active_local:
+        return "l1-non-equilibrium", "joint"
+    return "auxiliary", "joint"
 
 
-def prepare_neo_huggingface_release(
-    neo_root: str,
-    output_directory: str,
-    *,
-    tiers: Sequence[str] = ("tiny", "small", "standard", "large"),
-    acknowledge_rights_review: bool = False,
-    validate_hdf5: bool = True,
-    overwrite: bool = False,
+
+def _resolve_composite_source(composite: Path, raw_value: str) -> Path:
+    value = Path(str(raw_value)).expanduser()
+    return value.resolve() if value.is_absolute() else (composite.parent / value).resolve()
+
+
+
+def inspect_composite_dataset(
+    path: str, *, verify_sources: bool = False
 ) -> Dict[str, Any]:
-    """Create a portable, checksummed Hugging Face staging directory.
-
-    The rights acknowledgement only permits local staging. It never changes a
-    source status, declares permission, authenticates to Hugging Face, or
-    uploads a file.
-    """
-    if not HAS_H5PY:
-        raise RuntimeError("Hugging Face release preparation requires h5py")
-    root = Path(neo_root).expanduser().resolve()
-    output = Path(output_directory).expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"Neo dataset root does not exist: {root}")
-    if output == root or output in root.parents:
-        raise ValueError("Release output must not be the Neo root or its parent")
-
-    selected_tiers: List[str] = []
-    for raw_name in tiers:
-        name = str(raw_name).strip().lower()
-        if name not in NEO_HF_TIER_PATHS:
-            raise ValueError(
-                f"Unknown Neo release tier {raw_name!r}; choose from "
-                f"{sorted(NEO_HF_TIER_PATHS)}"
-            )
-        if name not in selected_tiers:
-            selected_tiers.append(name)
-    if not selected_tiers:
-        raise ValueError("At least one Neo release tier is required")
-
-    required_paths = [root / name for name in NEO_HF_REQUIRED_DOCUMENTS]
-    required_paths.extend((
-        root / "manifest.json",
-        root / ".gitattributes",
-        root / "provenance/source_registry.json",
-    ))
-    missing = [str(path) for path in required_paths if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"Release metadata is incomplete: {missing}")
-
-    registry = json.loads(
-        (root / "provenance/source_registry.json").read_text(encoding="utf-8")
-    )
-    tier_sources: Dict[str, List[str]] = {}
-    for name in selected_tiers:
-        source_path = root / NEO_HF_TIER_PATHS[name]
-        if not source_path.is_file():
-            raise FileNotFoundError(f"Neo tier is missing: {source_path}")
-        with h5py.File(source_path, "r") as handle:
-            if str(handle.attrs.get("schema_version", "")) != HDF5_SCHEMA_VERSION:
-                raise ValueError(f"Unsupported HDF5 schema in {source_path}")
-            tier_sources[name] = sorted(
-                set(str(value) for value in handle["metadata/source"].asstr()[:])
-            )
-    rights_issues = _neo_release_rights_issues(registry, tier_sources)
-    if rights_issues and not acknowledge_rights_review:
-        raise PermissionError(
-            "Public-release rights are not clear for selected Neo tiers. "
-            "Resolve the source registry issues or pass "
-            "--acknowledge-rights-review for local staging only: "
-            + json.dumps(rights_issues, sort_keys=True)
-        )
-
-    used_sources = {source for values in tier_sources.values() for source in values}
-    for entry in registry.get("sources", []):
-        aliases = {str(value) for value in entry.get("neo_source_ids", [])}
-        if not (aliases & used_sources) or not entry.get("required_notice"):
-            continue
-        source_notice = root / str(entry.get("notice_source", ""))
-        if not source_notice.is_file():
-            raise FileNotFoundError(
-                f"Required source notice is missing for {entry.get('id')}: {source_notice}"
-            )
-
-    if output.exists():
-        if not overwrite:
-            raise FileExistsError(f"Release output already exists: {output}")
-        shutil.rmtree(output)
-    output.mkdir(parents=True, exist_ok=False)
-
-    metadata_sources: List[Path] = list(required_paths[:-1])
-    metadata_sources.append(root / "provenance/source_registry.json")
-    for directory in ("config", "presets", "provenance"):
-        metadata_sources.extend(sorted((root / directory).glob("*.json")))
-    metadata_sources.extend(sorted((root / "reports").glob("*.json")))
-    unique_metadata: Dict[str, Path] = {}
-    for source in metadata_sources:
-        relative = source.relative_to(root).as_posix()
-        unique_metadata[relative] = source
-    for relative, source in sorted(unique_metadata.items()):
-        _copy_neo_release_metadata(source, output / relative, root)
-
-    (output / ".gitignore").write_text(
-        ".DS_Store\n.cache/\n*.partial\n*.building\n",
-        encoding="utf-8",
-    )
-
-    for entry in registry.get("sources", []):
-        aliases = {str(value) for value in entry.get("neo_source_ids", [])}
-        required_notice = entry.get("required_notice")
-        if not (aliases & used_sources) or not required_notice:
-            continue
-        source_notice = root / str(entry["notice_source"])
-        destination = output / str(required_notice)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_notice, destination)
-
-    source_manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    expected_hashes = {
-        str(item["path"]): str(item["sha256"])
-        for item in source_manifest.get("canonical_datasets", [])
-    }
-    release_status = (
-        "blocked_pending_rights_confirmation" if rights_issues else "ready_for_upload"
-    )
-    staged_tiers: List[Dict[str, Any]] = []
-    staged_hdf5: Dict[str, Dict[str, Any]] = {}
-    for name in selected_tiers:
-        relative = NEO_HF_TIER_PATHS[name]
-        source = root / relative
-        source_sha256 = sha256_file(str(source))
-        expected_sha256 = expected_hashes.get(relative)
-        if expected_sha256 is None:
-            raise ValueError(f"Canonical manifest has no checksum for {relative}")
-        if source_sha256 != expected_sha256:
-            raise ValueError(
-                f"Canonical checksum mismatch for {relative}: "
-                f"expected {expected_sha256}, got {source_sha256}"
-            )
-        destination = output / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        with h5py.File(destination, "r+") as handle:
-            metadata = json.loads(str(handle.attrs.get("metadata_json", "{}")))
-            units = json.loads(str(handle.attrs.get("units_json", "{}")))
-            units.update(HDF5_UNITS)
-            handle.attrs["metadata_json"] = json.dumps(
-                _checkpoint_safe(_neo_release_safe_value(metadata, root)),
-                sort_keys=True,
-            )
-            handle.attrs["units_json"] = json.dumps(units, sort_keys=True)
-            handle.attrs["release_source_sha256"] = source_sha256
-            handle.attrs["release_source_path"] = relative
-            handle.attrs["release_transform"] = (
-                "metadata-only portability normalization; numerical HDF5 datasets unchanged"
-            )
-            handle.attrs["release_rights_status"] = release_status
-            attribute_text = "\n".join(str(value) for value in handle.attrs.values())
-            private_endpoint = re.compile(
-                r"(?i)(?:https?://)?(?:127\.0\.0\.1|localhost):[0-9]{2,5}"
-            )
-            if (
-                str(Path.home()) + "/" in attribute_text
-                or private_endpoint.search(attribute_text)
-            ):
-                raise ValueError(f"Private workstation metadata remains in {relative}")
-        validation = (
-            validate_neo_hdf5(str(destination))
-            if validate_hdf5
-            else {
-                "valid": True,
-                "sha256": sha256_file(str(destination)),
-                "warnings": [],
-                "errors": [],
-                **hdf5_dataset_summary(str(destination)),
-            }
-        )
-        if not bool(validation.get("valid")):
-            raise ValueError(
-                f"Staged HDF5 validation failed for {relative}: {validation.get('errors')}"
-            )
-        tier_entry = {
-            "name": name,
-            "path": relative,
-            "source_sha256": source_sha256,
-            "release_sha256": str(validation["sha256"]),
-            "bytes": int(destination.stat().st_size),
-            "structures": int(validation["structures"]),
-            "atoms": int(validation["atoms"]),
-            "groups": int(validation["groups"]),
-            "splits": dict(validation["splits"]),
-            "sources": dict(validation["sources"]),
-            "warnings": list(validation.get("warnings", [])),
+    """Inspect Plus/Max selectors and strictly validate the embedded Large payload."""
+    composite = Path(path).expanduser().resolve()
+    with h5py.File(composite, "r") as handle:
+        if str(handle.attrs.get("schema_version", "")) != COMPOSITE_HDF5_SCHEMA_VERSION:
+            raise ValueError("Not an E3MU composite HDF5 dataset")
+        omat = handle["sources/omat24"]
+        omat_root = _resolve_composite_source(composite, str(omat.attrs["root"]))
+        file_paths = [str(value) for value in omat["file_paths"].asstr()[:]]
+        file_hashes = [str(value) for value in omat["file_sha256"].asstr()[:]]
+        missing: List[str] = []
+        mismatched: List[str] = []
+        embedded_errors: List[str] = []
+        selection = handle["selection"]
+        selection_lengths = {
+            name: int(selection[name].shape[0])
+            for name in ("source_order", "row_index", "split_code", "atom_count")
+            if name in selection
         }
-        staged_tiers.append(tier_entry)
-        staged_hdf5[relative] = tier_entry
-
-    private_home = str(Path.home()) + "/"
-    private_endpoint = re.compile(
-        r"(?i)(?:https?://)?(?:127\.0\.0\.1|localhost):[0-9]{2,5}"
-    )
-    for path in output.rglob("*"):
-        if not path.is_file() or path.suffix.lower() == ".h5":
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        if private_home in text or private_endpoint.search(text):
-            raise ValueError(f"Private workstation metadata remains in {path}")
-
-    release_files: List[Dict[str, Any]] = []
-    for path in sorted(item for item in output.rglob("*") if item.is_file()):
-        relative = path.relative_to(output).as_posix()
-        if relative in {"RELEASE_MANIFEST.json", "checksums.sha256"}:
-            continue
-        item: Dict[str, Any] = {
-            "path": relative,
-            "bytes": int(path.stat().st_size),
-            "sha256": (
-                staged_hdf5[relative]["release_sha256"]
-                if relative in staged_hdf5
-                else sha256_file(str(path))
-            ),
-        }
-        if relative in staged_hdf5:
-            item["source_sha256"] = staged_hdf5[relative]["source_sha256"]
-            item["role"] = "canonical_hdf5_tier"
+        if len(selection_lengths) != 4:
+            embedded_errors.append("one or more OMat24 selector arrays are missing")
+        elif len(set(selection_lengths.values())) != 1:
+            embedded_errors.append(
+                "OMat24 selector lengths disagree: "
+                + json.dumps(selection_lengths, sort_keys=True)
+            )
+        elif selection_lengths["source_order"]:
+            max_source_order = int(np.max(selection["source_order"][:]))
+            if max_source_order >= len(file_paths):
+                embedded_errors.append(
+                    f"selector source_order={max_source_order} exceeds "
+                    f"the {len(file_paths)} declared OMat24 shards"
+                )
+        if verify_sources:
+            for relative, expected in zip(file_paths, file_hashes):
+                source = omat_root / relative
+                if not source.is_file():
+                    missing.append(str(source))
+                elif sha256_file(str(source)) != expected:
+                    mismatched.append(str(source))
+        large_group = handle["sources/neo_large"]
+        large_embedded = bool(large_group.attrs.get("embedded", False))
+        if large_embedded:
+            absent = [
+                name for name in HDF5_CANONICAL_ROOT_GROUPS if name not in handle
+            ]
+            if absent:
+                embedded_errors.append(
+                    "missing embedded groups: " + ", ".join(absent)
+                )
+            else:
+                atom_ptr = handle["structures/atom_ptr"]
+                embedded_structures = max(0, int(atom_ptr.shape[0]) - 1)
+                embedded_atoms = int(atom_ptr[-1]) if atom_ptr.shape[0] else 0
+                declared_structures = int(large_group.attrs["structures"])
+                declared_atoms = int(large_group.attrs["atoms"])
+                if embedded_structures != declared_structures:
+                    embedded_errors.append(
+                        f"embedded structures={embedded_structures}, "
+                        f"declared={declared_structures}"
+                    )
+                if embedded_atoms != declared_atoms:
+                    embedded_errors.append(
+                        f"embedded atoms={embedded_atoms}, declared={declared_atoms}"
+                    )
+                for name, dataset in handle["metadata"].items():
+                    if int(dataset.shape[0]) != declared_structures:
+                        embedded_errors.append(
+                            f"metadata/{name} length={dataset.shape[0]}"
+                        )
+                for name, dataset in handle["masks"].items():
+                    if int(dataset.shape[0]) != declared_structures:
+                        embedded_errors.append(
+                            f"masks/{name} length={dataset.shape[0]}"
+                        )
+                for name, dataset in handle["labels"].items():
+                    expected = (
+                        declared_atoms if name in HDF5_ATOM_LABELS
+                        else declared_structures
+                    )
+                    if int(dataset.shape[0]) != expected:
+                        embedded_errors.append(
+                            f"labels/{name} length={dataset.shape[0]}, expected={expected}"
+                        )
         else:
-            item["role"] = "documentation_or_provenance"
-        release_files.append(item)
+            raw_path = str(large_group.attrs.get("path", ""))
+            large = _resolve_composite_source(composite, raw_path)
+            if verify_sources:
+                if not large.is_file():
+                    missing.append(str(large))
+                elif sha256_file(str(large)) != str(
+                    large_group.attrs.get("sha256", "")
+                ):
+                    mismatched.append(str(large))
+        metadata = json.loads(str(handle.attrs.get("metadata_json", "{}")))
+        split_names = np.asarray(["train", "val", "test"], dtype=object)
+        codes = np.asarray(handle["selection/split_code"][:], dtype=np.uint8)
+        split_counts = np.bincount(codes, minlength=3)
+        splits = {
+            str(split_names[index]): int(count)
+            for index, count in enumerate(split_counts)
+            if int(count) > 0
+        }
+        large_info = dict(metadata.get("neo_large", {}))
+        for name, count in dict(large_info.get("splits", {})).items():
+            splits[str(name)] = splits.get(str(name), 0) + int(count)
+        labels = {"energy": int(handle.attrs["omat24_structures"]),
+                  "forces": int(handle.attrs["omat24_structures"]),
+                  "stress": int(handle.attrs["omat24_structures"])}
+        for name, count in dict(large_info.get("labels", {})).items():
+            labels[str(name)] = labels.get(str(name), 0) + int(count)
+        return {
+            "ready": not missing and not mismatched and not embedded_errors,
+            "valid": not missing and not mismatched and not embedded_errors,
+            "path": str(composite),
+            "kind": "Neo composite HDF5",
+            "schema_version": COMPOSITE_HDF5_SCHEMA_VERSION,
+            "tier": str(handle.attrs["tier"]),
+            "structures": int(handle.attrs["structures"]),
+            "atoms": int(handle.attrs.get("atoms", 0)),
+            "elements": [int(value) for value in json.loads(
+                str(handle.attrs.get("elements_json", "[]"))
+            )],
+            "omat24_structures": int(handle.attrs["omat24_structures"]),
+            "large_structures": int(handle.attrs["large_structures"]),
+            "periodic_structures": int(handle.attrs["omat24_structures"])
+                + int(large_info.get("periodic_structures", 0)),
+            "labels": labels,
+            "splits": dict(sorted(splits.items())),
+            "sources": {
+                **{f"OMat24/{item['name']}": int(item["selected_unique"])
+                   for item in metadata.get("omat24", {}).get("corpora", [])},
+                **{str(name): int(count)
+                   for name, count in dict(large_info.get("sources", {})).items()},
+            },
+            "missing_sources": missing,
+            "checksum_mismatches": mismatched,
+            "embedded_large": large_embedded,
+            "embedded_errors": embedded_errors,
+            "source_files": len(file_paths),
+            "sha256": sha256_file(str(composite)) if verify_sources else None,
+        }
 
-    release_manifest = {
-        "schema": "e3mu-neo-huggingface-release-v1",
-        "created_at": _now(),
-        "dataset_schema": HDF5_SCHEMA_VERSION,
-        "huggingface_license": "other",
-        "technical_staging": "complete",
-        "release_status": release_status,
-        "rights_review_acknowledged_for_local_staging": bool(
-            acknowledge_rights_review and rights_issues
-        ),
-        "rights_acknowledgement_scope": (
-            "Local staging only; not evidence of permission and not authorization to upload."
-        ),
-        "rights_issues": rights_issues,
-        "tiers": staged_tiers,
-        "files": release_files,
-        "transformations": [
-            "Sanitized absolute local paths in release JSON and HDF5 root metadata.",
-            "Completed units_json from the e3mu-hdf5-v1 schema registry.",
-            "Added release source checksum and metadata-only transformation attributes.",
-            "Did not modify any numerical HDF5 dataset, mask, ID, or split.",
-        ],
-        "excluded": [
-            "raw archives and VASP outputs",
-            "combined static/response extXYZ archives",
-            "developer smoke intermediates",
-            "candidate and selection JSONL files",
-            "checkpoints, training outputs, caches, and local proxy settings",
-        ],
-    }
-    manifest_path = output / "RELEASE_MANIFEST.json"
-    manifest_path.write_text(
-        json.dumps(_checkpoint_safe(release_manifest), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-
-    checksum_paths = sorted(
-        path
-        for path in output.rglob("*")
-        if path.is_file() and path.name != "checksums.sha256"
-    )
-    checksum_path = output / "checksums.sha256"
-    checksum_path.write_text(
-        "".join(
-            f"{sha256_file(str(path))}  {path.relative_to(output).as_posix()}\n"
-            for path in checksum_paths
-        ),
-        encoding="utf-8",
-    )
-    return {
-        "output": str(output),
-        "release_status": release_status,
-        "rights_issues": rights_issues,
-        "tiers": staged_tiers,
-        "files": len(checksum_paths) + 1,
-        "bytes": sum(path.stat().st_size for path in output.rglob("*") if path.is_file()),
-        "release_manifest": str(manifest_path),
-        "checksums": str(checksum_path),
-        "checksums_sha256": sha256_file(str(checksum_path)),
-        "uploaded": False,
-    }
 
 
 _CAPABILITY_STRUCTURE_ALIASES: Dict[str, set] = {
@@ -6896,6 +3603,8 @@ def inspect_dataset_capabilities(path: str) -> Dict[str, Any]:
         if not HAS_H5PY:
             raise RuntimeError("HDF5 capability detection requires h5py")
         with h5py.File(dataset, "r") as handle:
+            if str(handle.attrs.get("schema_version", "")) == COMPOSITE_HDF5_SCHEMA_VERSION:
+                return inspect_composite_dataset(str(dataset), verify_sources=False)
             ptr = np.asarray(handle["structures/atom_ptr"], dtype=np.int64)
             structures = int(len(ptr) - 1)
             elements.update(
@@ -7616,540 +4325,6 @@ def estimate_model_parameter_count(
     return counts
 
 
-def _base_magnetic_structures() -> Dict[str, Atoms]:
-    from ase.build import bulk, make_supercell
-
-    fe = bulk("Fe", "bcc", a=2.866, cubic=True).repeat((2, 2, 2))
-    fe.set_pbc((True, True, True))
-
-    nio = bulk("NiO", "rocksalt", a=4.17, cubic=True).repeat((1, 1, 2))
-    nio.set_pbc((True, True, True))
-
-    fe_unit = bulk("Fe", "bcc", a=2.866, cubic=True)
-    transform = np.asarray([[1, 1, 0], [-1, 1, 0], [0, 0, 1]], dtype=int)
-    fe_slab = make_supercell(fe_unit, transform).repeat((1, 1, 3))
-    nio_slab = bulk("NiO", "rocksalt", a=4.17, cubic=True).repeat((1, 1, 2))
-    target_xy = np.asarray(nio_slab.cell.array[:2], dtype=float)
-    fe_cell = np.asarray(fe_slab.cell.array, dtype=float)
-    scale = np.linalg.norm(target_xy, axis=1) / np.linalg.norm(fe_cell[:2], axis=1)
-    scaled = fe_cell.copy()
-    scaled[0] *= scale[0]
-    scaled[1] *= scale[1]
-    fe_slab.set_cell(scaled, scale_atoms=True)
-    nio_z = float(nio_slab.cell.lengths()[2])
-    fe_slab.positions[:, 2] -= float(fe_slab.positions[:, 2].min())
-    fe_slab.positions[:, 2] += nio_z + 2.0
-    interface = nio_slab + fe_slab
-    interface.set_cell(
-        [target_xy[0], target_xy[1], [0.0, 0.0, nio_z + float(fe_slab.cell.lengths()[2]) + 17.0]],
-        scale_atoms=False,
-    )
-    interface.center(vacuum=7.5, axis=2)
-    interface.set_pbc((True, True, False))
-    return {"bcc_fe": fe, "nio_afm2": nio, "fe_nio_001": interface}
-
-
-def _initial_spin_vectors(atoms: Atoms, system_id: str) -> np.ndarray:
-    spins = np.zeros((len(atoms), 3), dtype=float)
-    symbols = atoms.get_chemical_symbols()
-    if system_id == "bcc_fe":
-        spins[:, 2] = 1.0
-        return spins
-    ni_indices = [index for index, symbol in enumerate(symbols) if symbol == "Ni"]
-    in_plane_lengths = np.linalg.norm(np.asarray(atoms.cell.array[:2], dtype=float), axis=1)
-    nio_lattice = float(np.mean(in_plane_lengths))
-    ni_plane_coordinates = {
-        index: float(np.sum(atoms.positions[index]) / max(nio_lattice, 1e-12))
-        for index in ni_indices
-    }
-    plane_origin = min(ni_plane_coordinates.values()) if ni_plane_coordinates else 0.0
-    for index, symbol in enumerate(symbols):
-        if symbol == "Fe":
-            spins[index, 2] = 1.0
-        elif symbol == "Ni":
-            # Type-II AFM: each (111) Ni plane is ferromagnetic and adjacent
-            # planes, separated by a/sqrt(3), have opposite orientation.
-            layer = int(np.rint(ni_plane_coordinates[index] - plane_origin))
-            spins[index, 2] = 1.0 if layer % 2 == 0 else -1.0
-    return spins
-
-
-def _vasp_species_order(system_id: str) -> Tuple[str, ...]:
-    if system_id == "bcc_fe":
-        return ("Fe",)
-    if system_id == "nio_afm2":
-        return ("Ni", "O")
-    return ("Ni", "O", "Fe")
-
-
-def _order_atoms_for_vasp(atoms: Atoms, system_id: str) -> Atoms:
-    symbols = atoms.get_chemical_symbols()
-    order = _vasp_species_order(system_id)
-    indices = [index for symbol in order for index, value in enumerate(symbols) if value == symbol]
-    if len(indices) != len(atoms):
-        missing = sorted(set(symbols) - set(order))
-        raise ValueError(f"No VASP species order for {system_id}: {missing}")
-    return atoms[indices]
-
-
-def _spin_family(base: np.ndarray, rng: np.random.Generator) -> List[np.ndarray]:
-    """Eight states separating exchange, SOC anisotropy, DMI, and time reversal."""
-    reference = np.asarray(base, dtype=float).copy()
-    magnetic_indices = np.flatnonzero(np.linalg.norm(reference, axis=1) > 0.0)
-    if magnetic_indices.size == 0:
-        return [reference.copy() for _ in range(8)]
-    reference[magnetic_indices] /= np.linalg.norm(
-        reference[magnetic_indices], axis=1, keepdims=True
-    ).clip(min=1e-12)
-
-    flipped = reference.copy()
-    flip_index = int(magnetic_indices[int(rng.integers(0, magnetic_indices.size))])
-    flipped[flip_index] *= -1.0
-
-    axis_x = reference.copy()
-    signs_x = np.sign(reference[magnetic_indices, 2])
-    signs_x[signs_x == 0.0] = 1.0
-    axis_x[magnetic_indices] = 0.0
-    axis_x[magnetic_indices, 0] = signs_x
-
-    angles = np.linspace(0.0, 2.0 * np.pi, magnetic_indices.size, endpoint=False)
-    cone_z = 0.60
-    cone_xy = math.sqrt(1.0 - cone_z * cone_z)
-    chiral_plus = reference.copy()
-    chiral_minus = reference.copy()
-    signs = np.sign(reference[magnetic_indices, 2])
-    signs[signs == 0.0] = 1.0
-    chiral_plus[magnetic_indices, 0] = cone_xy * np.cos(angles)
-    chiral_plus[magnetic_indices, 1] = cone_xy * np.sin(angles)
-    chiral_plus[magnetic_indices, 2] = cone_z * signs
-    chiral_minus[magnetic_indices, 0] = cone_xy * np.cos(angles)
-    chiral_minus[magnetic_indices, 1] = -cone_xy * np.sin(angles)
-    chiral_minus[magnetic_indices, 2] = cone_z * signs
-    return [
-        reference,
-        -reference,
-        flipped,
-        -flipped,
-        reference.copy(),
-        axis_x,
-        chiral_plus,
-        chiral_minus,
-    ]
-
-
-def _vasp_incar_text(
-    system_id: str,
-    spins: np.ndarray,
-    *,
-    soc: bool,
-    species: Optional[Sequence[str]] = None,
-) -> str:
-    atom_species = list(species or (["Fe"] * len(spins)))
-    moment_scale = {"Fe": 2.2, "Ni": 1.7, "O": 0.0}
-    moments_array = np.asarray(spins, dtype=float) * np.asarray(
-        [moment_scale.get(symbol, 1.0) for symbol in atom_species], dtype=float
-    ).reshape(-1, 1)
-    moments = " ".join(f"{x:.8f} {y:.8f} {z:.8f}" for x, y, z in moments_array)
-    lines = [
-        "SYSTEM = E3MU_" + system_id,
-        "ENCUT = 520",
-        "PREC = Accurate",
-        "EDIFF = 1E-7",
-        "EDIFFG = -1E-3",
-        "IBRION = -1",
-        "NSW = 0",
-        "ISYM = 0",
-        "LASPH = .TRUE.",
-        "LREAL = .FALSE.",
-        "LCHARG = .FALSE.",
-        "LWAVE = .FALSE.",
-        "LNONCOLLINEAR = .TRUE.",
-        "I_CONSTRAINED_M = 1",
-        "LAMBDA = 10",
-        "M_CONSTR = " + moments,
-        "MAGMOM = " + moments,
-    ]
-    if system_id == "bcc_fe":
-        lines.extend(["ISMEAR = 1", "SIGMA = 0.10"])
-    else:
-        ordered_species = _vasp_species_order(system_id)
-        ldau_l = ["2" if symbol == "Ni" else "-1" for symbol in ordered_species]
-        ldau_u = ["5.0" if symbol == "Ni" else "0.0" for symbol in ordered_species]
-        ldau_j = ["0.0" for _ in ordered_species]
-        lines.extend(
-            [
-                "ISMEAR = 0",
-                "SIGMA = 0.05",
-                "LDAU = .TRUE.",
-                "LDAUTYPE = 2",
-                "LDAUL = " + " ".join(ldau_l),
-                "LDAUU = " + " ".join(ldau_u),
-                "LDAUJ = " + " ".join(ldau_j),
-                "LMAXMIX = 4",
-            ]
-        )
-    if soc:
-        lines.extend(["LSORBIT = .TRUE.", "GGA_COMPAT = .FALSE.", "SAXIS = 0 0 1"])
-    if system_id == "fe_nio_001":
-        lines.extend(["LDIPOL = .TRUE.", "IDIPOL = 3"])
-    return "\n".join(lines) + "\n"
-
-
-def _vasp_kpoints_text(system_id: str) -> str:
-    mesh = (6, 6, 6) if system_id == "bcc_fe" else ((4, 4, 4) if system_id == "nio_afm2" else (5, 5, 1))
-    return "Automatic mesh\n0\nGamma\n{} {} {}\n0 0 0\n".format(*mesh)
-
-
-def generate_vasp_magnetic_jobs(
-    output_dir: str,
-    *,
-    total_jobs: int = 360,
-    seed: int = 20260718,
-    overwrite_metadata: bool = False,
-) -> Dict[str, Any]:
-    """Generate constrained non-collinear Fe/NiO/interface jobs without POTCAR data."""
-    from ase.io import write as ase_write
-
-    root = Path(output_dir).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    systems = _base_magnetic_structures()
-    family_size = 8
-    per_system = int(total_jobs) // len(systems)
-    if per_system < family_size:
-        raise ValueError("total_jobs must provide at least eight jobs per magnetic system")
-    per_system -= per_system % family_size
-    rng = np.random.default_rng(seed)
-    manifest: Dict[str, Any] = {
-        "schema": "e3mu-vasp-jobs-v1",
-        "seed": int(seed),
-        "potcar_distributed": False,
-        "nio_u_eff_ev": 5.0,
-        "jobs": [],
-    }
-    for system_id, base_atoms in systems.items():
-        base_atoms = _order_atoms_for_vasp(base_atoms, system_id)
-        parent_count = per_system // family_size
-        base_spins = _initial_spin_vectors(base_atoms, system_id)
-        for parent_index in range(parent_count):
-            atoms = base_atoms.copy()
-            strain = rng.normal(0.0, 0.008, size=(3, 3))
-            strain = 0.5 * (strain + strain.T)
-            if not bool(atoms.pbc[2]):
-                strain[2, :] = 0.0
-                strain[:, 2] = 0.0
-            atoms.set_cell(np.asarray(atoms.cell) @ (np.eye(3) + strain), scale_atoms=True)
-            atoms.positions += rng.normal(0.0, 0.025, size=atoms.positions.shape)
-            parent_id = f"{system_id}-parent-{parent_index:03d}"
-            split = stable_split(parent_id, train=60, val=20)
-            spin_family = _spin_family(base_spins, rng)
-            for variant, spins in enumerate(spin_family):
-                soc = variant >= 4
-                sample_id = f"{parent_id}-spin-{variant}"
-                job_dir = root / system_id / sample_id
-                job_dir.mkdir(parents=True, exist_ok=True)
-                metadata_path = job_dir / "metadata.json"
-                if metadata_path.exists() and not overwrite_metadata:
-                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                else:
-                    metadata = {
-                        "sample_id": sample_id,
-                        "parent_id": parent_id,
-                        "system_id": system_id,
-                        "split": split,
-                        "soc": bool(soc),
-                        "spin_variant": int(variant),
-                        "spin_design": (
-                            "reference" if variant == 0 else
-                            "time_reversed_reference" if variant == 1 else
-                            "single_site_flip" if variant == 2 else
-                            "time_reversed_single_site_flip" if variant == 3 else
-                            "soc_axis_z" if variant == 4 else
-                            "soc_axis_x" if variant == 5 else
-                            "positive_chirality" if variant == 6 else
-                            "negative_chirality"
-                        ),
-                        "spins": spins.tolist(),
-                        "method_id": "PBE+U5+SOC" if (system_id != "bcc_fe" and soc) else ("PBE+SOC" if soc else ("PBE+U5" if system_id != "bcc_fe" else "PBE")),
-                        "potcar_policy": "resolve from VASP_PP_PATH; never package POTCAR",
-                    }
-                    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
-                    ase_write(job_dir / "POSCAR", atoms, format="vasp", direct=True, vasp5=True)
-                    (job_dir / "INCAR").write_text(
-                        _vasp_incar_text(
-                            system_id,
-                            spins,
-                            soc=soc,
-                            species=atoms.get_chemical_symbols(),
-                        ),
-                        encoding="ascii",
-                    )
-                    (job_dir / "KPOINTS").write_text(_vasp_kpoints_text(system_id), encoding="ascii")
-                manifest["jobs"].append(
-                    {"directory": job_dir.relative_to(root).as_posix(), **metadata}
-                )
-    manifest["generated_jobs"] = len(manifest["jobs"])
-    manifest_path = root / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    return {"manifest": str(manifest_path), "jobs": len(manifest["jobs"]), "root": str(root)}
-
-
-def run_vasp_job(job_dir: str, *, executable: str = "vasp_std", mpi_ranks: int = 1) -> int:
-    directory = Path(job_dir).expanduser().resolve()
-    if not (directory / "INCAR").exists() or not (directory / "POSCAR").exists():
-        raise FileNotFoundError(f"Not a generated VASP job: {directory}")
-    if not (directory / "POTCAR").exists():
-        raise FileNotFoundError(
-            f"{directory / 'POTCAR'} is missing. Resolve licensed PAW datasets locally before running."
-        )
-    command = [executable] if int(mpi_ranks) <= 1 else ["mpirun", "-np", str(int(mpi_ranks)), executable]
-    with (directory / "vasp.stdout").open("w", encoding="utf-8") as stdout, (
-        directory / "vasp.stderr"
-    ).open("w", encoding="utf-8") as stderr:
-        process = subprocess.run(command, cwd=directory, stdout=stdout, stderr=stderr, check=False)
-    return int(process.returncode)
-
-
-def _spin_mapping_features(
-    atoms: Atoms,
-    spins: np.ndarray,
-    *,
-    cutoff: float = 4.5,
-) -> Tuple[float, float, np.ndarray, np.ndarray]:
-    """Return aggregate Heisenberg, uniaxial, and chiral design features."""
-    spin_array = np.asarray(spins, dtype=float).reshape(len(atoms), 3)
-    magnetic = np.linalg.norm(spin_array, axis=1) > 1e-10
-    src_all, dst_all = neighbor_list("ij", atoms, cutoff=float(cutoff))
-    keep = (src_all < dst_all) & magnetic[src_all] & magnetic[dst_all]
-    src, dst = src_all[keep], dst_all[keep]
-    if src.size:
-        dots = np.sum(spin_array[src] * spin_array[dst], axis=1)
-        crosses = np.cross(spin_array[src], spin_array[dst])
-        x_j = -float(np.sum(dots))
-        x_dmi = np.sum(crosses, axis=0)
-        pairs = np.stack([src, dst], axis=1).astype(np.int64)
-    else:
-        x_j = 0.0
-        x_dmi = np.zeros(3, dtype=float)
-        pairs = np.zeros((0, 2), dtype=np.int64)
-    x_di = float(np.sum(spin_array[magnetic, 2] ** 2 - 1.0 / 3.0))
-    return x_j, x_di, np.asarray(x_dmi, dtype=float), pairs
-
-
-def _mapped_effective_field(
-    spins: np.ndarray,
-    pairs: np.ndarray,
-    *,
-    j_effective: float,
-    dmi_effective: np.ndarray,
-    di_effective: np.ndarray,
-) -> np.ndarray:
-    spin_array = np.asarray(spins, dtype=float)
-    field_array = np.zeros_like(spin_array)
-    dmi = np.asarray(dmi_effective, dtype=float).reshape(3)
-    di = np.asarray(di_effective, dtype=float).reshape(3, 3)
-    for src, dst in np.asarray(pairs, dtype=np.int64).reshape(-1, 2):
-        field_array[src] += float(j_effective) * spin_array[dst] - np.cross(spin_array[dst], dmi)
-        field_array[dst] += float(j_effective) * spin_array[src] - np.cross(dmi, spin_array[src])
-    field_array -= 2.0 * np.einsum("ab,nb->na", di, spin_array)
-    return field_array
-
-
-def attach_spin_energy_mappings(
-    configurations: Sequence[Configuration],
-    *,
-    cutoff: float = 4.5,
-) -> Dict[str, Any]:
-    """Fit effective J, uniaxial Di, and projected DMI from each eight-state family."""
-    families: Dict[str, List[Configuration]] = {}
-    for cfg in configurations:
-        group_id = str(cfg.properties.get("group_id", "unknown"))
-        families.setdefault(group_id, []).append(cfg)
-    mapped = 0
-    diagnostics: List[Dict[str, Any]] = []
-    for group_id, family in families.items():
-        by_variant = {
-            int(round(float(cfg.properties.get("spin_variant", -1)))): cfg for cfg in family
-        }
-        if any(index not in by_variant for index in range(8)):
-            continue
-        ordered = [by_variant[index] for index in range(8)]
-        energies = np.asarray([float(cfg.properties["energy"]) for cfg in ordered], dtype=float)
-        features: List[Tuple[float, float, np.ndarray, np.ndarray]] = []
-        for cfg in ordered:
-            atoms = Atoms(
-                numbers=cfg.atomic_numbers,
-                positions=cfg.positions,
-                cell=cfg.cell,
-                pbc=cfg.pbc,
-            )
-            features.append(
-                _spin_mapping_features(atoms, np.asarray(cfg.properties["spins"]), cutoff=cutoff)
-            )
-        x_j = np.asarray([item[0] for item in features])
-        x_di = np.asarray([item[1] for item in features])
-        x_dmi = np.stack([item[2] for item in features])
-
-        e_reference = 0.5 * (energies[0] + energies[1])
-        e_flipped = 0.5 * (energies[2] + energies[3])
-        xj_reference = 0.5 * (x_j[0] + x_j[1])
-        xj_flipped = 0.5 * (x_j[2] + x_j[3])
-        denominator_j = xj_flipped - xj_reference
-        j_effective = (e_flipped - e_reference) / denominator_j if abs(denominator_j) > 1e-12 else 0.0
-
-        delta_chiral = x_dmi[6] - x_dmi[7]
-        delta_energy = (energies[6] - energies[7]) - j_effective * (x_j[6] - x_j[7])
-        denominator_dmi = float(np.dot(delta_chiral, delta_chiral))
-        dmi_effective = (
-            delta_energy * delta_chiral / denominator_dmi
-            if denominator_dmi > 1e-16
-            else np.zeros(3, dtype=float)
-        )
-
-        denominator_di = x_di[5] - x_di[4]
-        residual_di = (
-            energies[5]
-            - energies[4]
-            - j_effective * (x_j[5] - x_j[4])
-            - float(np.dot(dmi_effective, x_dmi[5] - x_dmi[4]))
-        )
-        k_effective = residual_di / denominator_di if abs(denominator_di) > 1e-12 else 0.0
-        di_effective = k_effective * (np.diag([0.0, 0.0, 1.0]) - np.eye(3) / 3.0)
-
-        reduced_energy = energies - j_effective * x_j - k_effective * x_di - x_dmi @ dmi_effective
-        offset_non_soc = float(np.mean(reduced_energy[:4]))
-        offset_soc = float(np.mean(reduced_energy[4:]))
-        offsets = np.asarray([offset_non_soc] * 4 + [offset_soc] * 4)
-        predicted = offsets + j_effective * x_j + k_effective * x_di + x_dmi @ dmi_effective
-        rmse = float(np.sqrt(np.mean((predicted - energies) ** 2)))
-        tr_error = float(max(abs(energies[0] - energies[1]), abs(energies[2] - energies[3])))
-        for cfg, (_, _, _, pairs) in zip(ordered, features):
-            spins = np.asarray(cfg.properties["spins"], dtype=float)
-            magnetic = np.linalg.norm(spins, axis=1) > 1e-10
-            di_atoms = np.zeros((len(spins), 3, 3), dtype=float)
-            di_atoms[magnetic] = di_effective
-            cfg.properties.update(
-                {
-                    "J_effective": float(j_effective),
-                    "DMI_effective": dmi_effective.copy(),
-                    "Di_effective": di_effective.copy(),
-                    "Di": di_atoms,
-                    "effective_field": _mapped_effective_field(
-                        spins,
-                        pairs,
-                        j_effective=j_effective,
-                        dmi_effective=dmi_effective,
-                        di_effective=di_effective,
-                    ),
-                    "spin_mapping_rmse": rmse,
-                }
-            )
-            for name in (
-                "J_effective", "DMI_effective", "Di_effective", "Di",
-                "effective_field", "spin_mapping_rmse",
-            ):
-                cfg.property_weights[name] = 1.0
-        mapped += 1
-        diagnostics.append(
-            {
-                "group_id": group_id,
-                "J_effective_eV": float(j_effective),
-                "DMI_effective_eV": dmi_effective.tolist(),
-                "K_effective_eV": float(k_effective),
-                "offset_non_soc_eV": offset_non_soc,
-                "offset_soc_eV": offset_soc,
-                "mapping_rmse_eV": rmse,
-                "time_reversal_pair_error_eV": tr_error,
-            }
-        )
-    return {"mapped_families": mapped, "diagnostics": diagnostics}
-
-
-def collect_vasp_magnetic_jobs(
-    jobs_root: str,
-    output_hdf5: str,
-    *,
-    overwrite: bool = False,
-) -> Dict[str, Any]:
-    from ase.io import read as ase_read
-
-    root = Path(jobs_root).expanduser().resolve()
-    metadata_files = sorted(root.glob("*/*/metadata.json"))
-    configs: List[Configuration] = []
-    failures: List[Dict[str, str]] = []
-    for metadata_path in metadata_files:
-        directory = metadata_path.parent
-        outcar = directory / "OUTCAR"
-        if not outcar.exists():
-            failures.append({"directory": str(directory), "reason": "missing OUTCAR"})
-            continue
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            atoms = ase_read(outcar, index=-1)
-            energy = float(atoms.get_potential_energy())
-            forces = np.asarray(atoms.get_forces(), dtype=float)
-            try:
-                magmoms = np.asarray(atoms.get_magnetic_moments(), dtype=float)
-                if magmoms.ndim == 1:
-                    magmoms = np.pad(magmoms.reshape(-1, 1), ((0, 0), (0, 2)))
-            except Exception:
-                magmoms = np.zeros((len(atoms), 3), dtype=float)
-            props = {
-                "energy": energy,
-                "forces": forces,
-                "spins": np.asarray(metadata["spins"], dtype=float),
-                "magnetic_moments": magmoms,
-                "field": np.zeros(3, dtype=float),
-                "total_charge": 0.0,
-                "source": "VASP-local",
-                "method_id": str(metadata["method_id"]),
-                "system_id": str(metadata["system_id"]),
-                "group_id": str(metadata["parent_id"]),
-                "split": str(metadata["split"]),
-                "spin_variant": float(metadata["spin_variant"]),
-                "soc": float(bool(metadata["soc"])),
-            }
-            configs.append(
-                Configuration(
-                    atomic_numbers=np.asarray(atoms.numbers, dtype=int),
-                    positions=np.asarray(atoms.positions, dtype=float),
-                    properties=props,
-                    property_weights={
-                        "energy": 1.0,
-                        "forces": 1.0,
-                        "spins": 1.0,
-                        "magnetic_moments": 1.0,
-                        "spin_variant": 1.0,
-                        "soc": 1.0,
-                    },
-                    cell=np.asarray(atoms.cell.array, dtype=float),
-                    pbc=tuple(bool(x) for x in atoms.pbc),
-                    head=str(metadata["method_id"]),
-                )
-            )
-        except Exception as exc:
-            failures.append({"directory": str(directory), "reason": f"{type(exc).__name__}: {exc}"})
-    if not configs:
-        return {"collected": 0, "failed": len(failures), "failures": failures, "output": None}
-    mapping = attach_spin_energy_mappings(configs)
-    output = write_hdf5_dataset(
-        configs,
-        output_hdf5,
-        metadata={
-            "dataset": "Fe-NiO-spin",
-            "jobs_root": str(root),
-            "failures": failures,
-            "energy_mapping": mapping,
-        },
-        overwrite=overwrite,
-    )
-    return {
-        "collected": len(configs),
-        "failed": len(failures),
-        "failures": failures,
-        "mapped_families": int(mapping["mapped_families"]),
-        "output": output,
-    }
-
 
 def get_neighborhood(
     *,
@@ -8218,6 +4393,20 @@ def split_train_val(data: Sequence[Any], val_fraction: float, seed: int) -> Tupl
 
 def _is_hdf5_path(path: str) -> bool:
     return Path(path).suffix.lower() in (".h5", ".hdf5", ".hdf")
+
+
+def _hdf5_schema(path: str) -> str:
+    if not _is_hdf5_path(path) or not HAS_H5PY:
+        return ""
+    try:
+        with h5py.File(Path(path).expanduser(), "r") as handle:
+            return str(handle.attrs.get("schema_version", ""))
+    except Exception:
+        return ""
+
+
+def _is_composite_hdf5_path(path: str) -> bool:
+    return _hdf5_schema(path) == COMPOSITE_HDF5_SCHEMA_VERSION
 
 
 def load_configurations_auto(
@@ -11470,6 +7659,10 @@ class TrainConfig:
     # same graph every epoch. Geometry and labels remain in canonical HDF5.
     cache_neighbor_graphs: bool = True
     graph_cache_dir: str = ""
+    # Composite Joint epochs use every response record and a rotating,
+    # deterministic foundation window. This prevents rare L2/L3 labels from
+    # being diluted by tens of millions of OMat24 L1 structures.
+    composite_joint_foundation_ratio: float = 4.0
     # Write per-epoch .pt checkpoints + scatter/MAE plots to ./train/.
     # Set to False during AutoSearch trials to avoid I/O overhead.
     save_epoch_artifacts: bool = True
@@ -12798,7 +8991,29 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         and _is_hdf5_path(cfg.dataset)
         and getattr(cfg, "stream_hdf5", True)
     )
-    if use_hdf5_stream:
+    composite_plan: Optional[CompositeStreamPlan] = None
+    use_composite_stream = bool(use_hdf5_stream and _is_composite_hdf5_path(cfg.dataset))
+    if use_composite_stream:
+        composite_plan = prepare_composite_stream_plan(
+            cfg.dataset,
+            mode=cfg.mode,
+            val_fraction=float(cfg.val_fraction),
+            seed=int(cfg.seed),
+            sample_fraction=float(cfg.subset_fraction),
+        )
+        split_info = dict(composite_plan.split_info)
+        zs = list(composite_plan.elements)
+        log(
+            f"[{_now()}] Composite HDF5 streaming index: "
+            f"train={split_info['train_structures']} val={split_info['val_structures']} "
+            f"(OMat24={split_info['train_omat24']}/{split_info['val_omat24']}, "
+            f"Large={split_info['train_large']}/{split_info['val_large']}); "
+            "Parquet/HDF5 numerical arrays remain on disk."
+        )
+        log(f"[{_now()}] Grouped split: {json.dumps(split_info, sort_keys=True)}")
+        static_cfgs = static_fields = resp_cfgs = resp_fields = []
+        all_cfgs = all_fields = train_cfgs = train_fields = val_cfgs = val_fields = []
+    elif use_hdf5_stream:
         plan_key = (
             "hdf5_stream_plan",
             str(Path(cfg.dataset).expanduser().resolve()),
@@ -12819,6 +9034,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             )
             if _cache is not None:
                 _cache[plan_key] = stream_plan
+        stream_plan = _filter_hdf5_stream_plan_for_mode(stream_plan, cfg.mode)
         split_info = dict(stream_plan.split_info)
         zs = list(stream_plan.elements)
         log(
@@ -12952,7 +9168,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         if progress is not None:
             progress({"type": "prep", "task": "Fit atomic energies", "overall_frac": 0.01, "current": 0, "total": 1, "stage": "start"})
         log(f"[{_now()}] Fitting atomic energies ...")
-        if stream_plan is not None and "energy" in stream_plan.label_masks:
+        if composite_plan is not None:
+            atomic_energies = fit_atomic_energies_from_composite_plan(
+                composite_plan, zs
+            )
+        elif stream_plan is not None and "energy" in stream_plan.label_masks:
             atomic_energies = fit_atomic_energies_from_hdf5_plan(stream_plan, zs)
         else:
             energy_fit_cfgs = [
@@ -12988,7 +9208,29 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     
     # Stream canonical HDF5 or materialize legacy inputs after the group-safe split.
     stopped = False
-    if stream_plan is not None:
+    if composite_plan is not None:
+        train_data = CompositeAtomicDataDataset(
+            composite_plan,
+            composite_plan.train_omat_indices,
+            composite_plan.train_large_indices,
+            z_table=z_table,
+            cutoff=float(model.cfg.r_max),
+        )
+        val_data = CompositeAtomicDataDataset(
+            composite_plan,
+            composite_plan.val_omat_indices,
+            composite_plan.val_large_indices,
+            z_table=z_table,
+            cutoff=float(model.cfg.r_max),
+        )
+        train_atoms = int(np.sum(train_data.atom_counts, dtype=np.int64))
+        avg_n = float("nan")
+        log(
+            f"[{_now()}] Composite dataset streaming: train={len(train_data)} "
+            f"val={len(val_data)} mode={cfg.mode}; source shards are opened lazily "
+            "and RAM retains only selectors/masks."
+        )
+    elif stream_plan is not None:
         topology_cache: Optional[str] = None
         if bool(getattr(cfg, "cache_neighbor_graphs", True)):
             topology_cache = build_hdf5_topology_cache(
@@ -13150,7 +9392,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     _dl_pin_memory = False
     _dl_persistent = bool(_dl_num_workers > 0)
     _dl_prefetch = 2
-    _dl_thread_prefetch = 2 if stream_plan is not None else 0
+    _dl_thread_prefetch = 2 if (stream_plan is not None or composite_plan is not None) else 0
     log(
         f"[{_now()}] DataLoader: num_workers={_dl_num_workers} pin_memory={_dl_pin_memory} "
         f"persistent_workers={_dl_persistent} prefetch_factor={_dl_prefetch} "
@@ -13210,6 +9452,104 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         def __len__(self) -> int:
             return len(self.batches)
 
+    class _CompositeCurriculumBatchSampler:
+        """Shard-local OMat batches with rotating role-balanced Joint windows."""
+
+        def __init__(
+            self,
+            ds: CompositeAtomicDataDataset,
+            batch_size: int,
+            seed: int,
+            *,
+            shuffle: bool,
+        ) -> None:
+            self.ds = ds
+            self.batch_size = max(1, int(batch_size))
+            self.seed = int(seed)
+            self.shuffle = bool(shuffle)
+            self.epoch = 0
+            self.omat_count = int(ds.omat_indices.size)
+            self.large_count = int(ds.large_indices.size)
+            self.large_local = np.arange(
+                self.omat_count, self.omat_count + self.large_count, dtype=np.int64
+            )
+            self.omat_by_source: Dict[int, np.ndarray] = {}
+            if self.omat_count:
+                orders = ds.plan.source_orders[ds.omat_indices]
+                rows = ds.plan.row_indices[ds.omat_indices]
+                for source_order in np.unique(orders):
+                    local = np.flatnonzero(orders == source_order).astype(np.int64)
+                    self.omat_by_source[int(source_order)] = local[
+                        np.argsort(rows[local], kind="stable")
+                    ]
+
+        def _omat_epoch_indices(self, rng: np.random.Generator) -> np.ndarray:
+            if self.omat_count == 0:
+                return np.zeros((0,), dtype=np.int64)
+            if self.ds.plan.mode != "joint" or self.large_count == 0:
+                selected = np.arange(self.omat_count, dtype=np.int64)
+            else:
+                ratio = float(getattr(cfg, "composite_joint_foundation_ratio", 4.0))
+                if not math.isfinite(ratio) or ratio <= 0.0:
+                    raise ValueError(
+                        "composite_joint_foundation_ratio must be finite and > 0"
+                    )
+                target = min(self.omat_count, max(1, int(round(ratio * self.large_count))))
+                start = (self.epoch * target) % self.omat_count
+                selected = (start + np.arange(target, dtype=np.int64)) % self.omat_count
+            if not self.omat_by_source:
+                return selected
+            selected_set = np.zeros((self.omat_count,), dtype=np.bool_)
+            selected_set[selected] = True
+            source_order = np.asarray(list(self.omat_by_source), dtype=np.int64)
+            if self.shuffle:
+                rng.shuffle(source_order)
+            blocks: List[np.ndarray] = []
+            for source in source_order:
+                local = self.omat_by_source[int(source)]
+                kept = local[selected_set[local]]
+                if kept.size:
+                    blocks.append(kept)
+            return np.concatenate(blocks) if blocks else np.zeros((0,), dtype=np.int64)
+
+        def __iter__(self) -> Iterable[List[int]]:
+            rng = np.random.default_rng(self.seed + self.epoch)
+            omat = self._omat_epoch_indices(rng)
+            large = self.large_local.copy()
+            if self.shuffle:
+                rng.shuffle(large)
+            omat_batches = [
+                omat[start:start + self.batch_size].tolist()
+                for start in range(0, int(omat.size), self.batch_size)
+            ]
+            large_batches = [
+                large[start:start + self.batch_size].tolist()
+                for start in range(0, int(large.size), self.batch_size)
+            ]
+            if omat_batches and large_batches:
+                merged: List[List[int]] = []
+                omat_step = max(1, int(math.ceil(len(omat_batches) / len(large_batches))))
+                cursor = 0
+                for response_batch in large_batches:
+                    merged.extend(omat_batches[cursor:cursor + omat_step])
+                    cursor += omat_step
+                    merged.append(response_batch)
+                merged.extend(omat_batches[cursor:])
+            else:
+                merged = omat_batches + large_batches
+            self.epoch += 1
+            return iter(merged)
+
+        def __len__(self) -> int:
+            if self.ds.plan.mode == "joint" and self.large_count:
+                ratio = max(1e-12, float(getattr(cfg, "composite_joint_foundation_ratio", 4.0)))
+                omat_count = min(self.omat_count, max(1, int(round(ratio * self.large_count))))
+            else:
+                omat_count = self.omat_count
+            return int(math.ceil(omat_count / self.batch_size)) + int(
+                math.ceil(self.large_count / self.batch_size)
+            )
+
     def _make_loader(ds: Sequence[AtomicData], *, shuffle: bool) -> Any:
         # Clamp the batch size so tiny validation sets still produce a batch.
         _eff_bs = max(1, min(int(cfg.batch_size), len(ds) if ds else 1))
@@ -13218,7 +9558,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             num_workers=int(_dl_num_workers),
             pin_memory=bool(_dl_pin_memory),
         )
-        if device.type == "mps":
+        if isinstance(ds, CompositeAtomicDataDataset):
+            kwargs["batch_sampler"] = _CompositeCurriculumBatchSampler(
+                ds, _eff_bs, int(cfg.seed), shuffle=shuffle
+            )
+        elif device.type == "mps":
             # Force/BEC training differentiates through positions twice. Bound
             # edges rather than only structures because edge count drives memory.
             # Apply the same policy to validation, where conservative forces
@@ -13243,7 +9587,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             kwargs.pop("persistent_workers", None)
             kwargs.pop("prefetch_factor", None)
             created = DataLoader(ds, **kwargs)
-        if isinstance(ds, HDF5AtomicDataDataset) and _dl_thread_prefetch > 0:
+        if isinstance(ds, (HDF5AtomicDataDataset, CompositeAtomicDataDataset)) and _dl_thread_prefetch > 0:
             return _ThreadPrefetchLoader(created, depth=_dl_thread_prefetch)
         return created
 
@@ -13281,9 +9625,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         from torch.optim.lr_scheduler import CosineAnnealingLR as _CosLR
         _sched = _CosLR(opt, T_max=max(1, int(cfg.epochs)), eta_min=1e-7)
 
-    def _reduce_optimizer_learning_rates() -> List[float]:
+    def _reduce_optimizer_learning_rates(
+        optimizer: torch.optim.Optimizer,
+    ) -> List[float]:
         updated: List[float] = []
-        for group in opt.param_groups:
+        for group in optimizer.param_groups:
             group["lr"] = max(1e-8, float(group["lr"]) * _nonfinite_lr_decay)
             updated.append(float(group["lr"]))
         if _sched is not None:
@@ -13578,7 +9924,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     else "initial finite model"
                 )
                 opt.state.clear()
-                _new_lrs = _reduce_optimizer_learning_rates()
+                _new_lrs = _reduce_optimizer_learning_rates(opt)
                 _forward_attempt += 1
                 _recovery = {
                     "epoch": int(epoch),
@@ -18738,8 +15084,6 @@ AUTOSEARCH_TO_GUI = {
 
 
 
-
-
 PALETTE = {
     "background": "#F7F5FA",
     "surface": "#FFFDFE",
@@ -22030,225 +18374,13 @@ def run_qt_gui(backend: Any, argv: Optional[Sequence[str]] = None) -> int:
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Mixed-granularity E(3)-mu GNN data, VASP, training, and validation tools."
+        description="Mixed-granularity E(3)-mu GNN training and inference tools."
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    extxyz_parser = subparsers.add_parser("dataset-extxyz", help="Convert extXYZ to canonical HDF5")
-    extxyz_parser.add_argument("input")
-    extxyz_parser.add_argument("output")
-    extxyz_parser.add_argument("--max-frames", type=int)
-    extxyz_parser.add_argument("--overwrite", action="store_true")
-
-    qm7x_parser = subparsers.add_parser("dataset-qm7x", help="Rebuild canonical QM7-X from raw HDF5")
-    qm7x_parser.add_argument("raw")
-    qm7x_parser.add_argument("output")
-    qm7x_parser.add_argument("--max-frames", type=int)
-    qm7x_parser.add_argument("--overwrite", action="store_true")
-
-    so3lr_parser = subparsers.add_parser("dataset-so3lr", help="Convert an official SO3LR HDF5 shard")
-    so3lr_parser.add_argument("raw")
-    so3lr_parser.add_argument("output")
-    so3lr_parser.add_argument("--dataset-name")
-    so3lr_parser.add_argument("--max-frames", type=int)
-    so3lr_parser.add_argument("--overwrite", action="store_true")
-
-    deepspin_parser = subparsers.add_parser("dataset-deepspin", help="Convert official DeepSPIN NiO raw files")
-    deepspin_parser.add_argument("raw_directory")
-    deepspin_parser.add_argument("output")
-    deepspin_parser.add_argument("--max-frames", type=int)
-    deepspin_parser.add_argument("--overwrite", action="store_true")
-
-    mptrj_scan_parser = subparsers.add_parser("dataset-mptrj-scan", help="Index multi-element magnetic MPtrj materials")
-    mptrj_scan_parser.add_argument("raw_json")
-    mptrj_scan_parser.add_argument("index")
-    mptrj_scan_parser.add_argument("--min-elements", type=int, default=2)
-    mptrj_scan_parser.add_argument("--min-abs-moment", type=float, default=0.05)
-    mptrj_scan_parser.add_argument("--max-atoms", type=int, default=160)
-
-    mptrj_select_parser = subparsers.add_parser("dataset-mptrj-select", help="Select balanced magnetic MPtrj materials")
-    mptrj_select_parser.add_argument("index")
-    mptrj_select_parser.add_argument("selection")
-    mptrj_select_parser.add_argument("--target", type=int, default=12000)
-
-    mptrj_build_parser = subparsers.add_parser("dataset-mptrj-build", help="Build a selected magnetic MPtrj HDF5 shard")
-    mptrj_build_parser.add_argument("raw_json")
-    mptrj_build_parser.add_argument("selection")
-    mptrj_build_parser.add_argument("output")
-    mptrj_build_parser.add_argument("--min-abs-moment", type=float, default=0.05)
-    mptrj_build_parser.add_argument("--overwrite", action="store_true")
-
-    mptrj_large_parser = subparsers.add_parser(
-        "dataset-mptrj-large-build",
-        help="Build a trajectory-rich MPtrj shard while retaining required samples",
+    train_parser = subparsers.add_parser(
+        "train", help="Train from canonical HDF5 or legacy extXYZ"
     )
-    mptrj_large_parser.add_argument("raw_json")
-    mptrj_large_parser.add_argument("output")
-    mptrj_large_parser.add_argument("--required-hdf5", action="append", default=[])
-    mptrj_large_parser.add_argument("--max-per-material", type=int, default=4)
-    mptrj_large_parser.add_argument("--min-elements", type=int, default=2)
-    mptrj_large_parser.add_argument("--max-atoms", type=int, default=160)
-    mptrj_large_parser.add_argument("--min-abs-moment", type=float, default=0.05)
-    mptrj_large_parser.add_argument("--report")
-    mptrj_large_parser.add_argument("--overwrite", action="store_true")
-
-    static_select_parser = subparsers.add_parser("dataset-static-mptrj-select", help="Recover balanced MPtrj IDs from Parquet")
-    static_select_parser.add_argument("parquet_directory")
-    static_select_parser.add_argument("selection")
-    static_select_parser.add_argument("--source-rows", type=int, default=200000)
-    static_select_parser.add_argument("--target", type=int, default=40000)
-    static_select_parser.add_argument("--min-elements", type=int, default=2)
-    static_select_parser.add_argument("--max-atoms", type=int, default=160)
-
-    static_build_parser = subparsers.add_parser("dataset-static-mptrj-build", help="Build a recovered static MPtrj HDF5 shard")
-    static_build_parser.add_argument("static_extxyz")
-    static_build_parser.add_argument("parquet_directory")
-    static_build_parser.add_argument("selection")
-    static_build_parser.add_argument("output")
-    static_build_parser.add_argument("--overwrite", action="store_true")
-
-    scfnn_parser = subparsers.add_parser("dataset-scfnn", help="Recover SCFNN field frames from combined response extXYZ")
-    scfnn_parser.add_argument("response_extxyz")
-    scfnn_parser.add_argument("output")
-    scfnn_parser.add_argument("--overwrite", action="store_true")
-
-    bec_parser = subparsers.add_parser("dataset-bec", help="Recover local DFPT BEC frames from combined response extXYZ")
-    bec_parser.add_argument("response_extxyz")
-    bec_parser.add_argument("output")
-    bec_parser.add_argument("--overwrite", action="store_true")
-
-    jarvis_scan_parser = subparsers.add_parser("dataset-jarvis-scan", help="Index complex multi-element JARVIS structures")
-    jarvis_scan_parser.add_argument("raw_json")
-    jarvis_scan_parser.add_argument("index")
-    jarvis_scan_parser.add_argument("--min-elements", type=int, default=2)
-    jarvis_scan_parser.add_argument("--max-atoms", type=int, default=160)
-
-    jarvis_select_parser = subparsers.add_parser("dataset-jarvis-select", help="Select balanced complex JARVIS structures")
-    jarvis_select_parser.add_argument("index")
-    jarvis_select_parser.add_argument("selection")
-    jarvis_select_parser.add_argument("--target", type=int, default=24000)
-
-    jarvis_build_parser = subparsers.add_parser("dataset-jarvis-build", help="Build a selected JARVIS OptB88vdW HDF5 shard")
-    jarvis_build_parser.add_argument("raw_json")
-    jarvis_build_parser.add_argument("selection")
-    jarvis_build_parser.add_argument("output")
-    jarvis_build_parser.add_argument("--overwrite", action="store_true")
-
-    jarvis_dfpt_select_parser = subparsers.add_parser("dataset-jarvis-dfpt-select", help="Select complex JARVIS DFPT archives")
-    jarvis_dfpt_select_parser.add_argument("raw_json")
-    jarvis_dfpt_select_parser.add_argument("selection")
-    jarvis_dfpt_select_parser.add_argument("--target", type=int, default=300)
-    jarvis_dfpt_select_parser.add_argument("--min-elements", type=int, default=2)
-    jarvis_dfpt_select_parser.add_argument("--max-atoms", type=int, default=80)
-
-    jarvis_dfpt_download_parser = subparsers.add_parser("dataset-jarvis-dfpt-download", help="Resume-download selected JARVIS DFPT archives")
-    jarvis_dfpt_download_parser.add_argument("selection")
-    jarvis_dfpt_download_parser.add_argument("output_directory")
-    jarvis_dfpt_download_parser.add_argument("--proxy")
-    jarvis_dfpt_download_parser.add_argument("--retries", type=int, default=4)
-
-    jarvis_dfpt_build_parser = subparsers.add_parser("dataset-jarvis-dfpt-build", help="Build a multi-element JARVIS BEC HDF5 shard")
-    jarvis_dfpt_build_parser.add_argument("selection")
-    jarvis_dfpt_build_parser.add_argument("archive_directory")
-    jarvis_dfpt_build_parser.add_argument("output")
-    jarvis_dfpt_build_parser.add_argument("--max-abs-bec", type=float, default=50.0)
-    jarvis_dfpt_build_parser.add_argument("--max-asr-residual", type=float, default=0.5)
-    jarvis_dfpt_build_parser.add_argument("--overwrite", action="store_true")
-
-    mixed_parser = subparsers.add_parser("dataset-mixed-build", help="Build a mixed corpus from a JSON source-policy list")
-    mixed_parser.add_argument("policy")
-    mixed_parser.add_argument("output")
-    mixed_parser.add_argument("--seed", type=int, default=20260719)
-    mixed_parser.add_argument("--overwrite", action="store_true")
-    mixed_parser.add_argument("--report", help="Write the build report as JSON")
-
-    smoke_parser = subparsers.add_parser("dataset-smoke-build", help="Build a split-balanced rare-target smoke corpus")
-    smoke_parser.add_argument("policy")
-    smoke_parser.add_argument("output")
-    smoke_parser.add_argument("--per-source-split", type=int, default=2)
-    smoke_parser.add_argument("--overwrite", action="store_true")
-
-    tier_parser = subparsers.add_parser(
-        "dataset-tier-build",
-        help="Build a size-calibrated, coverage-stratified Neo HDF5 tier",
-    )
-    tier_parser.add_argument("input")
-    tier_parser.add_argument("output")
-    tier_parser.add_argument("--target-mib", type=float, required=True)
-    tier_parser.add_argument("--seed", type=int, default=20260720)
-    tier_parser.add_argument("--source-temperature", type=float, default=0.5)
-    tier_parser.add_argument("--min-per-source", type=int, default=3)
-    tier_parser.add_argument("--max-per-group", type=int, default=2)
-    tier_parser.add_argument("--preserve-sources-up-to", type=int, default=128)
-    tier_parser.add_argument("--size-tolerance", type=float, default=0.05)
-    tier_parser.add_argument("--max-calibration-rounds", type=int, default=4)
-    tier_parser.add_argument("--report")
-    tier_parser.add_argument("--overwrite", action="store_true")
-
-    tier_audit_parser = subparsers.add_parser(
-        "dataset-tier-audit",
-        help="Audit ordered nested Neo tiers and their coverage",
-    )
-    tier_audit_parser.add_argument(
-        "--tier",
-        action="append",
-        required=True,
-        help="Ordered NAME=HDF5 entry; repeat from smallest to reference",
-    )
-    tier_audit_parser.add_argument("--output")
-
-    validate_parser = subparsers.add_parser("dataset-validate", help="Strictly validate a canonical Neo HDF5 dataset")
-    validate_parser.add_argument("input")
-    validate_parser.add_argument("--output")
-
-    summary_parser = subparsers.add_parser("dataset-summary", help="Inspect a canonical HDF5 dataset")
-    summary_parser.add_argument("input")
-    summary_parser.add_argument("--output")
-
-    hf_prepare_parser = subparsers.add_parser(
-        "dataset-hf-prepare",
-        help="Create a portable, rights-aware Hugging Face staging directory",
-    )
-    hf_prepare_parser.add_argument("neo_root")
-    hf_prepare_parser.add_argument("output_directory")
-    hf_prepare_parser.add_argument(
-        "--tier",
-        action="append",
-        choices=sorted(NEO_HF_TIER_PATHS),
-        help="Tier to stage; repeat as needed (default: all four tiers)",
-    )
-    hf_prepare_parser.add_argument(
-        "--acknowledge-rights-review",
-        action="store_true",
-        help="Permit local staging despite rights issues; this never authorizes upload",
-    )
-    hf_prepare_parser.add_argument("--skip-hdf5-validation", action="store_true")
-    hf_prepare_parser.add_argument("--overwrite", action="store_true")
-
-    download_parser = subparsers.add_parser("dataset-download", help="Download and checksum a raw dataset")
-    download_parser.add_argument("url")
-    download_parser.add_argument("output")
-    download_parser.add_argument("--sha256")
-
-    generate_parser = subparsers.add_parser("vasp-generate", help="Generate Fe/NiO magnetic VASP jobs")
-    generate_parser.add_argument("output_dir")
-    generate_parser.add_argument("--total-jobs", type=int, default=360)
-    generate_parser.add_argument("--seed", type=int, default=20260718)
-    generate_parser.add_argument("--overwrite-metadata", action="store_true")
-
-    run_parser = subparsers.add_parser("vasp-run", help="Run one generated VASP job or a job tree")
-    run_parser.add_argument("path")
-    run_parser.add_argument("--executable", default="vasp_std")
-    run_parser.add_argument("--mpi-ranks", type=int, default=1)
-    run_parser.add_argument("--limit", type=int)
-    run_parser.add_argument("--fail-fast", action="store_true")
-
-    collect_parser = subparsers.add_parser("vasp-collect", help="Collect OUTCAR files into canonical HDF5")
-    collect_parser.add_argument("jobs_root")
-    collect_parser.add_argument("output")
-    collect_parser.add_argument("--overwrite", action="store_true")
-
-    train_parser = subparsers.add_parser("train", help="Train from canonical HDF5 or legacy extXYZ")
     train_parser.add_argument("--config", help="JSON TrainConfig file")
     train_parser.add_argument("--dataset")
     train_parser.add_argument("--static-data")
@@ -22258,8 +18390,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--out-ckpt")
     train_parser.add_argument("--device")
     train_parser.add_argument(
-        "--cpu-threads",
-        help="PyTorch CPU threads: 'auto' or a positive integer",
+        "--cpu-threads", help="PyTorch CPU threads: 'auto' or a positive integer"
     )
     train_parser.add_argument("--dtype", choices=("float32", "float64"))
     train_parser.add_argument("--epochs", type=int)
@@ -22285,32 +18416,36 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--no-epoch-artifacts", action="store_true")
     train_parser.add_argument("--no-sevennet", action="store_true")
     train_parser.add_argument(
-        "--no-stream-hdf5",
-        action="store_true",
+        "--no-stream-hdf5", action="store_true",
         help="Materialize canonical HDF5 in RAM (debug/compatibility only)",
     )
     train_parser.add_argument(
-        "--no-graph-cache",
-        action="store_true",
+        "--no-graph-cache", action="store_true",
         help="Build neighbors on demand every epoch instead of using a disk cache",
     )
     train_parser.add_argument("--graph-cache-dir")
 
-    evaluate_parser = subparsers.add_parser("evaluate", help="Evaluate a safe checkpoint")
+    evaluate_parser = subparsers.add_parser(
+        "evaluate", help="Evaluate a safe checkpoint"
+    )
     evaluate_parser.add_argument("checkpoint")
     evaluate_parser.add_argument("dataset")
-    evaluate_parser.add_argument("--split", default="test", choices=("train", "val", "test", "all"))
+    evaluate_parser.add_argument(
+        "--split", default="test", choices=("train", "val", "test", "all")
+    )
     evaluate_parser.add_argument("--batch-size", type=int, default=4)
     evaluate_parser.add_argument("--device", default="auto")
     evaluate_parser.add_argument("--output")
 
-    self_test_parser = subparsers.add_parser("self-test", help="Run deterministic physics checks")
+    self_test_parser = subparsers.add_parser(
+        "self-test", help="Run deterministic physics checks"
+    )
     self_test_parser.add_argument("--seed", type=int, default=7)
     self_test_parser.add_argument("--output")
-
     subparsers.add_parser("gui", help="Launch the modern PyQt6 research GUI")
     subparsers.add_parser("gui-tk", help="Launch the legacy Tk training GUI")
     return parser
+
 
 
 def _cli_train(args: argparse.Namespace) -> Dict[str, Any]:
@@ -22390,6 +18525,14 @@ def _cli_train(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and (
+        arguments[0].startswith("dataset-")
+        or arguments[0].startswith("vasp-")
+    ):
+        # Preserve old command lines without importing offline tooling during
+        # normal GUI, training, evaluation, or library use.
+        preparation = _load_dataset_preparation_module()
+        return preparation.main(arguments)
     if not arguments:
         if HAS_PYQT6:
             return run_qt_gui(sys.modules[__name__])
@@ -22404,277 +18547,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(arguments)
     if args.command == "gui":
         if not HAS_PYQT6:
-            parser.error("PyQt6 is required for 'gui'; use 'gui-tk' for the legacy interface")
+            parser.error(
+                "PyQt6 is required for 'gui'; use 'gui-tk' for the legacy interface"
+            )
         return run_qt_gui(sys.modules[__name__])
     if args.command == "gui-tk":
         App().mainloop()
         return 0
-    if args.command == "dataset-extxyz":
-        result: Any = {
-            "output": extxyz_to_hdf5(
-                args.input,
-                args.output,
-                overwrite=args.overwrite,
-                max_frames=args.max_frames,
-            )
-        }
-    elif args.command == "dataset-qm7x":
-        result = {
-            "output": rebuild_qm7x_hdf5(
-                args.raw,
-                args.output,
-                max_frames=args.max_frames,
-                overwrite=args.overwrite,
-            )
-        }
-    elif args.command == "dataset-so3lr":
-        result = {"output": rebuild_so3lr_hdf5(
-            args.raw, args.output, dataset_name=args.dataset_name,
-            max_frames=args.max_frames, overwrite=args.overwrite,
-        )}
-    elif args.command == "dataset-deepspin":
-        result = {"output": rebuild_deepspin_hdf5(
-            args.raw_directory, args.output,
-            max_frames=args.max_frames, overwrite=args.overwrite,
-        )}
-    elif args.command == "dataset-mptrj-scan":
-        result = scan_mptrj_magnetic_candidates(
-            args.raw_json, args.index, min_elements=args.min_elements,
-            min_abs_moment=args.min_abs_moment, max_atoms=args.max_atoms,
-        )
-    elif args.command == "dataset-mptrj-select":
-        result = select_mptrj_magnetic_candidates(
-            args.index, args.selection, target_structures=args.target,
-        )
-    elif args.command == "dataset-mptrj-build":
-        result = {"output": rebuild_mptrj_magnetic_hdf5(
-            args.raw_json, args.selection, args.output,
-            min_abs_moment=args.min_abs_moment, overwrite=args.overwrite,
-        )}
-    elif args.command == "dataset-mptrj-large-build":
-        result = rebuild_mptrj_large_hdf5(
-            args.raw_json,
-            args.output,
-            required_hdf5=args.required_hdf5,
-            max_per_material=args.max_per_material,
-            min_elements=args.min_elements,
-            max_atoms=args.max_atoms,
-            min_abs_moment=args.min_abs_moment,
-            report_path=args.report,
-            overwrite=args.overwrite,
-        )
-    elif args.command == "dataset-static-mptrj-select":
-        result = select_static_mptrj_parquet_rows(
-            args.parquet_directory, args.selection,
-            source_rows=args.source_rows, target_materials=args.target,
-            min_elements=args.min_elements, max_atoms=args.max_atoms,
-        )
-    elif args.command == "dataset-static-mptrj-build":
-        result = {"output": rebuild_static_mptrj_hdf5(
-            args.static_extxyz, args.parquet_directory, args.selection, args.output,
-            overwrite=args.overwrite,
-        )}
-    elif args.command == "dataset-scfnn":
-        result = {"output": rebuild_scfnn_from_combined_extxyz(
-            args.response_extxyz, args.output, overwrite=args.overwrite,
-        )}
-    elif args.command == "dataset-bec":
-        result = {"output": rebuild_bec_from_combined_response(
-            args.response_extxyz, args.output, overwrite=args.overwrite,
-        )}
-    elif args.command == "dataset-jarvis-scan":
-        result = scan_jarvis_multi_element_candidates(
-            args.raw_json, args.index, min_elements=args.min_elements,
-            max_atoms=args.max_atoms,
-        )
-    elif args.command == "dataset-jarvis-select":
-        result = select_jarvis_multi_element_candidates(
-            args.index, args.selection, target_structures=args.target,
-        )
-    elif args.command == "dataset-jarvis-build":
-        result = {"output": rebuild_jarvis_multi_element_hdf5(
-            args.raw_json, args.selection, args.output, overwrite=args.overwrite,
-        )}
-    elif args.command == "dataset-jarvis-dfpt-select":
-        result = select_jarvis_dfpt_candidates(
-            args.raw_json, args.selection, target_structures=args.target,
-            min_elements=args.min_elements, max_atoms=args.max_atoms,
-        )
-    elif args.command == "dataset-jarvis-dfpt-download":
-        result = download_jarvis_dfpt_archives(
-            args.selection, args.output_directory,
-            proxy=args.proxy, retries=args.retries,
-        )
-    elif args.command == "dataset-jarvis-dfpt-build":
-        result = {"output": rebuild_jarvis_dfpt_hdf5(
-            args.selection, args.archive_directory, args.output,
-            overwrite=args.overwrite, max_abs_bec=args.max_abs_bec,
-            max_acoustic_sum_residual=args.max_asr_residual,
-        )}
-    elif args.command == "dataset-mixed-build":
-        policy_path = Path(args.policy).expanduser().resolve()
-        policy_payload = json.loads(policy_path.read_text(encoding="utf-8"))
-        if isinstance(policy_payload, dict):
-            policy = list(policy_payload.get("sources", []))
-            dataset_name = str(
-                policy_payload.get(
-                    "dataset_name",
-                    "Neo balanced L1-L3 mixed-granularity training corpus",
-                )
-            )
-            corpus_role = str(policy_payload.get("corpus_role", "balanced-training"))
-            metadata_extra = {
-                str(key): value
-                for key, value in policy_payload.items()
-                if key not in {"sources", "dataset_name", "corpus_role"}
-            }
-        elif isinstance(policy_payload, list):
-            policy = list(policy_payload)
-            dataset_name = "Neo balanced L1-L3 mixed-granularity training corpus"
-            corpus_role = "balanced-training"
-            metadata_extra = {}
-        else:
-            raise ValueError("Mixed dataset policy must be a source list or an object with 'sources'.")
-        if not policy:
-            raise ValueError("Mixed dataset policy contains no sources.")
-        for source in policy:
-            source_path = Path(str(source["path"])).expanduser()
-            if not source_path.is_absolute():
-                candidate = (policy_path.parent / source_path).resolve()
-                source["path"] = str(candidate if candidate.exists() else source_path.resolve())
-        result = build_neo_mixed_dataset(
-            policy,
-            args.output,
-            seed=args.seed,
-            overwrite=args.overwrite,
-            dataset_name=dataset_name,
-            corpus_role=corpus_role,
-            metadata_extra=metadata_extra,
-        )
-        if args.report:
-            report_path = Path(args.report).expanduser().resolve()
-            report_path.parent.mkdir(parents=True, exist_ok=True)
-            report_path.write_text(
-                json.dumps(_checkpoint_safe(result), indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-    elif args.command == "dataset-smoke-build":
-        policy_path = Path(args.policy).expanduser().resolve()
-        policy_payload = json.loads(policy_path.read_text(encoding="utf-8"))
-        if isinstance(policy_payload, dict):
-            policy = list(policy_payload.get("sources", []))
-        elif isinstance(policy_payload, list):
-            policy = list(policy_payload)
-        else:
-            raise ValueError(
-                "Smoke dataset policy must be a source list or an object with 'sources'."
-            )
-        if not policy:
-            raise ValueError("Smoke dataset policy contains no sources.")
-        for source in policy:
-            source_path = Path(str(source["path"])).expanduser()
-            if not source_path.is_absolute():
-                candidate = (policy_path.parent / source_path).resolve()
-                source["path"] = str(
-                    candidate if candidate.exists() else source_path.resolve()
-                )
-        result = build_neo_smoke_dataset(
-            policy, args.output, per_source_split=args.per_source_split,
-            overwrite=args.overwrite,
-        )
-    elif args.command == "dataset-tier-build":
-        result = build_neo_stratified_tier(
-            args.input,
-            args.output,
-            target_mib=args.target_mib,
-            seed=args.seed,
-            source_temperature=args.source_temperature,
-            min_per_source=args.min_per_source,
-            max_per_group=args.max_per_group,
-            preserve_sources_up_to=args.preserve_sources_up_to,
-            tolerance_fraction=args.size_tolerance,
-            max_calibration_rounds=args.max_calibration_rounds,
-            overwrite=args.overwrite,
-            report_path=args.report,
-        )
-    elif args.command == "dataset-tier-audit":
-        tiers: List[Tuple[str, str]] = []
-        for value in args.tier:
-            if "=" not in str(value):
-                raise ValueError("Each --tier must use NAME=HDF5 syntax")
-            name, path = str(value).split("=", 1)
-            if not name.strip() or not path.strip():
-                raise ValueError("Each --tier must include a non-empty name and path")
-            tiers.append((name.strip(), path.strip()))
-        result = audit_neo_tier_hierarchy(tiers, output_path=args.output)
-    elif args.command == "dataset-validate":
-        result = validate_neo_hdf5(args.input)
-        if args.output:
-            output = Path(args.output).expanduser().resolve()
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
-    elif args.command == "dataset-summary":
-        result = hdf5_dataset_summary(args.input)
-        if args.output:
-            output = Path(args.output).expanduser().resolve()
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
-    elif args.command == "dataset-hf-prepare":
-        result = prepare_neo_huggingface_release(
-            args.neo_root,
-            args.output_directory,
-            tiers=args.tier or tuple(NEO_HF_TIER_PATHS),
-            acknowledge_rights_review=args.acknowledge_rights_review,
-            validate_hdf5=not args.skip_hdf5_validation,
-            overwrite=args.overwrite,
-        )
-    elif args.command == "dataset-download":
-        result = {
-            "output": download_with_sha256(
-                args.url, args.output, expected_sha256=args.sha256
-            )
-        }
-    elif args.command == "vasp-generate":
-        result = generate_vasp_magnetic_jobs(
-            args.output_dir,
-            total_jobs=args.total_jobs,
-            seed=args.seed,
-            overwrite_metadata=args.overwrite_metadata,
-        )
-    elif args.command == "vasp-run":
-        path = Path(args.path).expanduser().resolve()
-        if (path / "INCAR").exists():
-            jobs = [path]
-        else:
-            jobs = [item.parent for item in sorted(path.glob("*/*/metadata.json"))]
-        if args.limit is not None:
-            jobs = jobs[: max(0, int(args.limit))]
-        results = []
-        for job in jobs:
-            return_code = run_vasp_job(
-                str(job), executable=args.executable, mpi_ranks=args.mpi_ranks
-            )
-            results.append({"directory": str(job), "return_code": return_code})
-            if return_code != 0 and args.fail_fast:
-                break
-        result = {
-            "jobs": len(results),
-            "failed": sum(item["return_code"] != 0 for item in results),
-            "results": results,
-        }
-    elif args.command == "vasp-collect":
-        result = collect_vasp_magnetic_jobs(
-            args.jobs_root, args.output, overwrite=args.overwrite
-        )
-    elif args.command == "train":
-        result = _cli_train(args)
+    if args.command == "train":
+        result: Any = _cli_train(args)
     elif args.command == "evaluate":
         result = evaluate_checkpoint(
-            args.checkpoint,
-            args.dataset,
-            split=args.split,
-            batch_size=args.batch_size,
-            device_name=args.device,
+            args.checkpoint, args.dataset, split=args.split,
+            batch_size=args.batch_size, device_name=args.device,
             output_json=args.output,
         )
     elif args.command == "self-test":
@@ -22686,6 +18571,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "self-test" and not bool(result["all_passed"]):
         return 1
     return 0
+
 
 
 if __name__ == "__main__":
