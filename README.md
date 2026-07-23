@@ -241,7 +241,7 @@ the archive-level redistribution terms for the transformed `BEC/H2O`,
 
 ## Verified behavior
 
-The current source tree passes 125 regression tests and the deterministic
+The current source tree passes 127 regression tests and the deterministic
 physics self-test. The checked invariants include:
 
 - rotation and reflection behavior of energy, force, dipole, and

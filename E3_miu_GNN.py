@@ -9609,7 +9609,8 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
     Depending on ``cfg.mode``, the routine can train:
         - the ground-state branch only,
-        - the response branch on top of a frozen base checkpoint,
+        - the response branch on top of a frozen base checkpoint or a frozen
+          randomly initialized Layer 1 when explicitly started from scratch,
         - or both branches jointly.
 
     The returned validation metric is a normalized mean of all active target
@@ -9877,8 +9878,24 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     def _fit_atomic_references() -> np.ndarray:
         if composite_plan is not None:
             return fit_atomic_energies_from_composite_plan(composite_plan, zs)
-        if stream_plan is not None and "energy" in stream_plan.label_masks:
-            return fit_atomic_energies_from_hdf5_plan(stream_plan, zs)
+        if stream_plan is not None:
+            energy_mask = stream_plan.label_masks.get("energy")
+            selected = np.asarray(stream_plan.train_indices, dtype=np.int64)
+            has_training_energy = bool(
+                energy_mask is not None
+                and selected.size
+                and np.any(np.asarray(energy_mask, dtype=bool)[selected])
+            )
+            if has_training_energy:
+                return fit_atomic_energies_from_hdf5_plan(stream_plan, zs)
+            if response_from_scratch:
+                log(
+                    f"[{_now()}] Response-from-scratch data has no active energy "
+                    "labels; frozen Layer-1 atomic references are initialized to zero."
+                )
+                return np.zeros((len(zs),), dtype=float)
+            if energy_mask is not None:
+                return fit_atomic_energies_from_hdf5_plan(stream_plan, zs)
         energy_fit_cfgs = [
             item for item in train_cfgs
             if "energy" in item.properties
@@ -9911,9 +9928,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         return loaded
 
     # Instantiate the model and freeze / unfreeze branches according to mode.
-    if cfg.mode == "response":
-        if not cfg.base_ckpt:
-            raise ValueError("base_ckpt is required for mode 'response'")
+    response_from_scratch = bool(
+        cfg.mode == "response" and not str(cfg.base_ckpt).strip()
+    )
+    if cfg.mode == "response" and str(cfg.base_ckpt).strip():
         model = _warm_start(cfg.base_ckpt, purpose="initialization for Response")
         model.freeze_ground()
         model.unfreeze_response()
@@ -9948,6 +9966,14 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         if cfg.mode == "base":
             model.unfreeze_ground()
             model.freeze_response()
+        elif cfg.mode == "response":
+            model.freeze_ground()
+            model.unfreeze_response()
+            log(
+                f"[{_now()}] WARN: Response training starts without a Base "
+                "checkpoint. Layer 1 is randomly initialized and frozen; only "
+                "the response/physics branch is optimized."
+            )
         else:
             model.unfreeze_ground()
             model.unfreeze_response()
@@ -11910,6 +11936,13 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         out_path,
         extra={
             "training_mode": str(cfg.mode),
+            "initialization_mode": (
+                "response_from_scratch"
+                if response_from_scratch
+                else "pretrained_checkpoint"
+                if str(cfg.base_ckpt).strip()
+                else "random_initialization"
+            ),
             "recommended_inference_mode": (
                 "ground_only" if str(cfg.mode) == "base" else "full_coupled"
             ),
@@ -14860,18 +14893,24 @@ class App(tk.Tk):
     def _start(self, mode):
         self._stop = False
         if mode == "response" and not self.var_base_ckpt.get().strip():
-            answer = messagebox.askyesno(
+            answer = messagebox.askyesnocancel(
                 "No Base Checkpoint",
                 "No base checkpoint selected.\n\n"
                 "Run Base training first, then Response automatically?\n\n"
                 "  Yes — chain: Base → Response (recommended)\n"
-                "  No  — abort (select a checkpoint manually)",
+                "  No  — run Response directly from scratch\n"
+                "  Cancel — do not start",
             )
-            if not answer:
+            if answer is None:
                 return
-            # Offer the built-in two-step chain when no Base checkpoint is selected.
-            self._run_chained()
-            return
+            if answer:
+                # Offer the built-in two-step chain when no Base checkpoint is selected.
+                self._run_chained()
+                return
+            self.logger.log(
+                f"[{_now()}] No Base checkpoint: starting Response directly "
+                "from scratch at user request; Layer 1 will remain frozen."
+            )
         try:
             self._validate_gui_data_paths(mode)
             cfg = TrainConfig(
@@ -15458,8 +15497,8 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
     "base_ckpt": _p(
         "Pretrained / base checkpoint",
         "Warm-starts Base, Response, Joint, and the first stage of Full Chain.",
-        "Compatible Layer-1 weights are transferred into the selected architecture; Response mode then freezes Layer 1, while other modes fine-tune it with a fresh optimizer.",
-        "Required for Response mode; optional for Base, Joint, and Full Chain. Match channels and parity for the largest transfer.",
+        "Compatible Layer-1 weights are transferred into the selected architecture; Response mode then freezes Layer 1, while other modes fine-tune it with a fresh optimizer. Without a checkpoint, Response can explicitly start with a randomly initialized frozen Layer 1.",
+        "Strongly recommended for Response; optional for all modes. Match channels and parity for the largest transfer.",
     ),
     "out_ckpt": _p(
         "Output checkpoint",
@@ -18339,31 +18378,56 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             return
         if not self._validate_numeric_preflight("Training"):
             return
+        state = "Training"
+        response_from_scratch = False
         if mode == "response" and not str(self.value("base_ckpt")).strip():
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "No Base Checkpoint",
-                "No base checkpoint is selected. Run Base -> Response automatically?",
+                "No base checkpoint is selected.\n\n"
+                "Yes: run Base -> Response automatically (recommended).\n"
+                "No: run Response directly from scratch; Layer 1 will be "
+                "randomly initialized and frozen.\n"
+                "Cancel: do not start.",
                 QtWidgets.QMessageBox.StandardButton.Yes
-                | QtWidgets.QMessageBox.StandardButton.No,
+                | QtWidgets.QMessageBox.StandardButton.No
+                | QtWidgets.QMessageBox.StandardButton.Cancel,
                 QtWidgets.QMessageBox.StandardButton.Yes,
             )
             if answer == QtWidgets.QMessageBox.StandardButton.Yes:
                 self._run_chained()
-            return
+                return
+            if answer == QtWidgets.QMessageBox.StandardButton.Cancel:
+                return
+            response_from_scratch = True
+            state = "Response from scratch"
         try:
             self._validate_paths(mode)
-            cfg = self._make_train_config(mode)
+            cfg = self._make_train_config(
+                mode,
+                base_ckpt="" if response_from_scratch else None,
+            )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Training configuration", str(exc))
             return
-        self._reset_dashboard(cfg.out_ckpt)
+        self._reset_dashboard(cfg.out_ckpt, state)
+        if response_from_scratch:
+            self.bus.log.emit(
+                f"[{self.backend._now()}] No Base checkpoint: starting one-stage "
+                "Response training from scratch at user request; Layer 1 will "
+                "remain frozen."
+            )
 
         def work() -> None:
+            stage_label = "Response From Scratch" if response_from_scratch else mode.title()
             progress = self._stage_progress_callback(
                 self.bus.event.emit,
-                stage_id=f"single-{mode}",
-                stage_label=mode.title(),
+                stage_id=(
+                    "single-response-from-scratch"
+                    if response_from_scratch
+                    else f"single-{mode}"
+                ),
+                stage_label=stage_label,
                 stage_index=1,
                 stage_total=1,
                 checkpoint=cfg.out_ckpt,
@@ -18378,7 +18442,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 {"type": "run_complete", "stopped": self._stop_event.is_set()}
             )
 
-        self._launch_worker(work, "Training")
+        self._launch_worker(work, state)
 
     def _run_chained(self) -> None:
         if not self._validate_numeric_preflight("Chained training"):
