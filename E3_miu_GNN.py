@@ -9447,11 +9447,12 @@ class AutoSearchConfig:
     min_validation_coverage_fraction: float = 0.95
     # Compare a short rolling mean instead of the single luckiest epoch.
     score_smoothing_window: int = 3
-    # A short search trial that exhibits the trainer's monotonic RSS leak signal
-    # is not a viable production candidate and is stopped before exhausting the
-    # entire search budget.
+    # Memory trend warnings are recorded without interrupting a trial. A hard
+    # stop is reserved for growth beyond this larger ceiling, because allocator
+    # warm-up and streamed HDF5 caches can legitimately raise RSS by hundreds of
+    # MiB while MPS active/driver memory remains stable.
     reject_memory_leaking_trials: bool = True
-    max_trial_memory_growth_mib: float = 768.0
+    max_trial_memory_growth_mib: float = 1024.0
     # Optional GUI-provided metadata used only for a transparent search-subset
     # confidence warning. It never changes a user's selected split silently.
     dataset_capability: Dict[str, Any] = field(default_factory=dict)
@@ -10826,19 +10827,37 @@ class AutoSearchEngine:
                 if trial_state is not None and auto_cfg is not None:
                     growth_limit = max(
                         0.0,
-                        float(getattr(auto_cfg, "max_trial_memory_growth_mib", 768.0)),
+                        float(getattr(auto_cfg, "max_trial_memory_growth_mib", 1024.0)),
                     )
                     leaking = bool(snapshot.get("memory_leak_warning", False))
+                    if leaking:
+                        trial_state["memory_warning_count"] = int(
+                            trial_state.get("memory_warning_count", 0)
+                        ) + 1
+                    trial_state["max_memory_growth_mib"] = max(
+                        float(trial_state.get("max_memory_growth_mib", 0.0)),
+                        float(snapshot.get("memory_growth_mib", 0.0)),
+                    )
                     over_limit = (
                         growth_limit > 0.0
                         and float(snapshot.get("memory_growth_mib", 0.0)) > growth_limit
                     )
+                    catastrophic_growth = (
+                        growth_limit > 0.0
+                        and float(snapshot.get("memory_growth_mib", 0.0))
+                        > 2.0 * growth_limit
+                    )
+                    persistent_over_limit = (
+                        over_limit
+                        and int(trial_state.get("memory_warning_count", 0)) >= 2
+                    )
                     if bool(getattr(auto_cfg, "reject_memory_leaking_trials", True)) and (
-                        leaking or over_limit
+                        persistent_over_limit or catastrophic_growth
                     ):
                         trial_state["abort_reason"] = (
-                            "monotonic RSS growth detected"
-                            if leaking else f"RSS growth exceeded {growth_limit:g} MiB"
+                            f"persistent RSS growth exceeded {growth_limit:g} MiB"
+                            if persistent_over_limit
+                            else f"RSS growth exceeded {2.0 * growth_limit:g} MiB"
                         )
                         trial_state["stop"] = True
             if d.get("type") == "epoch":
@@ -10956,6 +10975,14 @@ class AutoSearchEngine:
                 raw_score = float(raw_score)
                 if not math.isfinite(raw_score):
                     raise FloatingPointError("trial returned a non-finite validation score")
+                if int(trial_state.get("memory_warning_count", 0)) > 0:
+                    log(
+                        f"[{_now()}] WARN: Auto Research {phase} trial "
+                        f"retained after {trial_state['memory_warning_count']} RSS "
+                        f"trend warning(s); peak delta="
+                        f"{float(trial_state.get('max_memory_growth_mib', 0.0)):.1f} MiB "
+                        "(below the hard rejection policy)."
+                    )
                 if self.metric_calibration_available:
                     score, selected_window = self._score_metric_history(
                         metric_history,
@@ -11043,6 +11070,13 @@ class AutoSearchEngine:
             cleanup_trial(baseline_cfg.out_ckpt)
             raise FloatingPointError(
                 "AutoSearch baseline returned a non-finite validation score."
+            )
+        if int(baseline_state.get("memory_warning_count", 0)) > 0:
+            log(
+                f"[{_now()}] WARN: Auto Research baseline retained after "
+                f"{baseline_state['memory_warning_count']} RSS trend warning(s); "
+                f"peak delta={float(baseline_state.get('max_memory_growth_mib', 0.0)):.1f} MiB "
+                "(below the hard rejection policy)."
             )
         dropped_targets: List[str] = []
         if baseline_history:
@@ -11490,6 +11524,15 @@ class AutoSearchEngine:
                 self.auto_cfg, "score_smoothing_window", 3
             )),
             "subset_diagnostics": dict(self.subset_diagnostics),
+            "baseline_memory": {
+                "trend_warnings": int(baseline_state.get("memory_warning_count", 0)),
+                "peak_growth_mib": float(
+                    baseline_state.get("max_memory_growth_mib", 0.0)
+                ),
+                "hard_limit_mib": float(getattr(
+                    self.auto_cfg, "max_trial_memory_growth_mib", 1024.0
+                )),
+            },
             "baseline_score": float(baseline_score),
             "planned_trials": int(planned_total),
             "executed_trials": int(trial_counter),
@@ -11642,7 +11685,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
     def _cancelled_result(stage: str) -> "Tuple[str, float]":
         log(
-            f"[{_now()}] Training stopped by user during {stage}; "
+            f"[{_now()}] Training stop requested during {stage}; "
             "no unvalidated checkpoint was written."
         )
         if progress is not None:
@@ -13971,7 +14014,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         )
     if stopped:
         log(
-            f"[{_now()}] Training stopped by user; saving the best completed "
+            f"[{_now()}] Training stop requested; saving the best completed "
             f"validation checkpoint from epoch {_best_epoch}."
         )
     model.cpu()
