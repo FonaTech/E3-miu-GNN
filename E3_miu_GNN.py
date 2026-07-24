@@ -316,25 +316,123 @@ def _process_rss_bytes() -> int:
 
 def _memory_snapshot(device: torch.device) -> Dict[str, float]:
     rss = 0
+    system_total = 0
+    system_available = 0
     try:
         import psutil  # type: ignore[import-not-found]
 
         rss = int(psutil.Process().memory_info().rss)
+        virtual = psutil.virtual_memory()
+        system_total = int(virtual.total)
+        system_available = int(virtual.available)
     except Exception:
         rss = _process_rss_bytes()
     snapshot = {
         "rss_mib": float(rss) / float(1 << 20),
+        "system_total_mib": float(system_total) / float(1 << 20),
+        "system_available_mib": float(system_available) / float(1 << 20),
+        "system_available_fraction": (
+            float(system_available) / float(system_total) if system_total > 0 else 0.0
+        ),
+        "process_rss_fraction": (
+            float(rss) / float(system_total) if system_total > 0 else 0.0
+        ),
         "mps_active_mib": 0.0,
         "mps_driver_mib": 0.0,
         "mps_cache_mib": 0.0,
+        "mps_recommended_mib": 0.0,
+        "mps_active_fraction": 0.0,
+        "mps_driver_fraction": 0.0,
+        "cuda_active_mib": 0.0,
+        "cuda_reserved_mib": 0.0,
+        "cuda_total_mib": 0.0,
+        "cuda_reserved_fraction": 0.0,
     }
     if device.type == "mps":
         active = int(torch.mps.current_allocated_memory())
         driver = int(torch.mps.driver_allocated_memory())
+        recommended_fn = getattr(torch.mps, "recommended_max_memory", None)
+        try:
+            recommended = int(recommended_fn()) if callable(recommended_fn) else 0
+        except Exception:
+            recommended = 0
         snapshot["mps_active_mib"] = active / float(1 << 20)
         snapshot["mps_driver_mib"] = driver / float(1 << 20)
         snapshot["mps_cache_mib"] = max(0, driver - active) / float(1 << 20)
+        snapshot["mps_recommended_mib"] = recommended / float(1 << 20)
+        if recommended > 0:
+            snapshot["mps_active_fraction"] = float(active) / float(recommended)
+            snapshot["mps_driver_fraction"] = float(driver) / float(recommended)
+    elif device.type == "cuda" and torch.cuda.is_available():
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        active = int(torch.cuda.memory_allocated(index))
+        reserved = int(torch.cuda.memory_reserved(index))
+        try:
+            _free, total = torch.cuda.mem_get_info(index)
+            total = int(total)
+        except Exception:
+            total = 0
+        snapshot["cuda_active_mib"] = active / float(1 << 20)
+        snapshot["cuda_reserved_mib"] = reserved / float(1 << 20)
+        snapshot["cuda_total_mib"] = total / float(1 << 20)
+        if total > 0:
+            snapshot["cuda_reserved_fraction"] = float(reserved) / float(total)
     return snapshot
+
+
+def _memory_pressure_reason(
+    snapshot: Dict[str, Any],
+    *,
+    min_system_available_fraction: float = 0.08,
+    max_process_rss_fraction: float = 0.80,
+    max_accelerator_fraction: float = 0.90,
+) -> Optional[str]:
+    """Return a hard-pressure reason; RSS growth alone is never sufficient."""
+    def finite_number(value: Any, default: float = 0.0) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return float(default)
+        return numeric if math.isfinite(numeric) else float(default)
+
+    available_fraction = finite_number(
+        snapshot.get("system_available_fraction", 0.0)
+    )
+    available_mib = finite_number(snapshot.get("system_available_mib", 0.0))
+    total_mib = finite_number(snapshot.get("system_total_mib", 0.0))
+    process_fraction = finite_number(snapshot.get("process_rss_fraction", 0.0))
+    minimum_available = min(
+        1.0, max(0.0, finite_number(min_system_available_fraction, 0.08))
+    )
+    maximum_process = min(
+        1.0, max(0.0, finite_number(max_process_rss_fraction, 0.80))
+    )
+    if total_mib > 0.0 and available_fraction < max(
+        0.0, minimum_available
+    ):
+        return (
+            f"system available memory is {available_fraction:.1%} "
+            f"({available_mib:.0f} MiB)"
+        )
+    if total_mib > 0.0 and process_fraction > maximum_process:
+        return f"process RSS reached {process_fraction:.1%} of physical memory"
+    accelerator_limit = min(
+        1.0, max(0.0, finite_number(max_accelerator_fraction, 0.90))
+    )
+    mps_fraction = max(
+        finite_number(snapshot.get("mps_active_fraction", 0.0)),
+        finite_number(snapshot.get("mps_driver_fraction", 0.0)),
+    )
+    if finite_number(snapshot.get("mps_recommended_mib", 0.0)) > 0.0 and (
+        mps_fraction > accelerator_limit
+    ):
+        return f"MPS memory reached {mps_fraction:.1%} of its recommended maximum"
+    cuda_fraction = finite_number(snapshot.get("cuda_reserved_fraction", 0.0))
+    if finite_number(snapshot.get("cuda_total_mib", 0.0)) > 0.0 and (
+        cuda_fraction > accelerator_limit
+    ):
+        return f"CUDA reserved memory reached {cuda_fraction:.1%} of device capacity"
+    return None
 
 
 def resolve_device(name: Optional[str], *, dtype: str = "float32") -> Tuple[torch.device, str]:
@@ -3884,8 +3982,9 @@ class CompositeAtomicDataDataset(Dataset):
                 )
                 source_order = int(self.plan.source_orders[selector])
                 source_row = int(packed["source_row_index"][selector])
-                source_path = Path(self.plan.source_files[source_order])
-                corpus_name = source_path.parent.parent.name or source_path.stem
+                corpus_name = _omat24_corpus_name_from_path(
+                    self.plan.source_files[source_order]
+                )
                 raw_method = str(self._large_handle["sources/omat24"].attrs.get(
                     "method_id", "PBE+U"
                 ))
@@ -3900,14 +3999,17 @@ class CompositeAtomicDataDataset(Dataset):
                         packed["stress_volume_normalized"][selector]
                     ),
                     "method_id": method_id,
+                    "source": f"OMat24/{corpus_name}",
                     "group_id": f"OMat24:{material_id}",
                     "system_id": material_id,
                     "sample_id": f"OMat24:{configuration_id}",
+                    "parent_id": material_id,
+                    "domain": "periodic",
                     "provenance_id": (
                         f"ColabFit:{corpus_name}:{configuration_id}:"
                         f"packed:{source_order}:{source_row}"
                     ),
-                    "energy_reference": "OMat24 PBE+U",
+                    "energy_reference": "OMat24:VASP-PBE+U:absolute",
                     "dataset_role": "l1-foundation",
                     "curriculum_role": "base+joint",
                 }
@@ -3928,8 +4030,9 @@ class CompositeAtomicDataDataset(Dataset):
             source_order = int(self.plan.source_orders[selector])
             row_index = int(self.plan.row_indices[selector])
             row = self._parquet_row(source_order, row_index)
-            source_path = Path(self.plan.source_files[source_order])
-            corpus_name = source_path.parent.parent.name
+            corpus_name = _omat24_corpus_name_from_path(
+                self.plan.source_files[source_order]
+            )
             return _omat24_configuration_from_row(row, corpus_name=corpus_name)
         index = int(self.large_indices[position - self.omat_indices.size])
         cfg = _read_hdf5_configuration_at(
@@ -4022,22 +4125,30 @@ class CompositeAtomicDataDataset(Dataset):
         output: Dict[int, Configuration] = {}
         for offset, selector in enumerate(sorted_values):
             key = int(selector)
+            source_order = int(self.plan.source_orders[key])
+            corpus_name = _omat24_corpus_name_from_path(
+                self.plan.source_files[source_order]
+            )
+            material_id = material_ids[offset]
             props: Dict[str, Any] = {
                 "energy": float(energies[offset]),
                 "forces": forces_by_selector[key],
                 "stress": stresses[offset],
                 "stress_volume_normalized": float(normalized[offset]),
                 "method_id": method_id,
-                "group_id": f"OMat24:{material_ids[offset]}",
-                "system_id": material_ids[offset],
+                "source": f"OMat24/{corpus_name}",
+                "group_id": f"OMat24:{material_id}",
+                "system_id": material_id,
                 "sample_id": f"OMat24:{configuration_ids[offset]}",
+                "parent_id": material_id,
+                "domain": "periodic",
                 "provenance_id": (
-                    f"ColabFit:{Path(self.plan.source_files[int(self.plan.source_orders[key])]).parent.parent.name}"
+                    f"ColabFit:{corpus_name}"
                     f":{configuration_ids[offset]}:packed:"
-                    f"{int(self.plan.source_orders[key])}:"
+                    f"{source_order}:"
                     f"{int(packed['source_row_index'][key])}"
                 ),
-                "energy_reference": "OMat24 PBE+U",
+                "energy_reference": "OMat24:VASP-PBE+U:absolute",
                 "dataset_role": "l1-foundation",
                 "curriculum_role": "base+joint",
             }
@@ -4257,6 +4368,12 @@ def _omat24_material_id(row: Dict[str, Any]) -> str:
     name = str(names[0]) if names else ""
     match = re.search(r"OMat24__(agm[0-9]+)_", name)
     return match.group(1) if match else str(row.get("configuration_id", "unknown"))
+
+
+def _omat24_corpus_name_from_path(path: str) -> str:
+    """Recover the stable OMat24 corpus name from a declared shard path."""
+    source = Path(str(path))
+    return source.parent.parent.name or source.parent.name or source.stem or "unknown"
 
 
 def _omat24_configuration_from_row(
@@ -5217,7 +5334,11 @@ def dynamic_parameter_reference_ranges(
     stability_high = max(stability_low * 5.0, min(2.0, 4.0 * hardness))
     min_validation = 0.2 if 0 < structures < 50 else 0.1 if structures < 500 else 0.05
     max_validation = 0.3 if 0 < structures < 50 else 0.2
-    min_subset = min(100.0, 10000.0 / structures) if structures else 1.0
+    recommended_search_structures = max(100, 5 * len(elements))
+    min_subset = (
+        min(100.0, 100.0 * recommended_search_structures / structures)
+        if structures else 1.0
+    )
     lr_high = 2e-3 if channels >= 96 or active_physics >= 4 else 5e-3
     channel_range = "64-128" if active_physics >= 4 else "32-96"
 
@@ -5254,7 +5375,11 @@ def dynamic_parameter_reference_ranges(
         "chem_aug_prob": "0-0.30; start at 0.05 only after a stable non-augmented baseline",
         "chem_aug_noise_std": "0-0.10 standardized descriptor units",
         "chem_aug_mix_max": "0-0.30; keep below 0.15 for chemically narrow datasets",
-        "auto_subset": f"{min_subset:.3g}-100%; aim for at least 100 structures per search trial",
+        "auto_subset": (
+            f"{min_subset:.3g}-100%; aim for at least "
+            f"{recommended_search_structures} sampled structures "
+            f"(5 per detected element, minimum 100)"
+        ),
     }
 
 
@@ -8990,6 +9115,10 @@ class TrainConfig:
     # same graph every epoch. Geometry and labels remain in canonical HDF5.
     cache_neighbor_graphs: bool = True
     graph_cache_dir: str = ""
+    # Internal comparison control used by Auto Research. ``None`` preserves the
+    # regular device-aware policy; a positive value freezes the MPS topology
+    # budget so changing a loss weight cannot also change batches/step counts.
+    mps_edge_budget_override: Optional[int] = None
     # Composite Joint epochs use every response record and a rotating,
     # deterministic foundation window. This prevents rare L2/L3 labels from
     # being diluted by tens of millions of OMat24 L1 structures.
@@ -9381,6 +9510,10 @@ def _additional_physics_loss(
 # physics-group local refinement and independent confirmation.
 # --------------------------------------------------------------------------
 
+
+class _AutoSearchMemoryPressureError(MemoryError):
+    """Raised only when Auto Research reaches an actual memory-pressure limit."""
+
 @dataclass
 class AutoSearchConfig:
     """Configuration for sensitivity-aware automatic hyperparameter research.
@@ -9419,6 +9552,49 @@ class AutoSearchConfig:
     # modestly longer short-run budget. Both baseline and candidate are rerun.
     confirmation_epoch_multiplier: float = 1.5
     confirmation_seed_offset: int = 104_729
+    # Energy and forces that are already active in the baseline are protected
+    # by default. Explicit ``required_targets`` may extend or replace that set.
+    protect_active_core_targets: bool = True
+    required_targets: Tuple[str, ...] = ()
+    # A candidate is invalid when any required target regresses beyond this
+    # fraction at its selected epoch. This prevents an optional response metric
+    # from purchasing a materially worse interatomic potential.
+    max_required_target_regression: float = 0.10
+    # Auto Research calibrates each target against the baseline history and
+    # freezes those scales for every candidate. Coverage guards prevent a trial
+    # from winning by dropping difficult validation labels.
+    calibrate_validation_scales: bool = True
+    min_validation_observations: int = 2
+    min_validation_coverage_fraction: float = 0.95
+    # Compare a short rolling mean instead of the single luckiest epoch.
+    score_smoothing_window: int = 3
+    # Legacy fields remain loadable so older configuration files do not break.
+    # They no longer reject a trial: epoch-to-epoch RSS growth is diagnostic
+    # only because allocator warm-up, HDF5 metadata, and graph caches can remain
+    # resident without indicating a leak.
+    reject_memory_leaking_trials: bool = False
+    max_trial_memory_growth_mib: float = 1024.0
+    # Hard stops are based on actual system/accelerator pressure, never on an
+    # RSS delta. Epoch checks must remain pressured for consecutive observations
+    # to reject a trial; a pressured post-cleanup boundary is already considered
+    # reliable because GC and the accelerator cache have just been released.
+    hard_stop_on_memory_pressure: bool = True
+    memory_min_available_fraction: float = 0.08
+    memory_max_process_fraction: float = 0.80
+    memory_max_accelerator_fraction: float = 0.90
+    memory_pressure_consecutive_checks: int = 2
+    # Cleaned trial boundaries are assessed separately. Three consecutive
+    # retained increases produce a report warning only; they never stop search.
+    cross_trial_leak_window: int = 3
+    cross_trial_rss_growth_mib: float = 256.0
+    cross_trial_accelerator_growth_mib: float = 64.0
+    # Optional GUI-provided metadata used only for a transparent search-subset
+    # confidence preflight.
+    dataset_capability: Dict[str, Any] = field(default_factory=dict)
+    # Auto Research is a model-selection workflow, not a smoke test. When GUI
+    # metadata shows that the requested fraction cannot cover the chemistry and
+    # required labels, raise it transparently before any baseline training.
+    auto_raise_low_confidence_subset: bool = True
 
 
 _AUTOSEARCH_SAMPLERS = {
@@ -9932,6 +10108,261 @@ class AutoSearchEngine:
         "w_dmi": "DMI_effective",
     }
 
+    @staticmethod
+    def _positive_loss_sampler(name: str, spec: tuple) -> tuple:
+        """Remove the explicit zero atom from a required loss dimension."""
+        kind = str(spec[0])
+        if kind == "zero_log_uniform":
+            return ("log_uniform", float(spec[1]), float(spec[2]))
+        if kind == "choice":
+            values = [
+                value for value in spec[1]
+                if not isinstance(value, (int, float, np.integer, np.floating))
+                or float(value) > 0.0
+            ]
+            if not values:
+                raise ValueError(
+                    f"Required Auto Research target {name!r} has no positive search values"
+                )
+            return ("choice", values)
+        if kind == "uniform":
+            low, high = float(spec[1]), float(spec[2])
+            if high <= 0.0:
+                raise ValueError(
+                    f"Required Auto Research target {name!r} has no positive search interval"
+                )
+            return ("uniform", max(np.finfo(float).tiny, low), high)
+        return spec
+
+    def _subset_diagnostics(self) -> Dict[str, Any]:
+        """Choose a transparent minimum subset for chemistry/label coverage."""
+        capability = dict(getattr(self.auto_cfg, "dataset_capability", {}) or {})
+        try:
+            structures = max(0, int(capability.get("structures", 0)))
+        except (TypeError, ValueError, OverflowError):
+            structures = 0
+        if structures <= 0:
+            requested = min(1.0, max(0.0, float(self.auto_cfg.subset_fraction)))
+            return {
+                "available": False,
+                "requested_subset_fraction": requested,
+                "effective_subset_fraction": requested,
+                "adjusted": False,
+                "warnings": [],
+            }
+        elements: set = set()
+        for value in capability.get("elements", []):
+            try:
+                elements.add(int(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        requested_fraction = min(
+            1.0, max(0.0, float(self.auto_cfg.subset_fraction))
+        )
+        validation_fraction = min(
+            1.0, max(1e-6, float(self.base_cfg.val_fraction))
+        )
+        recommended_sampled = max(100, 5 * len(elements))
+        recommended_validation = max(16, min(64, max(1, len(elements) // 2)))
+        recommended_fraction = max(
+            recommended_sampled / float(structures),
+            recommended_validation / float(structures * validation_fraction),
+        )
+        labels = {
+            str(name): max(0, int(count))
+            for name, count in dict(capability.get("labels", {})).items()
+        }
+        minimum_required_labels = max(
+            8,
+            4 * max(
+                1, int(getattr(self.auto_cfg, "min_validation_observations", 2))
+            ),
+        )
+        required_label_fractions: Dict[str, float] = {}
+        unavailable_required_targets: List[str] = []
+        for target in self.required_targets:
+            aliases = (target, "Di") if target == "Di_effective" else (target,)
+            label_count = max((labels.get(name, 0) for name in aliases), default=0)
+            if label_count <= 0:
+                unavailable_required_targets.append(target)
+                continue
+            required_label_fractions[target] = min(
+                1.0,
+                minimum_required_labels
+                / float(label_count * validation_fraction),
+            )
+        if required_label_fractions:
+            recommended_fraction = max(
+                recommended_fraction, max(required_label_fractions.values())
+            )
+        recommended_fraction = min(1.0, recommended_fraction)
+        auto_raise = bool(getattr(
+            self.auto_cfg, "auto_raise_low_confidence_subset", True
+        ))
+        effective_fraction = (
+            max(requested_fraction, recommended_fraction)
+            if auto_raise else requested_fraction
+        )
+        sampled = max(1, int(math.ceil(structures * effective_fraction)))
+        validation = max(1, int(round(sampled * validation_fraction)))
+        adjusted = bool(effective_fraction > requested_fraction + 1e-12)
+        warnings: List[str] = []
+        if sampled < recommended_sampled:
+            warnings.append(
+                f"sampled structures {sampled} < recommended {recommended_sampled} "
+                f"for {len(elements)} elements"
+            )
+        if validation < recommended_validation:
+            warnings.append(
+                f"estimated validation structures {validation} < recommended "
+                f"{recommended_validation}"
+            )
+        if unavailable_required_targets:
+            warnings.append(
+                "dataset metadata has no labels for required targets "
+                + ", ".join(sorted(unavailable_required_targets))
+            )
+        return {
+            "available": True,
+            "structures": structures,
+            "elements": len(elements),
+            "requested_subset_fraction": requested_fraction,
+            "effective_subset_fraction": effective_fraction,
+            "recommended_subset_fraction": recommended_fraction,
+            "adjusted": adjusted,
+            "estimated_sampled_structures": sampled,
+            "estimated_validation_structures": validation,
+            "recommended_sampled_structures": recommended_sampled,
+            "recommended_validation_structures": recommended_validation,
+            "required_label_fraction_minima": required_label_fractions,
+            "unavailable_required_targets": unavailable_required_targets,
+            "warnings": warnings,
+        }
+
+    def _ensure_exact_required_validation_coverage(
+        self,
+        data_cache: Dict[str, Any],
+    ) -> None:
+        """Verify canonical HDF5 masks before spending epochs on a baseline."""
+        dataset = str(getattr(self.base_cfg, "dataset", "") or "").strip()
+        if (
+            not dataset
+            or not bool(getattr(self.base_cfg, "stream_hdf5", True))
+            or not _is_hdf5_path(dataset)
+            or _is_composite_hdf5_path(dataset)
+        ):
+            return
+        minimum = max(
+            1, int(getattr(self.auto_cfg, "min_validation_observations", 2))
+        )
+        fraction = min(1.0, max(1e-12, float(self.effective_subset_fraction)))
+        selected_mode = "joint" if dataset or str(
+            getattr(self.base_cfg, "response_data", "") or ""
+        ).strip() else "base"
+        final_plan: Optional[HDF5StreamPlan] = None
+        final_counts: Dict[str, int] = {}
+        for _attempt in range(10):
+            raw_plan = prepare_hdf5_stream_plan(
+                dataset,
+                val_fraction=float(self.base_cfg.val_fraction),
+                seed=int(self.base_cfg.seed),
+                sample_fraction=fraction,
+                sample_seed=int(self.base_cfg.seed),
+            )
+            plan = _filter_hdf5_stream_plan_for_mode(raw_plan, selected_mode)
+            counts: Dict[str, int] = {}
+            for target in self.validation_targets:
+                aliases = (target, "Di") if target == "Di_effective" else (target,)
+                mask = next(
+                    (raw_plan.label_masks[name] for name in aliases
+                     if name in raw_plan.label_masks),
+                    None,
+                )
+                counts[target] = (
+                    int(np.count_nonzero(mask[plan.val_indices]))
+                    if mask is not None else 0
+                )
+            final_plan, final_counts = raw_plan, counts
+            deficient = {
+                target: counts.get(target, 0) for target in self.required_targets
+                if counts.get(target, 0) < minimum
+            }
+            if not deficient:
+                break
+            if not bool(getattr(
+                self.auto_cfg, "auto_raise_low_confidence_subset", True
+            )) or fraction >= 1.0 - 1e-12:
+                raise ValueError(
+                    "Auto Research validation split lacks required labels before "
+                    f"training: counts={counts}, minimum={minimum}. Increase Sample %."
+                )
+            worst_ratio = max(
+                minimum / float(max(1, count)) for count in deficient.values()
+            )
+            fraction = min(1.0, max(fraction * 1.5, fraction * 1.25 * worst_ratio))
+        else:
+            raise ValueError(
+                "Auto Research could not construct a required-label validation split"
+            )
+        if any(final_counts.get(target, 0) < minimum for target in self.required_targets):
+            raise ValueError(
+                "Auto Research validation split lacks required labels before "
+                f"training: counts="
+                f"{{{', '.join(f'{target!r}: {final_counts.get(target, 0)}' for target in self.required_targets)}}}, "
+                f"minimum={minimum}."
+            )
+        self.preflight_dropped_targets = sorted(
+            target for target, count in final_counts.items()
+            if target not in self.required_targets and count < minimum
+        )
+        self.preflight_skipped_loss_params = sorted(
+            parameter
+            for parameter in self._params
+            if parameter in self.LOSS_PARAM_TO_TARGET
+            and self.LOSS_PARAM_TO_TARGET[parameter] in self.preflight_dropped_targets
+        )
+        if self.preflight_skipped_loss_params:
+            skipped = set(self.preflight_skipped_loss_params)
+            self._params = [
+                parameter for parameter in self._params if parameter not in skipped
+            ]
+        previous = float(self.effective_subset_fraction)
+        self.effective_subset_fraction = float(fraction)
+        requested = float(self.auto_cfg.subset_fraction)
+        self.subset_diagnostics.update({
+            "effective_subset_fraction": float(fraction),
+            "adjusted": bool(fraction > requested + 1e-12),
+            "exact_train_structures": int(len(
+                _filter_hdf5_stream_plan_for_mode(final_plan, selected_mode).train_indices
+            )),
+            "exact_validation_structures": int(len(
+                _filter_hdf5_stream_plan_for_mode(final_plan, selected_mode).val_indices
+            )),
+            "exact_validation_counts": dict(final_counts),
+            "exact_required_validation_counts": {
+                target: int(final_counts.get(target, 0))
+                for target in self.required_targets
+            },
+            "preflight_dropped_targets": list(self.preflight_dropped_targets),
+            "preflight_skipped_loss_params": list(
+                self.preflight_skipped_loss_params
+            ),
+            "exact_preflight": True,
+            "coverage_adjusted_fraction": bool(fraction > previous + 1e-12),
+        })
+        resolved = str(Path(dataset).expanduser().resolve())
+        source = Path(resolved).stat()
+        plan_key = (
+            "hdf5_stream_plan",
+            resolved,
+            int(source.st_size),
+            int(source.st_mtime_ns),
+            float(self.base_cfg.val_fraction),
+            int(self.base_cfg.seed),
+            float(fraction),
+        )
+        data_cache[plan_key] = final_plan
+
     def __init__(self, base_cfg: "TrainConfig", auto_cfg: AutoSearchConfig, tmp_dir: str) -> None:
         self.base_cfg  = base_cfg
         self.auto_cfg  = auto_cfg
@@ -9955,11 +10386,42 @@ class AutoSearchEngine:
             if name not in self.SEARCH_SPACE:
                 raise ValueError(f"Unknown Auto Research override parameter: {name!r}")
             self.search_space[name] = normalize_search_space_spec(name, spec)
-        # Dataset masks and architecture relevance determine availability. The
-        # current numeric value does not: zero must remain searchable.
+        # Dataset masks and architecture relevance determine availability. Zero
+        # remains searchable for optional objectives, while required targets are
+        # explicitly restricted to positive loss weights above.
         self._params = list(dict.fromkeys(
             name for name in requested if name not in excluded
         ))
+        valid_targets = set(self.LOSS_PARAM_TO_TARGET.values()) | {"Di"}
+        explicit_required = tuple(
+            str(value) for value in getattr(auto_cfg, "required_targets", ())
+            if str(value).strip()
+        )
+        unknown_required = sorted(set(explicit_required) - valid_targets)
+        if unknown_required:
+            raise ValueError(
+                f"Unknown required Auto Research target(s): {unknown_required}"
+            )
+        if explicit_required:
+            required_targets = explicit_required
+        elif bool(getattr(auto_cfg, "protect_active_core_targets", True)):
+            required_targets = tuple(
+                target
+                for parameter, target in (("w_energy", "energy"), ("w_forces", "forces"))
+                if float(getattr(base_cfg, parameter, 0.0)) > 0.0
+            )
+        else:
+            required_targets = ()
+        self.required_targets = tuple(dict.fromkeys(required_targets))
+        self.required_loss_params = {
+            parameter
+            for parameter, target in self.LOSS_PARAM_TO_TARGET.items()
+            if target in self.required_targets
+        }
+        for parameter in self.required_loss_params:
+            self.search_space[parameter] = self._positive_loss_sampler(
+                parameter, self.search_space[parameter]
+            )
         fixed_loss_params = {
             name
             for name in self.LOSS_PARAM_TO_TARGET
@@ -9972,6 +10434,28 @@ class AutoSearchEngine:
                 if name in fixed_loss_params
             )
         )
+        self.score_targets: Tuple[str, ...] = self.validation_targets
+        self.score_scales: Dict[str, float] = {}
+        self.score_coverage: Dict[str, int] = {}
+        self.required_target_references: Dict[str, float] = {}
+        self.required_target_limits: Dict[str, float] = {}
+        self.metric_calibration_available: bool = False
+        self.preflight_dropped_targets: List[str] = []
+        self.preflight_skipped_loss_params: List[str] = []
+        self.subset_diagnostics = self._subset_diagnostics()
+        self.effective_subset_fraction = float(
+            self.subset_diagnostics.get(
+                "effective_subset_fraction", self.auto_cfg.subset_fraction
+            )
+        )
+        unavailable_required = list(
+            self.subset_diagnostics.get("unavailable_required_targets", [])
+        )
+        if unavailable_required:
+            raise ValueError(
+                "Dataset has no labels for required Auto Research target(s): "
+                + ", ".join(sorted(str(value) for value in unavailable_required))
+            )
         # The old global BO is intentionally not constructed. Sparse observations
         # across all mixed-physics dimensions made its proposal direction mostly
         # indistinguishable from random sampling. Local BO instances are created
@@ -10309,6 +10793,13 @@ class AutoSearchEngine:
         suffix: str = "",
     ) -> "TrainConfig":
         """Build a TrainConfig for a single staged trial from flat parameters."""
+        for parameter in self.required_loss_params:
+            value = float(params.get(parameter, getattr(self.base_cfg, parameter)))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"{parameter} controls required target "
+                    f"{self.LOSS_PARAM_TO_TARGET[parameter]!r} and must remain positive"
+                )
         model_values = asdict(self.base_cfg.model)
         for name in ModelConfig.__dataclass_fields__:
             if name in params:
@@ -10358,6 +10849,24 @@ class AutoSearchEngine:
         # causing excessive MPSGraph shape compilation and memory caching.
         _bs_raw = int(params.get("batch_size", self.base_cfg.batch_size))
         _bs     = max(1, _bs_raw)
+        _fixed_edge_budget = getattr(
+            self.base_cfg, "mps_edge_budget_override", None
+        )
+        try:
+            _fixed_edge_budget = (
+                int(_fixed_edge_budget) if _fixed_edge_budget is not None else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            _fixed_edge_budget = None
+        if _fixed_edge_budget is None or _fixed_edge_budget <= 0:
+            # Freeze the comparison topology even when a candidate sets a
+            # derivative loss to zero. Otherwise one-factor screening changes
+            # both the objective and the number/composition of optimizer steps.
+            _fixed_edge_budget = (
+                12000
+                if bool({"forces", "bec"} & set(self.validation_targets))
+                else 30000
+            )
 
         return TrainConfig(
             mode                   = _mode,
@@ -10400,21 +10909,447 @@ class AutoSearchEngine:
             grad_clip_norm         = self.base_cfg.grad_clip_norm,
             export_sevennet        = False,    # Skip TorchScript export during search trials.
             save_epoch_artifacts   = False,    # Skip per-epoch checkpoints and plots during search.
-            subset_fraction        = float(self.auto_cfg.subset_fraction),
+            subset_fraction        = float(self.effective_subset_fraction),
             stream_hdf5            = bool(self.base_cfg.stream_hdf5),
             cache_neighbor_graphs  = bool(self.base_cfg.cache_neighbor_graphs),
             graph_cache_dir        = str(self.base_cfg.graph_cache_dir),
+            mps_edge_budget_override = int(_fixed_edge_budget),
             validation_targets     = self.validation_targets,
         )
+
+    # Auto Research metric calibration and robust scoring.
+
+    @staticmethod
+    def _metric_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
+        values: Dict[str, float] = {}
+        counts: Dict[str, int] = {}
+
+        def add(name: str, value: Any) -> None:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if math.isfinite(numeric):
+                values[str(name)] = numeric
+
+        add("energy", payload.get("energy_mae"))
+        add("forces", payload.get("force_mae"))
+        for name, value in dict(payload.get("multitask_mae", {})).items():
+            add(str(name), value)
+        for name, value in dict(payload.get("validation_counts", {})).items():
+            try:
+                counts[str(name)] = max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        memory = dict(payload.get("memory", {}))
+        try:
+            memory_growth = float(memory.get("rss_growth_mib", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            memory_growth = 0.0
+        return {
+            "epoch": int(payload.get("epoch", 0)),
+            "values": values,
+            "counts": counts,
+            "memory": memory,
+            "memory_growth_mib": memory_growth,
+            "memory_leak_warning": bool(payload.get("memory_leak_warning", False)),
+        }
+
+    @staticmethod
+    def _target_value(snapshot: Dict[str, Any], target: str) -> Optional[float]:
+        values = dict(snapshot.get("values", {}))
+        aliases = (target, "Di") if target == "Di_effective" else (target,)
+        for name in aliases:
+            if name in values and math.isfinite(float(values[name])):
+                return float(values[name])
+        return None
+
+    @staticmethod
+    def _target_count(snapshot: Dict[str, Any], target: str) -> int:
+        counts = dict(snapshot.get("counts", {}))
+        aliases = (target, "Di") if target == "Di_effective" else (target,)
+        return max((int(counts.get(name, 0)) for name in aliases), default=0)
+
+    def _score_metric_history(
+        self,
+        history: Sequence[Dict[str, Any]],
+        *,
+        scales: Dict[str, float],
+        coverage: Dict[str, int],
+        required_limits: Optional[Dict[str, float]] = None,
+    ) -> Tuple[float, Optional[Dict[str, Any]]]:
+        """Return the best smoothed, coverage-safe score and its metric window."""
+        snapshots = [dict(item) for item in history if dict(item).get("values")]
+        if not snapshots or not scales:
+            return float("inf"), None
+        requested_window = max(
+            1, int(getattr(self.auto_cfg, "score_smoothing_window", 3))
+        )
+        window = min(requested_window, len(snapshots))
+        coverage_fraction = min(
+            1.0,
+            max(
+                0.0,
+                float(getattr(
+                    self.auto_cfg, "min_validation_coverage_fraction", 0.95
+                )),
+            ),
+        )
+        limits = dict(required_limits or {})
+        best_score = float("inf")
+        best_window: Optional[Dict[str, Any]] = None
+        for end in range(window, len(snapshots) + 1):
+            chunk = snapshots[end - window:end]
+            means: Dict[str, float] = {}
+            valid = True
+            for target, scale in scales.items():
+                values: List[float] = []
+                required_count = int(math.ceil(
+                    coverage_fraction * max(0, int(coverage.get(target, 0)))
+                ))
+                for snapshot in chunk:
+                    value = self._target_value(snapshot, target)
+                    if value is None or self._target_count(snapshot, target) < required_count:
+                        valid = False
+                        break
+                    values.append(value)
+                if not valid:
+                    break
+                means[target] = float(np.mean(values))
+                if target in limits and means[target] > float(limits[target]):
+                    valid = False
+                    break
+            if not valid:
+                continue
+            score = float(np.mean([
+                means[target] / max(float(scale), np.finfo(float).tiny)
+                for target, scale in scales.items()
+            ]))
+            if math.isfinite(score) and score < best_score:
+                best_score = score
+                best_window = {
+                    "epoch_start": int(chunk[0].get("epoch", 0)),
+                    "epoch_end": int(chunk[-1].get("epoch", 0)),
+                    "values": means,
+                    "score": score,
+                }
+        return best_score, best_window
+
+    def _best_target_window_value(
+        self,
+        history: Sequence[Dict[str, Any]],
+        target: str,
+        coverage: Dict[str, int],
+    ) -> Optional[float]:
+        """Return the best rolling validation MAE for one protected target."""
+        snapshots = [dict(item) for item in history if dict(item).get("values")]
+        if not snapshots:
+            return None
+        window = min(
+            max(1, int(getattr(self.auto_cfg, "score_smoothing_window", 3))),
+            len(snapshots),
+        )
+        coverage_fraction = min(
+            1.0,
+            max(
+                0.0,
+                float(getattr(
+                    self.auto_cfg, "min_validation_coverage_fraction", 0.95
+                )),
+            ),
+        )
+        required_count = int(math.ceil(
+            coverage_fraction * max(0, int(coverage.get(target, 0)))
+        ))
+        best: Optional[float] = None
+        for end in range(window, len(snapshots) + 1):
+            values: List[float] = []
+            for snapshot in snapshots[end - window:end]:
+                value = self._target_value(snapshot, target)
+                if value is None or self._target_count(snapshot, target) < required_count:
+                    values = []
+                    break
+                values.append(value)
+            if values:
+                mean_value = float(np.mean(values))
+                if best is None or mean_value < best:
+                    best = mean_value
+        return best
+
+    def _calibrate_from_baseline(
+        self,
+        history: Sequence[Dict[str, Any]],
+    ) -> Tuple[float, Dict[str, Any], List[str]]:
+        """Freeze score targets/scales/coverage from one baseline trajectory."""
+        minimum = max(
+            1, int(getattr(self.auto_cfg, "min_validation_observations", 2))
+        )
+        scales: Dict[str, float] = {}
+        coverage: Dict[str, int] = {}
+        dropped: List[str] = []
+        for target in self.validation_targets:
+            observations = [
+                value
+                for snapshot in history
+                for value in [self._target_value(snapshot, target)]
+                if value is not None and math.isfinite(value)
+            ]
+            max_count = max(
+                (self._target_count(snapshot, target) for snapshot in history),
+                default=0,
+            )
+            if not observations or max_count < minimum:
+                if target in self.required_targets:
+                    raise ValueError(
+                        f"Required Auto Research target {target!r} has only "
+                        f"{max_count} validation observations; at least {minimum} are required"
+                    )
+                dropped.append(target)
+                continue
+            if bool(getattr(self.auto_cfg, "calibrate_validation_scales", True)):
+                reference = float(np.median(np.asarray(observations, dtype=float)))
+                physical_floor = float(VALIDATION_MAE_SCALES.get(target, 1.0)) * 1e-6
+                scales[target] = max(reference, physical_floor, np.finfo(float).tiny)
+            else:
+                scales[target] = float(VALIDATION_MAE_SCALES.get(target, 1.0))
+            coverage[target] = int(max_count)
+        if not scales:
+            raise ValueError(
+                "Auto Research baseline has no sufficiently covered validation targets"
+            )
+        self.score_targets = tuple(scales)
+        self.score_scales = dict(scales)
+        self.score_coverage = dict(coverage)
+        baseline_score, best_window = self._score_metric_history(
+            history, scales=scales, coverage=coverage
+        )
+        if best_window is None or not math.isfinite(baseline_score):
+            raise FloatingPointError(
+                "Auto Research could not form a finite smoothed baseline score"
+            )
+        tolerance = max(
+            0.0,
+            float(getattr(self.auto_cfg, "max_required_target_regression", 0.10)),
+        )
+        self.required_target_references = {
+            target: reference
+            for target in self.required_targets
+            for reference in [self._best_target_window_value(history, target, coverage)]
+            if reference is not None
+        }
+        self.required_target_limits = {
+            target: max(
+                float(reference) * (1.0 + tolerance),
+                float(reference) + scales[target] * tolerance,
+            )
+            for target, reference in self.required_target_references.items()
+            if target in scales
+        }
+        return baseline_score, best_window, dropped
 
     # Main search loop.
 
     @staticmethod
+    def _cross_trial_memory_assessment(
+        records: Sequence[Dict[str, Any]],
+        auto_cfg: AutoSearchConfig,
+    ) -> Dict[str, Any]:
+        """Classify retained memory across cleaned trials without stopping search.
+
+        RSS alone is deliberately weak evidence. A host-side classification
+        requires the configured (at least three) consecutive cleaned boundaries
+        to retain hundreds of MiB each. Sustained MPS/CUDA growth is classified
+        more strongly, but remains a warning until a real pressure threshold is
+        reached.
+        """
+        def finite_number(value: Any, default: float = 0.0) -> float:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return float(default)
+            return numeric if math.isfinite(numeric) else float(default)
+
+        window = max(
+            3, int(getattr(auto_cfg, "cross_trial_leak_window", 3))
+        )
+        rss_threshold = max(
+            0.0,
+            finite_number(
+                getattr(auto_cfg, "cross_trial_rss_growth_mib", 256.0), 256.0
+            ),
+        )
+        accelerator_threshold = max(
+            0.0,
+            finite_number(
+                getattr(
+                    auto_cfg, "cross_trial_accelerator_growth_mib", 64.0
+                ),
+                64.0,
+            ),
+        )
+        recent = [dict(item) for item in records[-window:]]
+
+        def delta(
+            item: Dict[str, Any], primary: str, fallback: str
+        ) -> float:
+            key = primary if primary in item else fallback
+            return finite_number(item.get(key, 0.0))
+
+        rss_deltas = [
+            delta(item, "cleaned_rss_growth_mib", "retained_rss_delta_mib")
+            for item in recent
+        ]
+        mps_active_deltas = [
+            delta(
+                item,
+                "cleaned_mps_active_growth_mib",
+                "retained_mps_active_delta_mib",
+            )
+            for item in recent
+        ]
+        mps_driver_deltas = [
+            delta(
+                item,
+                "cleaned_mps_driver_growth_mib",
+                "retained_mps_driver_delta_mib",
+            )
+            for item in recent
+        ]
+        cuda_active_deltas = [
+            delta(
+                item,
+                "cleaned_cuda_active_growth_mib",
+                "retained_cuda_active_delta_mib",
+            )
+            for item in recent
+        ]
+        cuda_reserved_deltas = [
+            delta(
+                item,
+                "cleaned_cuda_reserved_growth_mib",
+                "retained_cuda_reserved_delta_mib",
+            )
+            for item in recent
+        ]
+        enough_history = len(recent) >= window
+        rss_sustained = bool(
+            enough_history
+            and rss_threshold > 0.0
+            and all(value >= rss_threshold for value in rss_deltas)
+        )
+        sustained_channels = {
+            "mps_active": bool(
+                enough_history
+                and accelerator_threshold > 0.0
+                and all(value >= accelerator_threshold for value in mps_active_deltas)
+            ),
+            "mps_driver": bool(
+                enough_history
+                and accelerator_threshold > 0.0
+                and all(value >= accelerator_threshold for value in mps_driver_deltas)
+            ),
+            "cuda_active": bool(
+                enough_history
+                and accelerator_threshold > 0.0
+                and all(value >= accelerator_threshold for value in cuda_active_deltas)
+            ),
+            "cuda_reserved": bool(
+                enough_history
+                and accelerator_threshold > 0.0
+                and all(value >= accelerator_threshold for value in cuda_reserved_deltas)
+            ),
+        }
+        accelerator_sustained = any(sustained_channels.values())
+        if accelerator_sustained:
+            classification = "probable_accelerator_leak"
+        elif rss_sustained:
+            classification = "possible_host_retention"
+        else:
+            classification = "none"
+        return {
+            "classification": classification,
+            "warning": classification != "none",
+            "hard_stop": False,
+            "window": int(window),
+            "observed_trials": int(len(recent)),
+            "trial_indices": [int(item.get("trial", -1)) for item in recent],
+            "rss_threshold_mib": float(rss_threshold),
+            "accelerator_threshold_mib": float(accelerator_threshold),
+            "rss_sustained": bool(rss_sustained),
+            "accelerator_sustained": bool(accelerator_sustained),
+            "sustained_accelerator_channels": [
+                name for name, sustained in sustained_channels.items() if sustained
+            ],
+            "rss_growth_mib": rss_deltas,
+            "mps_active_growth_mib": mps_active_deltas,
+            "mps_driver_growth_mib": mps_driver_deltas,
+            "cuda_active_growth_mib": cuda_active_deltas,
+            "cuda_reserved_growth_mib": cuda_reserved_deltas,
+        }
+
+    @staticmethod
     def _make_progress(
-        pq_put: Callable, trial_idx: int, n_trials: int, phase: str = "refinement"
+        pq_put: Callable,
+        trial_idx: int,
+        n_trials: int,
+        phase: str = "refinement",
+        *,
+        metrics_sink: Optional[List[Dict[str, Any]]] = None,
+        trial_state: Optional[Dict[str, Any]] = None,
+        auto_cfg: Optional[AutoSearchConfig] = None,
     ) -> Callable:
-        """Return a progress callback that emits auto_search_epoch events."""
+        """Return a progress callback that records metrics and emits epochs."""
         def _cb(d: Dict[str, Any]) -> None:
+            if d.get("type") == "metrics":
+                snapshot = AutoSearchEngine._metric_snapshot(d)
+                if metrics_sink is not None:
+                    metrics_sink.append(snapshot)
+                if trial_state is not None and auto_cfg is not None:
+                    leaking = bool(snapshot.get("memory_leak_warning", False))
+                    if leaking:
+                        trial_state["memory_warning_count"] = int(
+                            trial_state.get("memory_warning_count", 0)
+                        ) + 1
+                    trial_state["max_memory_growth_mib"] = max(
+                        float(trial_state.get("max_memory_growth_mib", 0.0)),
+                        float(snapshot.get("memory_growth_mib", 0.0)),
+                    )
+                    pressure_reason = _memory_pressure_reason(
+                        dict(snapshot.get("memory", {})),
+                        min_system_available_fraction=float(getattr(
+                            auto_cfg, "memory_min_available_fraction", 0.08
+                        )),
+                        max_process_rss_fraction=float(getattr(
+                            auto_cfg, "memory_max_process_fraction", 0.80
+                        )),
+                        max_accelerator_fraction=float(getattr(
+                            auto_cfg, "memory_max_accelerator_fraction", 0.90
+                        )),
+                    )
+                    if pressure_reason is None:
+                        trial_state["memory_pressure_consecutive"] = 0
+                        trial_state.pop("current_memory_pressure_reason", None)
+                    else:
+                        consecutive = int(
+                            trial_state.get("memory_pressure_consecutive", 0)
+                        ) + 1
+                        trial_state["memory_pressure_consecutive"] = consecutive
+                        trial_state["memory_pressure_observations"] = int(
+                            trial_state.get("memory_pressure_observations", 0)
+                        ) + 1
+                        trial_state["current_memory_pressure_reason"] = pressure_reason
+                        required_checks = max(1, int(getattr(
+                            auto_cfg, "memory_pressure_consecutive_checks", 2
+                        )))
+                        if bool(getattr(
+                            auto_cfg, "hard_stop_on_memory_pressure", True
+                        )) and consecutive >= required_checks:
+                            trial_state["memory_pressure_reason"] = pressure_reason
+                            trial_state["abort_reason"] = (
+                                "sustained memory pressure after "
+                                f"{consecutive} consecutive checks: {pressure_reason}"
+                            )
+                            trial_state["stop"] = True
             if d.get("type") == "epoch":
                 pq_put({
                     "type":     "auto_search_epoch",
@@ -10424,7 +11359,17 @@ class AutoSearchEngine:
                     "epochs":   int(d.get("epochs", 1)),
                     "phase":    str(phase),
                 })
-            # Suppress detailed prep events to keep the GUI quieter during search.
+            elif d.get("type") in {"prep", "train", "val"}:
+                # Auto Research trials can take minutes once chemistry/label
+                # coverage raises the subset. Forward preparation and batch
+                # progress so the GUI never looks idle before an epoch ends.
+                event = dict(d)
+                event.update({
+                    "auto_search_trial": int(trial_idx),
+                    "auto_search_n_trials": int(n_trials),
+                    "auto_search_phase": str(phase),
+                })
+                pq_put(event)
         return _cb
 
     def run(
@@ -10445,27 +11390,171 @@ class AutoSearchEngine:
         current = self._constrain_cutoff_pair(self._extract_current(self.base_cfg))
         sensitivity_plan = self._sensitivity_plan(current)
         refinement_budget = max(0, int(self.auto_cfg.n_trials))
+        # This is an upper bound until the baseline establishes which selected
+        # targets actually occur in the sampled validation split.
         planned_total = len(sensitivity_plan) + refinement_budget + 2
         self.sensitivity_results = {}
         self.last_report = {}
 
-        if str(self.base_cfg.device).lower() in ("auto", "mps") and _mps_is_available():
-            torch.mps.synchronize()
-            torch.mps.empty_cache()
+        memory_device, _memory_dtype = resolve_device(
+            getattr(self.base_cfg, "device", "auto"),
+            dtype=getattr(self.base_cfg.model, "dtype", "float32"),
+        )
 
         # Cache parsed datasets and graph topology within one seed. A
         # confirmation seed intentionally receives a distinct cached split.
         data_cache: Dict[str, Any] = {}
+        self._ensure_exact_required_validation_coverage(data_cache)
+        sensitivity_plan = self._sensitivity_plan(current)
+        planned_total = len(sensitivity_plan) + refinement_budget + 2
 
-        def cleanup_trial(path: str) -> None:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        def cleanup_trial(path: str) -> Dict[str, float]:
+            if str(path).strip():
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
             gc.collect()
-            if str(self.base_cfg.device).lower() in ("auto", "mps") and _mps_is_available():
+            if memory_device.type == "mps" and _mps_is_available():
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
+                torch.mps.synchronize()
+            elif memory_device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(memory_device)
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize(memory_device)
+            return _memory_snapshot(memory_device)
+
+        def pressure_reason(snapshot: Dict[str, Any]) -> Optional[str]:
+            return _memory_pressure_reason(
+                snapshot,
+                min_system_available_fraction=float(getattr(
+                    self.auto_cfg, "memory_min_available_fraction", 0.08
+                )),
+                max_process_rss_fraction=float(getattr(
+                    self.auto_cfg, "memory_max_process_fraction", 0.80
+                )),
+                max_accelerator_fraction=float(getattr(
+                    self.auto_cfg, "memory_max_accelerator_fraction", 0.90
+                )),
+            )
+
+        trial_memory_records: List[Dict[str, Any]] = []
+        previous_cleaned_snapshot = cleanup_trial("")
+        cross_trial_memory = self._cross_trial_memory_assessment(
+            trial_memory_records, self.auto_cfg
+        )
+
+        def record_trial_memory(
+            *,
+            path: str,
+            pre_trial: Dict[str, Any],
+            trial: int,
+            phase: str,
+            source: str,
+        ) -> Dict[str, float]:
+            """Clean a completed trial, record retained memory, and guard pressure."""
+            nonlocal previous_cleaned_snapshot, cross_trial_memory
+
+            post_cleanup = cleanup_trial(path)
+
+            def difference(
+                current_snapshot: Dict[str, Any],
+                reference_snapshot: Dict[str, Any],
+                key: str,
+            ) -> float:
+                try:
+                    current_value = float(current_snapshot.get(key, 0.0))
+                    reference_value = float(reference_snapshot.get(key, 0.0))
+                except (TypeError, ValueError, OverflowError):
+                    return 0.0
+                if not math.isfinite(current_value) or not math.isfinite(reference_value):
+                    return 0.0
+                return current_value - reference_value
+
+            record: Dict[str, Any] = {
+                "trial": int(trial),
+                "phase": str(phase),
+                "source": str(source),
+                "pre_trial": dict(pre_trial),
+                "post_cleanup": dict(post_cleanup),
+            }
+            channels = {
+                "rss": "rss_mib",
+                "mps_active": "mps_active_mib",
+                "mps_driver": "mps_driver_mib",
+                "cuda_active": "cuda_active_mib",
+                "cuda_reserved": "cuda_reserved_mib",
+            }
+            for label, key in channels.items():
+                record[f"retained_{label}_delta_mib"] = difference(
+                    post_cleanup, pre_trial, key
+                )
+                record[f"cleaned_{label}_growth_mib"] = difference(
+                    post_cleanup, previous_cleaned_snapshot, key
+                )
+            cleanup_pressure = pressure_reason(post_cleanup)
+            record["cleanup_pressure_reason"] = cleanup_pressure
+            trial_memory_records.append(record)
+            cross_trial_memory = self._cross_trial_memory_assessment(
+                trial_memory_records, self.auto_cfg
+            )
+            record["cross_trial_classification"] = str(
+                cross_trial_memory["classification"]
+            )
+            previous_cleaned_snapshot = dict(post_cleanup)
+
+            accelerator_text = ""
+            if memory_device.type == "mps":
+                accelerator_text = (
+                    f"; MPS active={post_cleanup['mps_active_mib']:.1f} MiB "
+                    f"(retained={record['retained_mps_active_delta_mib']:+.1f}), "
+                    f"driver={post_cleanup['mps_driver_mib']:.1f} MiB "
+                    f"(retained={record['retained_mps_driver_delta_mib']:+.1f})"
+                )
+            elif memory_device.type == "cuda":
+                accelerator_text = (
+                    f"; CUDA active={post_cleanup['cuda_active_mib']:.1f} MiB "
+                    f"(retained={record['retained_cuda_active_delta_mib']:+.1f}), "
+                    f"reserved={post_cleanup['cuda_reserved_mib']:.1f} MiB "
+                    f"(retained={record['retained_cuda_reserved_delta_mib']:+.1f})"
+                )
+            log(
+                f"[{_now()}] Auto Research memory cleanup [{phase}/{source}]: "
+                f"RSS={post_cleanup['rss_mib']:.1f} MiB "
+                f"(retained={record['retained_rss_delta_mib']:+.1f}, "
+                f"cleaned-step={record['cleaned_rss_growth_mib']:+.1f})"
+                + accelerator_text
+                + "."
+            )
+            if bool(cross_trial_memory.get("warning", False)):
+                channels_text = ", ".join(
+                    cross_trial_memory.get("sustained_accelerator_channels", [])
+                ) or "RSS only"
+                log(
+                    f"[{_now()}] WARN: Auto Research post-cleanup memory trend "
+                    f"classified as {cross_trial_memory['classification']} across "
+                    f"{cross_trial_memory['window']} consecutive trials "
+                    f"({channels_text}); monitoring continues because retained "
+                    "growth alone is not a hard-stop condition."
+                )
+            if cleanup_pressure is not None and bool(getattr(
+                self.auto_cfg, "hard_stop_on_memory_pressure", True
+            )):
+                raise _AutoSearchMemoryPressureError(
+                    "Auto Research hard-stopped after trial cleanup because "
+                    f"{cleanup_pressure}. RSS trend alone did not trigger this stop."
+                )
+            return post_cleanup
+
+        initial_pressure = pressure_reason(previous_cleaned_snapshot)
+        if initial_pressure is not None and bool(getattr(
+            self.auto_cfg, "hard_stop_on_memory_pressure", True
+        )):
+            raise _AutoSearchMemoryPressureError(
+                "Auto Research cannot safely start because "
+                f"{initial_pressure}. RSS trend alone did not trigger this stop."
+            )
 
         trial_counter = 0
 
@@ -10479,6 +11568,7 @@ class AutoSearchEngine:
             seed: Optional[int] = None,
             epochs: Optional[int] = None,
             suffix: str = "",
+            enforce_required_targets: bool = True,
         ) -> "Optional[float]":
             """Run one short trial and convert failures into an explicit score."""
             nonlocal trial_counter
@@ -10498,17 +11588,84 @@ class AutoSearchEngine:
                 f"[{_now()}] Auto Research {phase} {trial_counter}/{planned_total} "
                 f"[{source}{'/' + group if group else ''}]: {changed_text}"
             )
-            progress = self._make_progress(pq_put, trial_counter, planned_total, phase)
-            try:
-                _checkpoint, score = train_dual_layer(
-                    cfg, log, progress, stop_flag, _cache=data_cache
+            metric_history: List[Dict[str, Any]] = []
+            trial_state: Dict[str, Any] = {"stop": False}
+            progress = self._make_progress(
+                pq_put,
+                trial_counter,
+                planned_total,
+                phase,
+                metrics_sink=metric_history,
+                trial_state=trial_state,
+                auto_cfg=self.auto_cfg,
+            )
+            pre_trial_snapshot = _memory_snapshot(memory_device)
+            pre_trial_pressure = pressure_reason(pre_trial_snapshot)
+            if pre_trial_pressure is not None and bool(getattr(
+                self.auto_cfg, "hard_stop_on_memory_pressure", True
+            )):
+                raise _AutoSearchMemoryPressureError(
+                    f"Auto Research cannot start {phase} trial {trial_counter} "
+                    f"because {pre_trial_pressure}."
                 )
+            cancelled = False
+            try:
+                _checkpoint, raw_score = train_dual_layer(
+                    cfg,
+                    log,
+                    progress,
+                    lambda: bool(stop_flag() or trial_state.get("stop", False)),
+                    _cache=data_cache,
+                )
+                if trial_state.get("memory_pressure_reason"):
+                    raise _AutoSearchMemoryPressureError(
+                        "Auto Research hard-stopped because "
+                        f"{trial_state.get('abort_reason')}"
+                    )
                 if stop_flag():
-                    cleanup_trial(cfg.out_ckpt)
-                    return None
-                score = float(score)
-                if not math.isfinite(score):
-                    raise FloatingPointError("trial returned a non-finite validation score")
+                    cancelled = True
+                if trial_state.get("abort_reason"):
+                    raise FloatingPointError(
+                        f"trial rejected: {trial_state['abort_reason']}"
+                    )
+                if not cancelled:
+                    raw_score = float(raw_score)
+                    if not math.isfinite(raw_score):
+                        raise FloatingPointError(
+                            "trial returned a non-finite validation score"
+                        )
+                    if int(trial_state.get("memory_warning_count", 0)) > 0:
+                        log(
+                            f"[{_now()}] WARN: Auto Research {phase} trial "
+                            f"recorded {trial_state['memory_warning_count']} RSS "
+                            f"trend warning(s); peak delta="
+                            f"{float(trial_state.get('max_memory_growth_mib', 0.0)):.1f} MiB "
+                            "(diagnostic only; RSS growth does not reject trials)."
+                        )
+                    if self.metric_calibration_available:
+                        score, selected_window = self._score_metric_history(
+                            metric_history,
+                            scales=self.score_scales,
+                            coverage=self.score_coverage,
+                            required_limits=(
+                                self.required_target_limits
+                                if enforce_required_targets else None
+                            ),
+                        )
+                        if selected_window is None or not math.isfinite(score):
+                            guard = "required-target guard or validation coverage"
+                            raise FloatingPointError(
+                                f"trial has no finite calibrated score after {guard}"
+                            )
+                        log(
+                            f"[{_now()}] Auto Research {phase} calibrated score={score:.6g} "
+                            f"over epochs {selected_window['epoch_start']}-"
+                            f"{selected_window['epoch_end']} (trainer score={raw_score:.6g})."
+                        )
+                    else:
+                        score = raw_score
+            except _AutoSearchMemoryPressureError:
+                raise
             except Exception as exc:
                 score = float("inf")
                 log(
@@ -10516,42 +11673,200 @@ class AutoSearchEngine:
                     f"[{source}] {type(exc).__name__}: {exc}."
                 )
             finally:
-                cleanup_trial(cfg.out_ckpt)
+                record_trial_memory(
+                    path=cfg.out_ckpt,
+                    pre_trial=pre_trial_snapshot,
+                    trial=trial_counter,
+                    phase=phase,
+                    source=source,
+                )
+            if cancelled:
+                return None
             return score
 
         # Baseline trial using the current GUI parameters.
         log(
             f"[{_now()}] Auto Research: baseline + {len(sensitivity_plan)} "
-            f"one-factor trials + up to {refinement_budget} group refinements; "
-            f"subset={self.auto_cfg.subset_fraction:.0%}, "
+            f"one-factor trials + up to {refinement_budget} group refinements "
+            "(pre-coverage upper bound); "
+            f"subset={self.effective_subset_fraction:.2%}"
+            + (
+                f" (requested {float(self.auto_cfg.subset_fraction):.2%}, auto-raised)"
+                if bool(self.subset_diagnostics.get("adjusted", False)) else ""
+            )
+            + ", "
             f"epochs={self.auto_cfg.trial_epochs}."
         )
-        baseline_cfg = self._build_trial_cfg(current, trial_idx=0)
-        baseline_progress = self._make_progress(pq_put, 0, planned_total, "baseline")
-        try:
-            _checkpoint, baseline_score = train_dual_layer(
-                baseline_cfg, log, baseline_progress, stop_flag, _cache=data_cache
+        log(
+            f"[{_now()}] Auto Research memory policy: epoch RSS trends are "
+            "warning-only; every trial is measured after GC/cache cleanup; "
+            f"hard stop requires system available <"
+            f"{100.0 * float(getattr(self.auto_cfg, 'memory_min_available_fraction', 0.08)):.1f}%, "
+            f"process RSS >"
+            f"{100.0 * float(getattr(self.auto_cfg, 'memory_max_process_fraction', 0.80)):.1f}% "
+            f"of physical memory, or accelerator memory >"
+            f"{100.0 * float(getattr(self.auto_cfg, 'memory_max_accelerator_fraction', 0.90)):.1f}% "
+            "of its recommended/device capacity."
+        )
+        if bool(self.subset_diagnostics.get("adjusted", False)):
+            log(
+                f"[{_now()}] Auto Research raised Sample % before training: "
+                f"{100.0 * float(self.auto_cfg.subset_fraction):.3g}% -> "
+                f"{100.0 * self.effective_subset_fraction:.3g}% "
+                f"({self.subset_diagnostics.get('estimated_sampled_structures', 0)} "
+                "estimated sampled structures)."
             )
-        except Exception as exc:
-            cleanup_trial(baseline_cfg.out_ckpt)
-            raise RuntimeError(
-                "AutoSearch baseline failed with the currently selected "
-                f"architecture and parameters: {type(exc).__name__}: {exc}"
-            ) from exc
+        if bool(self.subset_diagnostics.get("exact_preflight", False)):
+            log(
+                f"[{_now()}] Auto Research exact validation preflight: "
+                f"train={self.subset_diagnostics.get('exact_train_structures', 0)} "
+                f"val={self.subset_diagnostics.get('exact_validation_structures', 0)} "
+                f"required_labels={json.dumps(self.subset_diagnostics.get('exact_required_validation_counts', {}), sort_keys=True)} "
+                f"skipped_dimensions={self.subset_diagnostics.get('preflight_skipped_loss_params', [])}."
+            )
+        if self.subset_diagnostics.get("warnings"):
+            log(
+                f"[{_now()}] WARN: Auto Research subset confidence is limited: "
+                + "; ".join(self.subset_diagnostics["warnings"])
+                + ". Increase Sample % before treating small score differences as physical."
+            )
+        baseline_cfg = self._build_trial_cfg(current, trial_idx=0)
+        baseline_history: List[Dict[str, Any]] = []
+        baseline_state: Dict[str, Any] = {"stop": False}
+        baseline_progress = self._make_progress(
+            pq_put,
+            0,
+            planned_total,
+            "baseline",
+            metrics_sink=baseline_history,
+            trial_state=baseline_state,
+            auto_cfg=self.auto_cfg,
+        )
+        baseline_pre_snapshot = _memory_snapshot(memory_device)
+        baseline_pre_pressure = pressure_reason(baseline_pre_snapshot)
+        if baseline_pre_pressure is not None and bool(getattr(
+            self.auto_cfg, "hard_stop_on_memory_pressure", True
+        )):
+            raise _AutoSearchMemoryPressureError(
+                "Auto Research cannot start the baseline because "
+                f"{baseline_pre_pressure}."
+            )
+        try:
+            try:
+                _checkpoint, raw_baseline_score = train_dual_layer(
+                    baseline_cfg,
+                    log,
+                    baseline_progress,
+                    lambda: bool(stop_flag() or baseline_state.get("stop", False)),
+                    _cache=data_cache,
+                )
+                if baseline_state.get("memory_pressure_reason"):
+                    raise _AutoSearchMemoryPressureError(
+                        "Auto Research hard-stopped because "
+                        f"{baseline_state.get('abort_reason')}"
+                    )
+            except _AutoSearchMemoryPressureError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    "AutoSearch baseline failed with the currently selected "
+                    f"architecture and parameters: {type(exc).__name__}: {exc}"
+                ) from exc
+        finally:
+            record_trial_memory(
+                path=baseline_cfg.out_ckpt,
+                pre_trial=baseline_pre_snapshot,
+                trial=0,
+                phase="baseline",
+                source="paired-reference",
+            )
         if stop_flag():
-            cleanup_trial(baseline_cfg.out_ckpt)
             log(f"[{_now()}] Auto Research: stopped during baseline trial.")
             return dict(current), float("inf")
-        baseline_score = float(baseline_score)
-        if not math.isfinite(baseline_score):
-            cleanup_trial(baseline_cfg.out_ckpt)
+        if baseline_state.get("abort_reason"):
+            raise FloatingPointError(
+                "AutoSearch baseline is not safe for repeated trials: "
+                f"{baseline_state['abort_reason']}"
+            )
+        raw_baseline_score = float(raw_baseline_score)
+        if not math.isfinite(raw_baseline_score):
             raise FloatingPointError(
                 "AutoSearch baseline returned a non-finite validation score."
             )
-        cleanup_trial(baseline_cfg.out_ckpt)
+        if int(baseline_state.get("memory_warning_count", 0)) > 0:
+            log(
+                f"[{_now()}] WARN: Auto Research baseline retained after "
+                f"{baseline_state['memory_warning_count']} RSS trend warning(s); "
+                f"peak delta={float(baseline_state.get('max_memory_growth_mib', 0.0)):.1f} MiB "
+                "(diagnostic only; RSS growth does not reject trials)."
+            )
+        dropped_targets: List[str] = []
+        if baseline_history:
+            baseline_score, baseline_window, dropped_targets = (
+                self._calibrate_from_baseline(baseline_history)
+            )
+            self.metric_calibration_available = True
+        else:
+            # Keep the engine testable with external/custom training callables
+            # that predate metrics progress events. Real ``train_dual_layer``
+            # always emits those events and therefore takes the calibrated path.
+            baseline_score = raw_baseline_score
+            baseline_window = {"epoch_start": 0, "epoch_end": 0, "values": {}}
+            self.score_targets = self.validation_targets
+            self.score_scales = {
+                target: float(VALIDATION_MAE_SCALES.get(target, 1.0))
+                for target in self.score_targets
+            }
+            self.score_coverage = {}
+            self.required_target_references = {}
+            self.required_target_limits = {}
+            self.metric_calibration_available = False
+            log(
+                f"[{_now()}] Auto Research did not receive validation metrics; "
+                "using legacy scalar trial scores without target calibration."
+            )
+        unsupported_loss_params = {
+            parameter
+            for parameter in self._params
+            if parameter in self.LOSS_PARAM_TO_TARGET
+            and self.metric_calibration_available
+            and self.LOSS_PARAM_TO_TARGET[parameter] not in self.score_targets
+        }
+        unsupported_loss_params.update(self.preflight_skipped_loss_params)
+        if unsupported_loss_params:
+            self._params = [
+                parameter for parameter in self._params
+                if parameter not in unsupported_loss_params
+            ]
+        sensitivity_plan = self._sensitivity_plan(current)
+        planned_total = len(sensitivity_plan) + refinement_budget + 2
+        if self.metric_calibration_available:
+            log(
+                f"[{_now()}] Auto Research baseline calibrated score={baseline_score:.6g} "
+                f"over epochs {baseline_window['epoch_start']}-{baseline_window['epoch_end']} "
+                f"(trainer score={raw_baseline_score:.6g}); targets={list(self.score_targets)}."
+            )
+            log(
+                f"[{_now()}] Auto Research frozen calibration: "
+                f"scales={json.dumps({name: round(value, 6) for name, value in self.score_scales.items()}, sort_keys=True)} "
+                f"coverage={json.dumps(self.score_coverage, sort_keys=True)} "
+                f"required_references={json.dumps({name: round(value, 6) for name, value in self.required_target_references.items()}, sort_keys=True)} "
+                f"required_limits={json.dumps({name: round(value, 6) for name, value in self.required_target_limits.items()}, sort_keys=True)}."
+            )
+        else:
+            log(
+                f"[{_now()}] Auto Research baseline legacy scalar score={baseline_score:.6g}."
+            )
+        if dropped_targets or unsupported_loss_params:
+            log(
+                f"[{_now()}] Auto Research excluded insufficiently covered targets="
+                f"{sorted(set(dropped_targets))}; skipped dimensions="
+                f"{sorted(unsupported_loss_params)}."
+            )
         log(
-            f"[{_now()}] Auto Research baseline normalized multi-task score="
-            f"{baseline_score:.6g}"
+            f"[{_now()}] Auto Research effective plan: {len(sensitivity_plan)} "
+            f"one-factor trials + up to {refinement_budget} group refinements + "
+            "paired confirmation."
         )
 
         best_observed_params = dict(current)
@@ -10810,6 +12125,7 @@ class AutoSearchEngine:
                 seed=confirmation_seed,
                 epochs=confirmation_epochs,
                 suffix="_confirm_baseline",
+                enforce_required_targets=False,
             )
             if baseline_confirmation is None:
                 return dict(current), float("inf")
@@ -10840,10 +12156,42 @@ class AutoSearchEngine:
                 )
                 confirmation["baseline_aggregate"] = baseline_aggregate
                 confirmation["candidate_aggregate"] = candidate_aggregate
-                required_gain = max(
+                minimum_relative_gain = max(
                     0.0, float(getattr(self.auto_cfg, "min_relative_effect", 0.005))
-                ) * max(1.0, abs(baseline_aggregate))
-                if candidate_aggregate < baseline_aggregate - required_gain:
+                )
+                initial_required_gain = minimum_relative_gain * max(
+                    1.0, abs(float(baseline_score))
+                )
+                paired_required_gain = minimum_relative_gain * max(
+                    1.0, abs(float(baseline_confirmation))
+                )
+                aggregate_required_gain = minimum_relative_gain * max(
+                    1.0, abs(float(baseline_aggregate))
+                )
+                initial_pass = (
+                    float(best_observed_score)
+                    < float(baseline_score) - initial_required_gain
+                )
+                paired_pass = (
+                    float(candidate_confirmation)
+                    < float(baseline_confirmation) - paired_required_gain
+                )
+                aggregate_pass = (
+                    candidate_aggregate
+                    < baseline_aggregate - aggregate_required_gain
+                )
+                confirmation.update({
+                    "initial_delta": float(baseline_score) - float(best_observed_score),
+                    "paired_delta": float(baseline_confirmation) - float(candidate_confirmation),
+                    "aggregate_delta": baseline_aggregate - candidate_aggregate,
+                    "initial_required_gain": initial_required_gain,
+                    "paired_required_gain": paired_required_gain,
+                    "aggregate_required_gain": aggregate_required_gain,
+                    "initial_pass": initial_pass,
+                    "paired_pass": paired_pass,
+                    "aggregate_pass": aggregate_pass,
+                })
+                if initial_pass and paired_pass and aggregate_pass:
                     final_params = dict(best_observed_params)
                     final_score = float(candidate_aggregate)
                     confirmation["confirmed"] = True
@@ -10855,7 +12203,9 @@ class AutoSearchEngine:
                     final_score = float(baseline_aggregate)
                     log(
                         f"[{_now()}] Auto Research confirmation rejected the provisional "
-                        "winner; retaining the baseline configuration."
+                        "winner; retaining the baseline configuration "
+                        f"(initial_pass={initial_pass}, paired_pass={paired_pass}, "
+                        f"aggregate_pass={aggregate_pass})."
                     )
             else:
                 log(
@@ -10874,6 +12224,60 @@ class AutoSearchEngine:
 
         self.last_report = {
             "strategy": "paired_one_factor_then_grouped_local_bo",
+            "score_policy": (
+                "baseline_calibrated_smoothed_pareto_guard"
+                if self.metric_calibration_available
+                else "legacy_scalar_fallback"
+            ),
+            "metric_calibration_available": bool(self.metric_calibration_available),
+            "score_targets": list(self.score_targets),
+            "score_scales": dict(self.score_scales),
+            "score_coverage": dict(self.score_coverage),
+            "required_targets": list(self.required_targets),
+            "required_target_references": dict(self.required_target_references),
+            "required_target_limits": dict(self.required_target_limits),
+            "dropped_targets": list(dropped_targets),
+            "skipped_loss_dimensions": sorted(unsupported_loss_params),
+            "score_smoothing_window": int(getattr(
+                self.auto_cfg, "score_smoothing_window", 3
+            )),
+            "subset_diagnostics": dict(self.subset_diagnostics),
+            "baseline_memory": {
+                "trend_warnings": int(baseline_state.get("memory_warning_count", 0)),
+                "peak_growth_mib": float(
+                    baseline_state.get("max_memory_growth_mib", 0.0)
+                ),
+                "rss_policy": "warn_only",
+                "hard_limit_mib": None,
+                "legacy_rss_limit_mib": float(getattr(
+                    self.auto_cfg, "max_trial_memory_growth_mib", 1024.0
+                )),
+                "legacy_rss_rejection_ignored": True,
+                "pressure_observations": int(
+                    baseline_state.get("memory_pressure_observations", 0)
+                ),
+            },
+            "memory_policy": {
+                "rss_delta_action": "warn_only",
+                "hard_stop_on_pressure": bool(getattr(
+                    self.auto_cfg, "hard_stop_on_memory_pressure", True
+                )),
+                "minimum_system_available_fraction": float(getattr(
+                    self.auto_cfg, "memory_min_available_fraction", 0.08
+                )),
+                "maximum_process_rss_fraction": float(getattr(
+                    self.auto_cfg, "memory_max_process_fraction", 0.80
+                )),
+                "maximum_accelerator_fraction": float(getattr(
+                    self.auto_cfg, "memory_max_accelerator_fraction", 0.90
+                )),
+                "epoch_pressure_consecutive_checks": max(1, int(getattr(
+                    self.auto_cfg, "memory_pressure_consecutive_checks", 2
+                ))),
+                "cross_trial_action": "warn_only",
+            },
+            "trial_memory_records": copy.deepcopy(trial_memory_records),
+            "cross_trial_memory_assessment": copy.deepcopy(cross_trial_memory),
             "baseline_score": float(baseline_score),
             "planned_trials": int(planned_total),
             "executed_trials": int(trial_counter),
@@ -11026,7 +12430,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
     def _cancelled_result(stage: str) -> "Tuple[str, float]":
         log(
-            f"[{_now()}] Training stopped by user during {stage}; "
+            f"[{_now()}] Training stop requested during {stage}; "
             "no unvalidated checkpoint was written."
         )
         if progress is not None:
@@ -11748,6 +13152,13 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     def _make_loader(ds: Sequence[AtomicData], *, shuffle: bool) -> Any:
         # Clamp the batch size so tiny validation sets still produce a batch.
         _eff_bs = max(1, min(int(cfg.batch_size), len(ds) if ds else 1))
+        _configured_edge_budget = getattr(cfg, "mps_edge_budget_override", None)
+        try:
+            _configured_edge_budget = int(_configured_edge_budget)
+        except (TypeError, ValueError, OverflowError):
+            _configured_edge_budget = None
+        if _configured_edge_budget is not None and _configured_edge_budget <= 0:
+            _configured_edge_budget = None
         kwargs: Dict[str, Any] = dict(
             collate_fn=_collate,
             num_workers=int(_dl_num_workers),
@@ -11755,7 +13166,9 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         )
         if isinstance(ds, CompositeAtomicDataDataset):
             edge_budget = (
-                12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
+                _configured_edge_budget
+                if _configured_edge_budget is not None
+                else 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
             ) if device.type == "mps" else None
             kwargs["batch_sampler"] = _CompositeCurriculumBatchSampler(
                 ds, _eff_bs, int(cfg.seed), shuffle=shuffle,
@@ -11766,7 +13179,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             # edges rather than only structures because edge count drives memory.
             # Apply the same policy to validation, where conservative forces
             # still construct the higher-order graph; only training shuffles.
-            edge_budget = 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
+            edge_budget = (
+                _configured_edge_budget
+                if _configured_edge_budget is not None
+                else 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
+            )
             kwargs["batch_sampler"] = _FixedGraphBatchSampler(
                 ds,
                 _eff_bs,
@@ -13247,7 +14664,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             f"MPS active={memory['mps_active_mib']:.1f} MiB "
             f"driver={memory['mps_driver_mib']:.1f} MiB "
             f"cache={memory['mps_cache_mib']:.1f} MiB"
-            + (" [possible cross-epoch leak]" if leak_warning else "")
+            + (
+                " [RSS trend warning; monitoring only]"
+                if leak_warning else ""
+            )
         )
         if cfg.save_epoch_artifacts:
             (_train_dir / "memory_history.json").write_text(
@@ -13268,6 +14688,15 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     name: float(total / count)
                     for name, (total, count) in val_extra_metrics.items()
                     if count > 0
+                },
+                "validation_counts": {
+                    **({"energy": int(val_emae_n)} if val_emae_n > 0 else {}),
+                    **({"forces": int(val_fmae_n)} if val_fmae_n > 0 else {}),
+                    **{
+                        name: int(count)
+                        for name, (_total, count) in val_extra_metrics.items()
+                        if count > 0
+                    },
                 },
                 "physics_residual_max": dict(val_residual_max),
                 "memory": dict(memory),
@@ -13333,7 +14762,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         )
     if stopped:
         log(
-            f"[{_now()}] Training stopped by user; saving the best completed "
+            f"[{_now()}] Training stop requested; saving the best completed "
             f"validation checkpoint from epoch {_best_epoch}."
         )
     model.cpu()
@@ -16691,6 +18120,7 @@ class App(tk.Tk):
                 search_space_overrides=dynamic_architecture_search_space(
                     base_cfg.model, self._dataset_capability
                 ),
+                dataset_capability=dict(self._dataset_capability),
             )
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("Auto Search Error", str(e))
@@ -16761,6 +18191,18 @@ class App(tk.Tk):
         while not self._progress_q.empty():
             d = self._progress_q.get()
             typ = d.get("type", "")
+            auto_prefix = ""
+            if "auto_search_trial" in d:
+                auto_trial = int(d.get("auto_search_trial", 0))
+                auto_total = max(1, int(d.get("auto_search_n_trials", 1)))
+                auto_phase = str(
+                    d.get("auto_search_phase", "refinement")
+                ).replace("_", " ").title()
+                auto_label = (
+                    "Baseline" if auto_trial == 0
+                    else f"Trial {auto_trial}/{auto_total}"
+                )
+                auto_prefix = f"Auto Research {auto_phase} {auto_label}  "
             if typ == "train":
                 frac = float(d.get("overall_frac", 0.0))
                 self.progress["value"] = 100.0 * max(0.0, min(1.0, frac))
@@ -16769,7 +18211,10 @@ class App(tk.Tk):
                 st = int(d.get("step", 0))
                 sts = int(d.get("steps", 0))
                 eta_s = float(d.get("eta_s", float("nan")))
-                self._progress_text_var.set(f"Epoch {ep}/{eps}  Batch {st}/{sts}  {self._fmt_eta(eta_s)}")
+                self._progress_text_var.set(
+                    f"{auto_prefix}Epoch {ep}/{eps}  Batch {st}/{sts}  "
+                    f"{self._fmt_eta(eta_s)}"
+                )
             elif typ == "prep":
                 frac = float(d.get("overall_frac", 0.0))
                 self.progress["value"] = 100.0 * max(0.0, min(1.0, frac))
@@ -16782,7 +18227,7 @@ class App(tk.Tk):
                     msg = f"{msg}: {int(cur)}/{int(tot)}"
                 if stage:
                     msg = f"{msg}  {stage}"
-                self._progress_text_var.set(msg)
+                self._progress_text_var.set(auto_prefix + msg)
             elif typ == "epoch":
                 self.progress["value"] = (float(d.get("epoch", 0)) / float(max(1, d.get("epochs", 1)))) * 100.0
             elif typ == "metrics":
@@ -16797,7 +18242,9 @@ class App(tk.Tk):
                 eps = int(d.get("epochs", 0))
                 st  = int(d.get("step", 0))
                 sts = int(d.get("steps", 0))
-                self._progress_text_var.set(f"Epoch {ep}/{eps}  Validating {st}/{sts}")
+                self._progress_text_var.set(
+                    f"{auto_prefix}Epoch {ep}/{eps}  Validating {st}/{sts}"
+                )
             elif typ == "auto_search":
                 trial    = int(d.get("trial", 0))
                 n        = int(d.get("n_trials", 1))
@@ -18609,13 +20056,13 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
         table_card = Card(
             "Active Search Dimensions",
-            "One-factor effects use a fixed mixed-architecture baseline; only supported dimensions enter local group refinement.",
+            "One-factor effects use a fixed baseline, calibrated target scales, and protected core PES objectives. Values remain provisional until paired confirmation.",
             PALETTE["surface"],
         )
         self.search_table = QtWidgets.QTableWidget(0, 8)
         self.search_table.setHorizontalHeaderLabels(
             (
-                "Parameter", "Sampler", "Domain (JSON)", "Best / current",
+                "Parameter", "Sampler", "Domain (JSON)", "Provisional best",
                 "Last tried", "Status", "Independent effect", "Phase",
             )
         )
@@ -20081,6 +21528,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 lock_selected_architecture=True,
                 search_space_overrides=search_overrides,
                 search_params=tuple(selected_params),
+                dataset_capability=dict(self._capability),
             )
             tmp_dir = str(self._artifact_dir_for_checkpoint(str(self.value("out_ckpt"))) / "auto_trials")
             engine = self.backend.AutoSearchEngine(base, auto_cfg, tmp_dir)
@@ -20268,17 +21716,39 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Auto Research", str(exc))
             return
+        if bool(engine.subset_diagnostics.get("adjusted", False)):
+            self._signal_guard = True
+            try:
+                self.set_value(
+                    "auto_subset",
+                    100.0 * float(engine.effective_subset_fraction),
+                )
+            finally:
+                self._signal_guard = False
         revision = self._dataset_revision
         architecture_signature = self._architecture_signature()
         self._search_context_revision += 1
         context_revision = self._search_context_revision
         self._invalidate_auto_result("Search in progress")
         counts = engine.planned_trial_counts()
-        self.auto_summary.setText(
+        summary_text = (
             f"Fixed-baseline screen: {counts['sensitivity']} one-factor trials for "
             f"{len(params)} dimensions, then up to {counts['refinement']} group "
-            f"refinements and a paired confirmation ({counts['baseline'] + counts['sensitivity'] + counts['refinement'] + counts['confirmation']} max runs)."
+            f"refinements and a paired confirmation "
+            f"({counts['baseline'] + counts['sensitivity'] + counts['refinement'] + counts['confirmation']} max runs). "
+            f"Protected targets: {', '.join(engine.required_targets) or 'none'}."
         )
+        if engine.subset_diagnostics.get("warnings"):
+            summary_text += " Subset warning: " + "; ".join(
+                engine.subset_diagnostics["warnings"]
+            ) + "."
+        if bool(engine.subset_diagnostics.get("adjusted", False)):
+            summary_text += (
+                f" Sample % will be raised from "
+                f"{100.0 * float(engine.auto_cfg.subset_fraction):.3g}% to "
+                f"{100.0 * float(engine.effective_subset_fraction):.3g}% before training."
+            )
+        self.auto_summary.setText(summary_text)
         self._reset_dashboard(str(self.value("out_ckpt")), "Auto Research")
 
         def work() -> None:
@@ -20399,6 +21869,19 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             index = int(self._stage_info[stage_id].get("stage_index", 1))
             total = int(self._stage_info[stage_id].get("stage_total", 1))
             stage_prefix = f"{label} ({index}/{total})  "
+        if "auto_search_trial" in event:
+            auto_trial = int(event.get("auto_search_trial", 0))
+            auto_total = max(1, int(event.get("auto_search_n_trials", 1)))
+            auto_phase = str(
+                event.get("auto_search_phase", "refinement")
+            ).replace("_", " ").title()
+            auto_label = (
+                "Baseline" if auto_trial == 0
+                else f"Trial {auto_trial}/{auto_total}"
+            )
+            stage_prefix = (
+                f"Auto Research {auto_phase} {auto_label}  " + stage_prefix
+            )
         if kind == "train":
             fraction = max(0.0, min(1.0, float(event.get("overall_frac", 0.0))))
             self.progress_bar.setValue(int(round(1000.0 * fraction)))
@@ -20493,7 +21976,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self.progress_bar.setValue(int(1000 * trial / trials))
         self.header_progress.setText(
             f"Auto Research {phase.replace('_', ' ')} {trial}/{trials}  "
-            f"best={best_score:.4g}  trial={trial_score:.4g}"
+            f"provisional={best_score:.4g}  trial={trial_score:.4g}"
         )
         best = dict(event.get("params", {}))
         latest = dict(event.get("trial_params", {}))
