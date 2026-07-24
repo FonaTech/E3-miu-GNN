@@ -5217,11 +5217,7 @@ def dynamic_parameter_reference_ranges(
     stability_high = max(stability_low * 5.0, min(2.0, 4.0 * hardness))
     min_validation = 0.2 if 0 < structures < 50 else 0.1 if structures < 500 else 0.05
     max_validation = 0.3 if 0 < structures < 50 else 0.2
-    recommended_search_structures = max(100, 5 * len(elements))
-    min_subset = (
-        min(100.0, 100.0 * recommended_search_structures / structures)
-        if structures else 1.0
-    )
+    min_subset = min(100.0, 10000.0 / structures) if structures else 1.0
     lr_high = 2e-3 if channels >= 96 or active_physics >= 4 else 5e-3
     channel_range = "64-128" if active_physics >= 4 else "32-96"
 
@@ -5258,11 +5254,7 @@ def dynamic_parameter_reference_ranges(
         "chem_aug_prob": "0-0.30; start at 0.05 only after a stable non-augmented baseline",
         "chem_aug_noise_std": "0-0.10 standardized descriptor units",
         "chem_aug_mix_max": "0-0.30; keep below 0.15 for chemically narrow datasets",
-        "auto_subset": (
-            f"{min_subset:.3g}-100%; aim for at least "
-            f"{recommended_search_structures} sampled structures "
-            f"(5 per detected element, minimum 100)"
-        ),
+        "auto_subset": f"{min_subset:.3g}-100%; aim for at least 100 structures per search trial",
     }
 
 
@@ -8998,10 +8990,6 @@ class TrainConfig:
     # same graph every epoch. Geometry and labels remain in canonical HDF5.
     cache_neighbor_graphs: bool = True
     graph_cache_dir: str = ""
-    # Internal comparison control used by Auto Research. ``None`` preserves the
-    # regular device-aware policy; a positive value freezes the MPS topology
-    # budget so changing a loss weight cannot also change batches/step counts.
-    mps_edge_budget_override: Optional[int] = None
     # Composite Joint epochs use every response record and a rotating,
     # deterministic foundation window. This prevents rare L2/L3 labels from
     # being diluted by tens of millions of OMat24 L1 structures.
@@ -9431,31 +9419,6 @@ class AutoSearchConfig:
     # modestly longer short-run budget. Both baseline and candidate are rerun.
     confirmation_epoch_multiplier: float = 1.5
     confirmation_seed_offset: int = 104_729
-    # Energy and forces that are already active in the baseline are protected
-    # by default. Explicit ``required_targets`` may extend or replace that set.
-    protect_active_core_targets: bool = True
-    required_targets: Tuple[str, ...] = ()
-    # A candidate is invalid when any required target regresses beyond this
-    # fraction at its selected epoch. This prevents an optional response metric
-    # from purchasing a materially worse interatomic potential.
-    max_required_target_regression: float = 0.10
-    # Auto Research calibrates each target against the baseline history and
-    # freezes those scales for every candidate. Coverage guards prevent a trial
-    # from winning by dropping difficult validation labels.
-    calibrate_validation_scales: bool = True
-    min_validation_observations: int = 2
-    min_validation_coverage_fraction: float = 0.95
-    # Compare a short rolling mean instead of the single luckiest epoch.
-    score_smoothing_window: int = 3
-    # Memory trend warnings are recorded without interrupting a trial. A hard
-    # stop is reserved for growth beyond this larger ceiling, because allocator
-    # warm-up and streamed HDF5 caches can legitimately raise RSS by hundreds of
-    # MiB while MPS active/driver memory remains stable.
-    reject_memory_leaking_trials: bool = True
-    max_trial_memory_growth_mib: float = 1024.0
-    # Optional GUI-provided metadata used only for a transparent search-subset
-    # confidence warning. It never changes a user's selected split silently.
-    dataset_capability: Dict[str, Any] = field(default_factory=dict)
 
 
 _AUTOSEARCH_SAMPLERS = {
@@ -9969,74 +9932,6 @@ class AutoSearchEngine:
         "w_dmi": "DMI_effective",
     }
 
-    @staticmethod
-    def _positive_loss_sampler(name: str, spec: tuple) -> tuple:
-        """Remove the explicit zero atom from a required loss dimension."""
-        kind = str(spec[0])
-        if kind == "zero_log_uniform":
-            return ("log_uniform", float(spec[1]), float(spec[2]))
-        if kind == "choice":
-            values = [
-                value for value in spec[1]
-                if not isinstance(value, (int, float, np.integer, np.floating))
-                or float(value) > 0.0
-            ]
-            if not values:
-                raise ValueError(
-                    f"Required Auto Research target {name!r} has no positive search values"
-                )
-            return ("choice", values)
-        if kind == "uniform":
-            low, high = float(spec[1]), float(spec[2])
-            if high <= 0.0:
-                raise ValueError(
-                    f"Required Auto Research target {name!r} has no positive search interval"
-                )
-            return ("uniform", max(np.finfo(float).tiny, low), high)
-        return spec
-
-    def _subset_diagnostics(self) -> Dict[str, Any]:
-        """Estimate whether a GUI-selected search subset is statistically thin."""
-        capability = dict(getattr(self.auto_cfg, "dataset_capability", {}) or {})
-        try:
-            structures = max(0, int(capability.get("structures", 0)))
-        except (TypeError, ValueError, OverflowError):
-            structures = 0
-        if structures <= 0:
-            return {"available": False, "warnings": []}
-        elements = {
-            int(value)
-            for value in capability.get("elements", [])
-            if isinstance(value, (int, np.integer)) or str(value).strip().isdigit()
-        }
-        fraction = min(1.0, max(0.0, float(self.auto_cfg.subset_fraction)))
-        sampled = max(1, int(math.ceil(structures * fraction)))
-        validation = max(1, int(round(sampled * float(self.base_cfg.val_fraction))))
-        recommended_sampled = max(100, 5 * len(elements))
-        recommended_validation = max(16, min(64, max(1, len(elements) // 2)))
-        warnings: List[str] = []
-        if sampled < recommended_sampled:
-            warnings.append(
-                f"sampled structures {sampled} < recommended {recommended_sampled} "
-                f"for {len(elements)} elements"
-            )
-        if validation < recommended_validation:
-            warnings.append(
-                f"estimated validation structures {validation} < recommended "
-                f"{recommended_validation}"
-            )
-        return {
-            "available": True,
-            "structures": structures,
-            "elements": len(elements),
-            "subset_fraction": fraction,
-            "estimated_sampled_structures": sampled,
-            "estimated_validation_structures": validation,
-            "recommended_sampled_structures": recommended_sampled,
-            "recommended_validation_structures": recommended_validation,
-            "warnings": warnings,
-        }
-
     def __init__(self, base_cfg: "TrainConfig", auto_cfg: AutoSearchConfig, tmp_dir: str) -> None:
         self.base_cfg  = base_cfg
         self.auto_cfg  = auto_cfg
@@ -10060,42 +9955,11 @@ class AutoSearchEngine:
             if name not in self.SEARCH_SPACE:
                 raise ValueError(f"Unknown Auto Research override parameter: {name!r}")
             self.search_space[name] = normalize_search_space_spec(name, spec)
-        # Dataset masks and architecture relevance determine availability. Zero
-        # remains searchable for optional objectives, while required targets are
-        # explicitly restricted to positive loss weights above.
+        # Dataset masks and architecture relevance determine availability. The
+        # current numeric value does not: zero must remain searchable.
         self._params = list(dict.fromkeys(
             name for name in requested if name not in excluded
         ))
-        valid_targets = set(self.LOSS_PARAM_TO_TARGET.values()) | {"Di"}
-        explicit_required = tuple(
-            str(value) for value in getattr(auto_cfg, "required_targets", ())
-            if str(value).strip()
-        )
-        unknown_required = sorted(set(explicit_required) - valid_targets)
-        if unknown_required:
-            raise ValueError(
-                f"Unknown required Auto Research target(s): {unknown_required}"
-            )
-        if explicit_required:
-            required_targets = explicit_required
-        elif bool(getattr(auto_cfg, "protect_active_core_targets", True)):
-            required_targets = tuple(
-                target
-                for parameter, target in (("w_energy", "energy"), ("w_forces", "forces"))
-                if float(getattr(base_cfg, parameter, 0.0)) > 0.0
-            )
-        else:
-            required_targets = ()
-        self.required_targets = tuple(dict.fromkeys(required_targets))
-        self.required_loss_params = {
-            parameter
-            for parameter, target in self.LOSS_PARAM_TO_TARGET.items()
-            if target in self.required_targets
-        }
-        for parameter in self.required_loss_params:
-            self.search_space[parameter] = self._positive_loss_sampler(
-                parameter, self.search_space[parameter]
-            )
         fixed_loss_params = {
             name
             for name in self.LOSS_PARAM_TO_TARGET
@@ -10108,13 +9972,6 @@ class AutoSearchEngine:
                 if name in fixed_loss_params
             )
         )
-        self.score_targets: Tuple[str, ...] = self.validation_targets
-        self.score_scales: Dict[str, float] = {}
-        self.score_coverage: Dict[str, int] = {}
-        self.required_target_references: Dict[str, float] = {}
-        self.required_target_limits: Dict[str, float] = {}
-        self.metric_calibration_available: bool = False
-        self.subset_diagnostics = self._subset_diagnostics()
         # The old global BO is intentionally not constructed. Sparse observations
         # across all mixed-physics dimensions made its proposal direction mostly
         # indistinguishable from random sampling. Local BO instances are created
@@ -10452,13 +10309,6 @@ class AutoSearchEngine:
         suffix: str = "",
     ) -> "TrainConfig":
         """Build a TrainConfig for a single staged trial from flat parameters."""
-        for parameter in self.required_loss_params:
-            value = float(params.get(parameter, getattr(self.base_cfg, parameter)))
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(
-                    f"{parameter} controls required target "
-                    f"{self.LOSS_PARAM_TO_TARGET[parameter]!r} and must remain positive"
-                )
         model_values = asdict(self.base_cfg.model)
         for name in ModelConfig.__dataclass_fields__:
             if name in params:
@@ -10508,24 +10358,6 @@ class AutoSearchEngine:
         # causing excessive MPSGraph shape compilation and memory caching.
         _bs_raw = int(params.get("batch_size", self.base_cfg.batch_size))
         _bs     = max(1, _bs_raw)
-        _fixed_edge_budget = getattr(
-            self.base_cfg, "mps_edge_budget_override", None
-        )
-        try:
-            _fixed_edge_budget = (
-                int(_fixed_edge_budget) if _fixed_edge_budget is not None else None
-            )
-        except (TypeError, ValueError, OverflowError):
-            _fixed_edge_budget = None
-        if _fixed_edge_budget is None or _fixed_edge_budget <= 0:
-            # Freeze the comparison topology even when a candidate sets a
-            # derivative loss to zero. Otherwise one-factor screening changes
-            # both the objective and the number/composition of optimizer steps.
-            _fixed_edge_budget = (
-                12000
-                if bool({"forces", "bec"} & set(self.validation_targets))
-                else 30000
-            )
 
         return TrainConfig(
             mode                   = _mode,
@@ -10572,294 +10404,17 @@ class AutoSearchEngine:
             stream_hdf5            = bool(self.base_cfg.stream_hdf5),
             cache_neighbor_graphs  = bool(self.base_cfg.cache_neighbor_graphs),
             graph_cache_dir        = str(self.base_cfg.graph_cache_dir),
-            mps_edge_budget_override = int(_fixed_edge_budget),
             validation_targets     = self.validation_targets,
         )
-
-    # Auto Research metric calibration and robust scoring.
-
-    @staticmethod
-    def _metric_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
-        values: Dict[str, float] = {}
-        counts: Dict[str, int] = {}
-
-        def add(name: str, value: Any) -> None:
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError, OverflowError):
-                return
-            if math.isfinite(numeric):
-                values[str(name)] = numeric
-
-        add("energy", payload.get("energy_mae"))
-        add("forces", payload.get("force_mae"))
-        for name, value in dict(payload.get("multitask_mae", {})).items():
-            add(str(name), value)
-        for name, value in dict(payload.get("validation_counts", {})).items():
-            try:
-                counts[str(name)] = max(0, int(value))
-            except (TypeError, ValueError, OverflowError):
-                continue
-        memory = dict(payload.get("memory", {}))
-        try:
-            memory_growth = float(memory.get("rss_growth_mib", 0.0))
-        except (TypeError, ValueError, OverflowError):
-            memory_growth = 0.0
-        return {
-            "epoch": int(payload.get("epoch", 0)),
-            "values": values,
-            "counts": counts,
-            "memory_growth_mib": memory_growth,
-            "memory_leak_warning": bool(payload.get("memory_leak_warning", False)),
-        }
-
-    @staticmethod
-    def _target_value(snapshot: Dict[str, Any], target: str) -> Optional[float]:
-        values = dict(snapshot.get("values", {}))
-        aliases = (target, "Di") if target == "Di_effective" else (target,)
-        for name in aliases:
-            if name in values and math.isfinite(float(values[name])):
-                return float(values[name])
-        return None
-
-    @staticmethod
-    def _target_count(snapshot: Dict[str, Any], target: str) -> int:
-        counts = dict(snapshot.get("counts", {}))
-        aliases = (target, "Di") if target == "Di_effective" else (target,)
-        return max((int(counts.get(name, 0)) for name in aliases), default=0)
-
-    def _score_metric_history(
-        self,
-        history: Sequence[Dict[str, Any]],
-        *,
-        scales: Dict[str, float],
-        coverage: Dict[str, int],
-        required_limits: Optional[Dict[str, float]] = None,
-    ) -> Tuple[float, Optional[Dict[str, Any]]]:
-        """Return the best smoothed, coverage-safe score and its metric window."""
-        snapshots = [dict(item) for item in history if dict(item).get("values")]
-        if not snapshots or not scales:
-            return float("inf"), None
-        requested_window = max(
-            1, int(getattr(self.auto_cfg, "score_smoothing_window", 3))
-        )
-        window = min(requested_window, len(snapshots))
-        coverage_fraction = min(
-            1.0,
-            max(
-                0.0,
-                float(getattr(
-                    self.auto_cfg, "min_validation_coverage_fraction", 0.95
-                )),
-            ),
-        )
-        limits = dict(required_limits or {})
-        best_score = float("inf")
-        best_window: Optional[Dict[str, Any]] = None
-        for end in range(window, len(snapshots) + 1):
-            chunk = snapshots[end - window:end]
-            means: Dict[str, float] = {}
-            valid = True
-            for target, scale in scales.items():
-                values: List[float] = []
-                required_count = int(math.ceil(
-                    coverage_fraction * max(0, int(coverage.get(target, 0)))
-                ))
-                for snapshot in chunk:
-                    value = self._target_value(snapshot, target)
-                    if value is None or self._target_count(snapshot, target) < required_count:
-                        valid = False
-                        break
-                    values.append(value)
-                if not valid:
-                    break
-                means[target] = float(np.mean(values))
-                if target in limits and means[target] > float(limits[target]):
-                    valid = False
-                    break
-            if not valid:
-                continue
-            score = float(np.mean([
-                means[target] / max(float(scale), np.finfo(float).tiny)
-                for target, scale in scales.items()
-            ]))
-            if math.isfinite(score) and score < best_score:
-                best_score = score
-                best_window = {
-                    "epoch_start": int(chunk[0].get("epoch", 0)),
-                    "epoch_end": int(chunk[-1].get("epoch", 0)),
-                    "values": means,
-                    "score": score,
-                }
-        return best_score, best_window
-
-    def _best_target_window_value(
-        self,
-        history: Sequence[Dict[str, Any]],
-        target: str,
-        coverage: Dict[str, int],
-    ) -> Optional[float]:
-        """Return the best rolling validation MAE for one protected target."""
-        snapshots = [dict(item) for item in history if dict(item).get("values")]
-        if not snapshots:
-            return None
-        window = min(
-            max(1, int(getattr(self.auto_cfg, "score_smoothing_window", 3))),
-            len(snapshots),
-        )
-        coverage_fraction = min(
-            1.0,
-            max(
-                0.0,
-                float(getattr(
-                    self.auto_cfg, "min_validation_coverage_fraction", 0.95
-                )),
-            ),
-        )
-        required_count = int(math.ceil(
-            coverage_fraction * max(0, int(coverage.get(target, 0)))
-        ))
-        best: Optional[float] = None
-        for end in range(window, len(snapshots) + 1):
-            values: List[float] = []
-            for snapshot in snapshots[end - window:end]:
-                value = self._target_value(snapshot, target)
-                if value is None or self._target_count(snapshot, target) < required_count:
-                    values = []
-                    break
-                values.append(value)
-            if values:
-                mean_value = float(np.mean(values))
-                if best is None or mean_value < best:
-                    best = mean_value
-        return best
-
-    def _calibrate_from_baseline(
-        self,
-        history: Sequence[Dict[str, Any]],
-    ) -> Tuple[float, Dict[str, Any], List[str]]:
-        """Freeze score targets/scales/coverage from one baseline trajectory."""
-        minimum = max(
-            1, int(getattr(self.auto_cfg, "min_validation_observations", 2))
-        )
-        scales: Dict[str, float] = {}
-        coverage: Dict[str, int] = {}
-        dropped: List[str] = []
-        for target in self.validation_targets:
-            observations = [
-                value
-                for snapshot in history
-                for value in [self._target_value(snapshot, target)]
-                if value is not None and math.isfinite(value)
-            ]
-            max_count = max(
-                (self._target_count(snapshot, target) for snapshot in history),
-                default=0,
-            )
-            if not observations or max_count < minimum:
-                if target in self.required_targets:
-                    raise ValueError(
-                        f"Required Auto Research target {target!r} has only "
-                        f"{max_count} validation observations; at least {minimum} are required"
-                    )
-                dropped.append(target)
-                continue
-            if bool(getattr(self.auto_cfg, "calibrate_validation_scales", True)):
-                reference = float(np.median(np.asarray(observations, dtype=float)))
-                physical_floor = float(VALIDATION_MAE_SCALES.get(target, 1.0)) * 1e-6
-                scales[target] = max(reference, physical_floor, np.finfo(float).tiny)
-            else:
-                scales[target] = float(VALIDATION_MAE_SCALES.get(target, 1.0))
-            coverage[target] = int(max_count)
-        if not scales:
-            raise ValueError(
-                "Auto Research baseline has no sufficiently covered validation targets"
-            )
-        self.score_targets = tuple(scales)
-        self.score_scales = dict(scales)
-        self.score_coverage = dict(coverage)
-        baseline_score, best_window = self._score_metric_history(
-            history, scales=scales, coverage=coverage
-        )
-        if best_window is None or not math.isfinite(baseline_score):
-            raise FloatingPointError(
-                "Auto Research could not form a finite smoothed baseline score"
-            )
-        tolerance = max(
-            0.0,
-            float(getattr(self.auto_cfg, "max_required_target_regression", 0.10)),
-        )
-        self.required_target_references = {
-            target: reference
-            for target in self.required_targets
-            for reference in [self._best_target_window_value(history, target, coverage)]
-            if reference is not None
-        }
-        self.required_target_limits = {
-            target: max(
-                float(reference) * (1.0 + tolerance),
-                float(reference) + scales[target] * tolerance,
-            )
-            for target, reference in self.required_target_references.items()
-            if target in scales
-        }
-        return baseline_score, best_window, dropped
 
     # Main search loop.
 
     @staticmethod
     def _make_progress(
-        pq_put: Callable,
-        trial_idx: int,
-        n_trials: int,
-        phase: str = "refinement",
-        *,
-        metrics_sink: Optional[List[Dict[str, Any]]] = None,
-        trial_state: Optional[Dict[str, Any]] = None,
-        auto_cfg: Optional[AutoSearchConfig] = None,
+        pq_put: Callable, trial_idx: int, n_trials: int, phase: str = "refinement"
     ) -> Callable:
-        """Return a progress callback that records metrics and emits epochs."""
+        """Return a progress callback that emits auto_search_epoch events."""
         def _cb(d: Dict[str, Any]) -> None:
-            if d.get("type") == "metrics":
-                snapshot = AutoSearchEngine._metric_snapshot(d)
-                if metrics_sink is not None:
-                    metrics_sink.append(snapshot)
-                if trial_state is not None and auto_cfg is not None:
-                    growth_limit = max(
-                        0.0,
-                        float(getattr(auto_cfg, "max_trial_memory_growth_mib", 1024.0)),
-                    )
-                    leaking = bool(snapshot.get("memory_leak_warning", False))
-                    if leaking:
-                        trial_state["memory_warning_count"] = int(
-                            trial_state.get("memory_warning_count", 0)
-                        ) + 1
-                    trial_state["max_memory_growth_mib"] = max(
-                        float(trial_state.get("max_memory_growth_mib", 0.0)),
-                        float(snapshot.get("memory_growth_mib", 0.0)),
-                    )
-                    over_limit = (
-                        growth_limit > 0.0
-                        and float(snapshot.get("memory_growth_mib", 0.0)) > growth_limit
-                    )
-                    catastrophic_growth = (
-                        growth_limit > 0.0
-                        and float(snapshot.get("memory_growth_mib", 0.0))
-                        > 2.0 * growth_limit
-                    )
-                    persistent_over_limit = (
-                        over_limit
-                        and int(trial_state.get("memory_warning_count", 0)) >= 2
-                    )
-                    if bool(getattr(auto_cfg, "reject_memory_leaking_trials", True)) and (
-                        persistent_over_limit or catastrophic_growth
-                    ):
-                        trial_state["abort_reason"] = (
-                            f"persistent RSS growth exceeded {growth_limit:g} MiB"
-                            if persistent_over_limit
-                            else f"RSS growth exceeded {2.0 * growth_limit:g} MiB"
-                        )
-                        trial_state["stop"] = True
             if d.get("type") == "epoch":
                 pq_put({
                     "type":     "auto_search_epoch",
@@ -10890,8 +10445,6 @@ class AutoSearchEngine:
         current = self._constrain_cutoff_pair(self._extract_current(self.base_cfg))
         sensitivity_plan = self._sensitivity_plan(current)
         refinement_budget = max(0, int(self.auto_cfg.n_trials))
-        # This is an upper bound until the baseline establishes which selected
-        # targets actually occur in the sampled validation split.
         planned_total = len(sensitivity_plan) + refinement_budget + 2
         self.sensitivity_results = {}
         self.last_report = {}
@@ -10926,7 +10479,6 @@ class AutoSearchEngine:
             seed: Optional[int] = None,
             epochs: Optional[int] = None,
             suffix: str = "",
-            enforce_required_targets: bool = True,
         ) -> "Optional[float]":
             """Run one short trial and convert failures into an explicit score."""
             nonlocal trial_counter
@@ -10946,65 +10498,17 @@ class AutoSearchEngine:
                 f"[{_now()}] Auto Research {phase} {trial_counter}/{planned_total} "
                 f"[{source}{'/' + group if group else ''}]: {changed_text}"
             )
-            metric_history: List[Dict[str, Any]] = []
-            trial_state: Dict[str, Any] = {"stop": False}
-            progress = self._make_progress(
-                pq_put,
-                trial_counter,
-                planned_total,
-                phase,
-                metrics_sink=metric_history,
-                trial_state=trial_state,
-                auto_cfg=self.auto_cfg,
-            )
+            progress = self._make_progress(pq_put, trial_counter, planned_total, phase)
             try:
-                _checkpoint, raw_score = train_dual_layer(
-                    cfg,
-                    log,
-                    progress,
-                    lambda: bool(stop_flag() or trial_state.get("stop", False)),
-                    _cache=data_cache,
+                _checkpoint, score = train_dual_layer(
+                    cfg, log, progress, stop_flag, _cache=data_cache
                 )
                 if stop_flag():
                     cleanup_trial(cfg.out_ckpt)
                     return None
-                if trial_state.get("abort_reason"):
-                    raise FloatingPointError(
-                        f"trial rejected: {trial_state['abort_reason']}"
-                    )
-                raw_score = float(raw_score)
-                if not math.isfinite(raw_score):
+                score = float(score)
+                if not math.isfinite(score):
                     raise FloatingPointError("trial returned a non-finite validation score")
-                if int(trial_state.get("memory_warning_count", 0)) > 0:
-                    log(
-                        f"[{_now()}] WARN: Auto Research {phase} trial "
-                        f"retained after {trial_state['memory_warning_count']} RSS "
-                        f"trend warning(s); peak delta="
-                        f"{float(trial_state.get('max_memory_growth_mib', 0.0)):.1f} MiB "
-                        "(below the hard rejection policy)."
-                    )
-                if self.metric_calibration_available:
-                    score, selected_window = self._score_metric_history(
-                        metric_history,
-                        scales=self.score_scales,
-                        coverage=self.score_coverage,
-                        required_limits=(
-                            self.required_target_limits
-                            if enforce_required_targets else None
-                        ),
-                    )
-                    if selected_window is None or not math.isfinite(score):
-                        guard = "required-target guard or validation coverage"
-                        raise FloatingPointError(
-                            f"trial has no finite calibrated score after {guard}"
-                        )
-                    log(
-                        f"[{_now()}] Auto Research {phase} calibrated score={score:.6g} "
-                        f"over epochs {selected_window['epoch_start']}-"
-                        f"{selected_window['epoch_end']} (trainer score={raw_score:.6g})."
-                    )
-                else:
-                    score = raw_score
             except Exception as exc:
                 score = float("inf")
                 log(
@@ -11018,36 +10522,15 @@ class AutoSearchEngine:
         # Baseline trial using the current GUI parameters.
         log(
             f"[{_now()}] Auto Research: baseline + {len(sensitivity_plan)} "
-            f"one-factor trials + up to {refinement_budget} group refinements "
-            "(pre-coverage upper bound); "
+            f"one-factor trials + up to {refinement_budget} group refinements; "
             f"subset={self.auto_cfg.subset_fraction:.0%}, "
             f"epochs={self.auto_cfg.trial_epochs}."
         )
-        if self.subset_diagnostics.get("warnings"):
-            log(
-                f"[{_now()}] WARN: Auto Research subset confidence is limited: "
-                + "; ".join(self.subset_diagnostics["warnings"])
-                + ". Increase Sample % before treating small score differences as physical."
-            )
         baseline_cfg = self._build_trial_cfg(current, trial_idx=0)
-        baseline_history: List[Dict[str, Any]] = []
-        baseline_state: Dict[str, Any] = {"stop": False}
-        baseline_progress = self._make_progress(
-            pq_put,
-            0,
-            planned_total,
-            "baseline",
-            metrics_sink=baseline_history,
-            trial_state=baseline_state,
-            auto_cfg=self.auto_cfg,
-        )
+        baseline_progress = self._make_progress(pq_put, 0, planned_total, "baseline")
         try:
-            _checkpoint, raw_baseline_score = train_dual_layer(
-                baseline_cfg,
-                log,
-                baseline_progress,
-                lambda: bool(stop_flag() or baseline_state.get("stop", False)),
-                _cache=data_cache,
+            _checkpoint, baseline_score = train_dual_layer(
+                baseline_cfg, log, baseline_progress, stop_flag, _cache=data_cache
             )
         except Exception as exc:
             cleanup_trial(baseline_cfg.out_ckpt)
@@ -11059,96 +10542,16 @@ class AutoSearchEngine:
             cleanup_trial(baseline_cfg.out_ckpt)
             log(f"[{_now()}] Auto Research: stopped during baseline trial.")
             return dict(current), float("inf")
-        if baseline_state.get("abort_reason"):
-            cleanup_trial(baseline_cfg.out_ckpt)
-            raise FloatingPointError(
-                "AutoSearch baseline is not safe for repeated trials: "
-                f"{baseline_state['abort_reason']}"
-            )
-        raw_baseline_score = float(raw_baseline_score)
-        if not math.isfinite(raw_baseline_score):
+        baseline_score = float(baseline_score)
+        if not math.isfinite(baseline_score):
             cleanup_trial(baseline_cfg.out_ckpt)
             raise FloatingPointError(
                 "AutoSearch baseline returned a non-finite validation score."
             )
-        if int(baseline_state.get("memory_warning_count", 0)) > 0:
-            log(
-                f"[{_now()}] WARN: Auto Research baseline retained after "
-                f"{baseline_state['memory_warning_count']} RSS trend warning(s); "
-                f"peak delta={float(baseline_state.get('max_memory_growth_mib', 0.0)):.1f} MiB "
-                "(below the hard rejection policy)."
-            )
-        dropped_targets: List[str] = []
-        if baseline_history:
-            try:
-                baseline_score, baseline_window, dropped_targets = (
-                    self._calibrate_from_baseline(baseline_history)
-                )
-            except Exception:
-                cleanup_trial(baseline_cfg.out_ckpt)
-                raise
-            self.metric_calibration_available = True
-        else:
-            # Keep the engine testable with external/custom training callables
-            # that predate metrics progress events. Real ``train_dual_layer``
-            # always emits those events and therefore takes the calibrated path.
-            baseline_score = raw_baseline_score
-            baseline_window = {"epoch_start": 0, "epoch_end": 0, "values": {}}
-            self.score_targets = self.validation_targets
-            self.score_scales = {
-                target: float(VALIDATION_MAE_SCALES.get(target, 1.0))
-                for target in self.score_targets
-            }
-            self.score_coverage = {}
-            self.required_target_references = {}
-            self.required_target_limits = {}
-            self.metric_calibration_available = False
-            log(
-                f"[{_now()}] Auto Research did not receive validation metrics; "
-                "using legacy scalar trial scores without target calibration."
-            )
-        unsupported_loss_params = {
-            parameter
-            for parameter in self._params
-            if parameter in self.LOSS_PARAM_TO_TARGET
-            and self.metric_calibration_available
-            and self.LOSS_PARAM_TO_TARGET[parameter] not in self.score_targets
-        }
-        if unsupported_loss_params:
-            self._params = [
-                parameter for parameter in self._params
-                if parameter not in unsupported_loss_params
-            ]
-        sensitivity_plan = self._sensitivity_plan(current)
-        planned_total = len(sensitivity_plan) + refinement_budget + 2
         cleanup_trial(baseline_cfg.out_ckpt)
-        if self.metric_calibration_available:
-            log(
-                f"[{_now()}] Auto Research baseline calibrated score={baseline_score:.6g} "
-                f"over epochs {baseline_window['epoch_start']}-{baseline_window['epoch_end']} "
-                f"(trainer score={raw_baseline_score:.6g}); targets={list(self.score_targets)}."
-            )
-            log(
-                f"[{_now()}] Auto Research frozen calibration: "
-                f"scales={json.dumps({name: round(value, 6) for name, value in self.score_scales.items()}, sort_keys=True)} "
-                f"coverage={json.dumps(self.score_coverage, sort_keys=True)} "
-                f"required_references={json.dumps({name: round(value, 6) for name, value in self.required_target_references.items()}, sort_keys=True)} "
-                f"required_limits={json.dumps({name: round(value, 6) for name, value in self.required_target_limits.items()}, sort_keys=True)}."
-            )
-        else:
-            log(
-                f"[{_now()}] Auto Research baseline legacy scalar score={baseline_score:.6g}."
-            )
-        if dropped_targets or unsupported_loss_params:
-            log(
-                f"[{_now()}] Auto Research excluded insufficiently covered targets="
-                f"{sorted(set(dropped_targets))}; skipped dimensions="
-                f"{sorted(unsupported_loss_params)}."
-            )
         log(
-            f"[{_now()}] Auto Research effective plan: {len(sensitivity_plan)} "
-            f"one-factor trials + up to {refinement_budget} group refinements + "
-            "paired confirmation."
+            f"[{_now()}] Auto Research baseline normalized multi-task score="
+            f"{baseline_score:.6g}"
         )
 
         best_observed_params = dict(current)
@@ -11407,7 +10810,6 @@ class AutoSearchEngine:
                 seed=confirmation_seed,
                 epochs=confirmation_epochs,
                 suffix="_confirm_baseline",
-                enforce_required_targets=False,
             )
             if baseline_confirmation is None:
                 return dict(current), float("inf")
@@ -11438,42 +10840,10 @@ class AutoSearchEngine:
                 )
                 confirmation["baseline_aggregate"] = baseline_aggregate
                 confirmation["candidate_aggregate"] = candidate_aggregate
-                minimum_relative_gain = max(
+                required_gain = max(
                     0.0, float(getattr(self.auto_cfg, "min_relative_effect", 0.005))
-                )
-                initial_required_gain = minimum_relative_gain * max(
-                    1.0, abs(float(baseline_score))
-                )
-                paired_required_gain = minimum_relative_gain * max(
-                    1.0, abs(float(baseline_confirmation))
-                )
-                aggregate_required_gain = minimum_relative_gain * max(
-                    1.0, abs(float(baseline_aggregate))
-                )
-                initial_pass = (
-                    float(best_observed_score)
-                    < float(baseline_score) - initial_required_gain
-                )
-                paired_pass = (
-                    float(candidate_confirmation)
-                    < float(baseline_confirmation) - paired_required_gain
-                )
-                aggregate_pass = (
-                    candidate_aggregate
-                    < baseline_aggregate - aggregate_required_gain
-                )
-                confirmation.update({
-                    "initial_delta": float(baseline_score) - float(best_observed_score),
-                    "paired_delta": float(baseline_confirmation) - float(candidate_confirmation),
-                    "aggregate_delta": baseline_aggregate - candidate_aggregate,
-                    "initial_required_gain": initial_required_gain,
-                    "paired_required_gain": paired_required_gain,
-                    "aggregate_required_gain": aggregate_required_gain,
-                    "initial_pass": initial_pass,
-                    "paired_pass": paired_pass,
-                    "aggregate_pass": aggregate_pass,
-                })
-                if initial_pass and paired_pass and aggregate_pass:
+                ) * max(1.0, abs(baseline_aggregate))
+                if candidate_aggregate < baseline_aggregate - required_gain:
                     final_params = dict(best_observed_params)
                     final_score = float(candidate_aggregate)
                     confirmation["confirmed"] = True
@@ -11485,9 +10855,7 @@ class AutoSearchEngine:
                     final_score = float(baseline_aggregate)
                     log(
                         f"[{_now()}] Auto Research confirmation rejected the provisional "
-                        "winner; retaining the baseline configuration "
-                        f"(initial_pass={initial_pass}, paired_pass={paired_pass}, "
-                        f"aggregate_pass={aggregate_pass})."
+                        "winner; retaining the baseline configuration."
                     )
             else:
                 log(
@@ -11506,33 +10874,6 @@ class AutoSearchEngine:
 
         self.last_report = {
             "strategy": "paired_one_factor_then_grouped_local_bo",
-            "score_policy": (
-                "baseline_calibrated_smoothed_pareto_guard"
-                if self.metric_calibration_available
-                else "legacy_scalar_fallback"
-            ),
-            "metric_calibration_available": bool(self.metric_calibration_available),
-            "score_targets": list(self.score_targets),
-            "score_scales": dict(self.score_scales),
-            "score_coverage": dict(self.score_coverage),
-            "required_targets": list(self.required_targets),
-            "required_target_references": dict(self.required_target_references),
-            "required_target_limits": dict(self.required_target_limits),
-            "dropped_targets": list(dropped_targets),
-            "skipped_loss_dimensions": sorted(unsupported_loss_params),
-            "score_smoothing_window": int(getattr(
-                self.auto_cfg, "score_smoothing_window", 3
-            )),
-            "subset_diagnostics": dict(self.subset_diagnostics),
-            "baseline_memory": {
-                "trend_warnings": int(baseline_state.get("memory_warning_count", 0)),
-                "peak_growth_mib": float(
-                    baseline_state.get("max_memory_growth_mib", 0.0)
-                ),
-                "hard_limit_mib": float(getattr(
-                    self.auto_cfg, "max_trial_memory_growth_mib", 1024.0
-                )),
-            },
             "baseline_score": float(baseline_score),
             "planned_trials": int(planned_total),
             "executed_trials": int(trial_counter),
@@ -11685,7 +11026,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
     def _cancelled_result(stage: str) -> "Tuple[str, float]":
         log(
-            f"[{_now()}] Training stop requested during {stage}; "
+            f"[{_now()}] Training stopped by user during {stage}; "
             "no unvalidated checkpoint was written."
         )
         if progress is not None:
@@ -12407,13 +11748,6 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     def _make_loader(ds: Sequence[AtomicData], *, shuffle: bool) -> Any:
         # Clamp the batch size so tiny validation sets still produce a batch.
         _eff_bs = max(1, min(int(cfg.batch_size), len(ds) if ds else 1))
-        _configured_edge_budget = getattr(cfg, "mps_edge_budget_override", None)
-        try:
-            _configured_edge_budget = int(_configured_edge_budget)
-        except (TypeError, ValueError, OverflowError):
-            _configured_edge_budget = None
-        if _configured_edge_budget is not None and _configured_edge_budget <= 0:
-            _configured_edge_budget = None
         kwargs: Dict[str, Any] = dict(
             collate_fn=_collate,
             num_workers=int(_dl_num_workers),
@@ -12421,9 +11755,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         )
         if isinstance(ds, CompositeAtomicDataDataset):
             edge_budget = (
-                _configured_edge_budget
-                if _configured_edge_budget is not None
-                else 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
+                12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
             ) if device.type == "mps" else None
             kwargs["batch_sampler"] = _CompositeCurriculumBatchSampler(
                 ds, _eff_bs, int(cfg.seed), shuffle=shuffle,
@@ -12434,11 +11766,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             # edges rather than only structures because edge count drives memory.
             # Apply the same policy to validation, where conservative forces
             # still construct the higher-order graph; only training shuffles.
-            edge_budget = (
-                _configured_edge_budget
-                if _configured_edge_budget is not None
-                else 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
-            )
+            edge_budget = 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
             kwargs["batch_sampler"] = _FixedGraphBatchSampler(
                 ds,
                 _eff_bs,
@@ -13941,15 +13269,6 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     for name, (total, count) in val_extra_metrics.items()
                     if count > 0
                 },
-                "validation_counts": {
-                    **({"energy": int(val_emae_n)} if val_emae_n > 0 else {}),
-                    **({"forces": int(val_fmae_n)} if val_fmae_n > 0 else {}),
-                    **{
-                        name: int(count)
-                        for name, (_total, count) in val_extra_metrics.items()
-                        if count > 0
-                    },
-                },
                 "physics_residual_max": dict(val_residual_max),
                 "memory": dict(memory),
                 "memory_leak_warning": leak_warning,
@@ -14014,7 +13333,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         )
     if stopped:
         log(
-            f"[{_now()}] Training stop requested; saving the best completed "
+            f"[{_now()}] Training stopped by user; saving the best completed "
             f"validation checkpoint from epoch {_best_epoch}."
         )
     model.cpu()
@@ -17372,7 +16691,6 @@ class App(tk.Tk):
                 search_space_overrides=dynamic_architecture_search_space(
                     base_cfg.model, self._dataset_capability
                 ),
-                dataset_capability=dict(self._dataset_capability),
             )
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("Auto Search Error", str(e))
@@ -19291,13 +18609,13 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
         table_card = Card(
             "Active Search Dimensions",
-            "One-factor effects use a fixed baseline, calibrated target scales, and protected core PES objectives. Values remain provisional until paired confirmation.",
+            "One-factor effects use a fixed mixed-architecture baseline; only supported dimensions enter local group refinement.",
             PALETTE["surface"],
         )
         self.search_table = QtWidgets.QTableWidget(0, 8)
         self.search_table.setHorizontalHeaderLabels(
             (
-                "Parameter", "Sampler", "Domain (JSON)", "Provisional best",
+                "Parameter", "Sampler", "Domain (JSON)", "Best / current",
                 "Last tried", "Status", "Independent effect", "Phase",
             )
         )
@@ -20763,7 +20081,6 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 lock_selected_architecture=True,
                 search_space_overrides=search_overrides,
                 search_params=tuple(selected_params),
-                dataset_capability=dict(self._capability),
             )
             tmp_dir = str(self._artifact_dir_for_checkpoint(str(self.value("out_ckpt"))) / "auto_trials")
             engine = self.backend.AutoSearchEngine(base, auto_cfg, tmp_dir)
@@ -20957,18 +20274,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         context_revision = self._search_context_revision
         self._invalidate_auto_result("Search in progress")
         counts = engine.planned_trial_counts()
-        summary_text = (
+        self.auto_summary.setText(
             f"Fixed-baseline screen: {counts['sensitivity']} one-factor trials for "
             f"{len(params)} dimensions, then up to {counts['refinement']} group "
-            f"refinements and a paired confirmation "
-            f"({counts['baseline'] + counts['sensitivity'] + counts['refinement'] + counts['confirmation']} max runs). "
-            f"Protected targets: {', '.join(engine.required_targets) or 'none'}."
+            f"refinements and a paired confirmation ({counts['baseline'] + counts['sensitivity'] + counts['refinement'] + counts['confirmation']} max runs)."
         )
-        if engine.subset_diagnostics.get("warnings"):
-            summary_text += " Subset warning: " + "; ".join(
-                engine.subset_diagnostics["warnings"]
-            ) + "."
-        self.auto_summary.setText(summary_text)
         self._reset_dashboard(str(self.value("out_ckpt")), "Auto Research")
 
         def work() -> None:
@@ -21183,7 +20493,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self.progress_bar.setValue(int(1000 * trial / trials))
         self.header_progress.setText(
             f"Auto Research {phase.replace('_', ' ')} {trial}/{trials}  "
-            f"provisional={best_score:.4g}  trial={trial_score:.4g}"
+            f"best={best_score:.4g}  trial={trial_score:.4g}"
         )
         best = dict(event.get("params", {}))
         latest = dict(event.get("trial_params", {}))
