@@ -215,14 +215,18 @@ optimizer gradients, plotting figures, and reclaimable allocator blocks are
 released after their useful lifetime. Every epoch reports process RSS, active
 MPS tensors, driver allocation, and reclaimable cache.
 
-Canonical HDF5 training and checkpoint evaluation stream by default. The
-in-memory state contains the structure/atom index, group split, label masks,
-and element table. Exact neighbor indices and periodic shift vectors are kept
-in a source-, cutoff-, and backend-keyed disk cache. The cache is written once,
-then opened read-only as contiguous memory-mapped arrays; it is never rewritten
-between epochs. Coordinates and labels are read only when a batch is requested,
-and a bounded two-batch CPU thread prefetch overlaps HDF5 assembly with device
-execution. `stream_hdf5=False` (or the CLI option
+Canonical and Composite HDF5 training and checkpoint evaluation stream by
+default. The in-memory state contains the structure/atom index, group split,
+label masks, and element table. Plus and Max read OMat24 structures from
+lossless packed arrays in contiguous batch spans; no per-row Arrow conversion
+occurs in the training path. Exact neighbor indices and periodic shift vectors
+are kept in a source-, selection-, cutoff-, and backend-keyed disk cache. The
+cache is written once, then opened read-only as contiguous memory-mapped arrays;
+it is never rewritten between epochs. Cached `edge_counts` also drive the MPS
+edge-budget sampler while preserving packed selector order. Coordinates and
+labels are read only when a batch is requested, and a bounded two-batch CPU
+thread prefetch overlaps HDF5 assembly with device execution.
+`stream_hdf5=False` (or the CLI option
 `--no-stream-hdf5`) retains the former whole-corpus materialization path for
 debugging. Legacy extXYZ input is still materialized during parsing.
 

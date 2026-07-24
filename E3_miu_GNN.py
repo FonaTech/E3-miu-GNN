@@ -36,7 +36,7 @@ Key components:
     FastEquivariantBlock   — SO(3) message-passing block.
     FastEquivariantBlockO3 — O(3) parity-aware message-passing block.
     train_dual_layer       — training entry point for base / response / joint modes.
-    AutoSearchEngine       — greedy random search with a lightweight GP surrogate.
+    AutoSearchEngine       — paired one-factor sensitivity screening and grouped local search.
     ModernE3MUGui          — default PyQt6 research and training interface.
     App                    — retained legacy Tkinter interface.
 """
@@ -1531,6 +1531,7 @@ _DATASET_PREPARATION_EXPORTS = frozenset({
     "hdf5_dataset_summary",
     "build_neo_omat24_composite",
     "build_neo_composite_half",
+    "pack_omat24_selection_in_composite",
     "embed_omat24_parquet_in_composite",
     "embed_neo_large_in_composite",
     "prepare_neo_huggingface_release",
@@ -2580,6 +2581,489 @@ def build_hdf5_topology_cache(
     return str(cache_path)
 
 
+class _TopologyCacheView:
+    """Read an exact topology cache for an arbitrary dataset index space.
+
+    Canonical and composite datasets use the same on-disk cache schema.  The
+    cache stores global ids, so a Composite dataset can combine OMat24 selector
+    ids and Neo Large ids without making the cache depend on a transient batch
+    ordering.
+    """
+
+    def __init__(self, path: str, selected_ids: Sequence[int]) -> None:
+        self.path = str(path)
+        requested = np.asarray(selected_ids, dtype=np.int64).reshape(-1)
+        self.cache_rows: np.ndarray
+        self.edge_ptr: Any = None
+        self.shift_ptr: Any = None
+        self.shift_value_ptr: Any = None
+        self.edge_counts: np.ndarray
+        self._arrays: Dict[str, Any] = {}
+        self._mmap_specs: Dict[str, Tuple[int, np.dtype, Tuple[int, ...]]] = {}
+        self._mmap_arrays: Dict[str, np.memmap] = {}
+        self._global_index_mmap: Optional[np.memmap] = None
+        self._handle: Any = None
+        with h5py.File(self.path, "r") as cache:
+            global_dataset = cache["global_indices"]
+            global_offset = global_dataset.id.get_offset()
+            if global_dataset.chunks is None and global_offset is not None:
+                global_ids = np.memmap(
+                    self.path,
+                    mode="r",
+                    offset=int(global_offset),
+                    dtype=np.dtype(global_dataset.dtype),
+                    shape=tuple(int(value) for value in global_dataset.shape),
+                    order="C",
+                )
+                self._global_index_mmap = global_ids
+            else:
+                global_ids = np.asarray(global_dataset[:], dtype=np.int64)
+            rows = np.searchsorted(global_ids, requested)
+            if np.any(rows >= global_ids.size) or not np.array_equal(
+                global_ids[rows], requested
+            ):
+                raise ValueError("Topology cache does not cover dataset indices")
+            self.cache_rows = rows.astype(np.int64, copy=False)
+            required = {
+                "edge_ptr", "edge_counts", "edge_index", "shift_ptr",
+                "shift_value_ptr",
+            }
+            missing = sorted(required - set(cache))
+            if missing:
+                raise ValueError(
+                    "Topology cache is missing required fields: " + ", ".join(missing)
+                )
+            if self.cache_rows.size:
+                sorted_rows = np.sort(self.cache_rows)
+                sorted_counts = np.asarray(
+                    cache["edge_counts"][sorted_rows.tolist()], dtype=np.int64
+                )
+                restore = np.searchsorted(sorted_rows, self.cache_rows)
+                self.edge_counts = sorted_counts[restore]
+            else:
+                self.edge_counts = np.zeros((0,), dtype=np.int64)
+            for name in ("edge_ptr", "shift_ptr", "shift_value_ptr", "edge_counts"):
+                self._register_dataset(cache, name)
+            for name in (
+                "edge_index", "shifts", "shift_nonzero_local_indices",
+                "shift_codes", "shift_unique_values", "shift_nonzero_indices",
+                "shift_nonzero_values",
+            ):
+                if name in cache:
+                    self._register_dataset(cache, name)
+            if "shifts" not in cache and not {
+                "shift_nonzero_local_indices", "shift_codes", "shift_unique_values"
+            }.issubset(cache.keys()) and not {
+                "shift_nonzero_indices", "shift_nonzero_values"
+            }.issubset(cache.keys()):
+                raise ValueError("Topology cache has no supported shift representation")
+
+    def _register_dataset(self, handle: Any, name: str) -> None:
+        dataset = handle[name]
+        offset = dataset.id.get_offset()
+        if dataset.chunks is None and offset is not None:
+            self._mmap_specs[name] = (
+                int(offset),
+                np.dtype(dataset.dtype),
+                tuple(int(value) for value in dataset.shape),
+            )
+        else:
+            self._arrays[name] = np.asarray(dataset[:])
+
+    def _ensure(self) -> None:
+        if self._handle is not None:
+            return
+        self._handle = h5py.File(self.path, "r")
+        for name, (offset, dtype, shape) in self._mmap_specs.items():
+            self._mmap_arrays[name] = np.memmap(
+                self.path, mode="r", offset=offset, dtype=dtype,
+                shape=shape, order="C"
+            )
+
+    def _value(self, name: str, index: int) -> Any:
+        array = self._mmap_arrays.get(name, self._arrays.get(name))
+        if array is not None:
+            return array[int(index)]
+        return self._handle[name][int(index)]
+
+    def _slice(self, name: str, start: int, end: int) -> np.ndarray:
+        array = self._mmap_arrays.get(name, self._arrays.get(name))
+        if array is not None:
+            return np.asarray(array[int(start):int(end)])
+        return np.asarray(self._handle[name][int(start):int(end)])
+
+    def topology(self, item: int) -> Tuple[np.ndarray, np.ndarray]:
+        self._ensure()
+        row = int(self.cache_rows[int(item)])
+        start = int(self._value("edge_ptr", row))
+        end = int(self._value("edge_ptr", row + 1))
+        edges = self._slice("edge_index", start, end).astype(np.int64, copy=False).T
+        if "shifts" in self._mmap_specs or "shifts" in self._arrays:
+            shifts = self._slice("shifts", start, end).astype(np.float64, copy=False)
+            return edges, shifts
+        left = int(self._value("shift_ptr", row))
+        right = int(self._value("shift_ptr", row + 1))
+        if (
+            "shift_nonzero_local_indices" in self._mmap_specs
+            or "shift_nonzero_local_indices" in self._arrays
+        ):
+            value_left = int(self._value("shift_value_ptr", row))
+            value_right = int(self._value("shift_value_ptr", row + 1))
+            local = self._slice(
+                "shift_nonzero_local_indices", left, right
+            ).astype(np.int64, copy=False)
+            codes = self._slice("shift_codes", left, right).astype(np.int64, copy=False)
+            values = self._slice(
+                "shift_unique_values", value_left, value_right
+            ).astype(np.float64, copy=False)
+            shifts = np.zeros((end - start, 3), dtype=np.float64)
+            if local.size:
+                shifts[local] = values[codes]
+            return edges, shifts
+        # Legacy sparse representation stores absolute edge indices.
+        local = self._slice("shift_nonzero_indices", left, right).astype(
+            np.int64, copy=False
+        ) - start
+        values = self._slice("shift_nonzero_values", left, right).astype(
+            np.float64, copy=False
+        )
+        shifts = np.zeros((end - start, 3), dtype=np.float64)
+        if local.size:
+            shifts[local] = values
+        return edges, shifts
+
+    def close(self) -> None:
+        for array in self._mmap_arrays.values():
+            mmap = getattr(array, "_mmap", None)
+            if mmap is not None:
+                try:
+                    mmap.close()
+                except Exception:
+                    pass
+        self._mmap_arrays.clear()
+        if self._global_index_mmap is not None:
+            mmap = getattr(self._global_index_mmap, "_mmap", None)
+            if mmap is not None:
+                try:
+                    mmap.close()
+                except Exception:
+                    pass
+            self._global_index_mmap = None
+        if self._handle is not None:
+            try:
+                self._handle.close()
+            except Exception:
+                pass
+            self._handle = None
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def _composite_global_ids(
+    plan: "CompositeStreamPlan",
+    omat_indices: Sequence[int],
+    large_indices: Sequence[int],
+) -> np.ndarray:
+    """Map OMat24 and Large selectors into one stable cache id space."""
+    omat = np.unique(np.asarray(omat_indices, dtype=np.int64))
+    large = np.unique(np.asarray(large_indices, dtype=np.int64))
+    offset = int(plan.source_orders.size)
+    values = np.concatenate((omat, offset + large))
+    return np.unique(values.astype(np.int64, copy=False))
+
+
+def _topology_cache_valid(
+    path: Path, *, spec_json: str, selected: np.ndarray
+) -> bool:
+    try:
+        with h5py.File(path, "r") as handle:
+            if str(handle.attrs.get("spec_json", "")) != spec_json:
+                return False
+            if int(handle.attrs.get("selected_count", -1)) != int(selected.size):
+                return False
+            if str(handle.attrs.get("selected_sha256", "")) != hashlib.sha256(
+                selected.tobytes()
+            ).hexdigest():
+                return False
+            if "global_indices" not in handle or int(
+                handle["global_indices"].shape[0]
+            ) != int(selected.size):
+                return False
+            for name in (
+                "edge_ptr", "edge_counts", "edge_index", "shift_ptr",
+                "shift_value_ptr",
+            ):
+                if name not in handle:
+                    return False
+            if int(handle["edge_ptr"].shape[0]) != int(selected.size) + 1:
+                return False
+            if int(handle["edge_ptr"][-1]) != int(handle["edge_index"].shape[0]):
+                return False
+            if int(handle["shift_ptr"].shape[0]) != int(selected.size) + 1:
+                return False
+            if int(handle["shift_value_ptr"].shape[0]) != int(selected.size) + 1:
+                return False
+            modern = {
+                "shift_nonzero_local_indices", "shift_codes", "shift_unique_values"
+            }.issubset(handle.keys())
+            legacy = {"shift_nonzero_indices", "shift_nonzero_values"}.issubset(
+                handle.keys()
+            )
+            return "shifts" in handle or modern or legacy
+    except Exception:
+        return False
+
+
+def _build_topology_cache_from_getter(
+    *,
+    cache_path: Path,
+    spec: Dict[str, Any],
+    selected: np.ndarray,
+    config_getter: Callable[[int], Configuration],
+    log: Callable[[str], None],
+    progress: Optional[Callable[[Dict[str, Any]], None]],
+    stop_flag: Optional[Callable[[], bool]],
+) -> Optional[str]:
+    """Build the shared exact topology format from a bounded config getter."""
+    spec_json = json.dumps(spec, sort_keys=True)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if cache_path.exists() and _topology_cache_valid(
+        cache_path, spec_json=spec_json, selected=selected
+    ):
+        log(f"[{_now()}] Reusing disk topology cache: {cache_path}")
+        return str(cache_path)
+    if cache_path.exists():
+        cache_path.unlink()
+    temporary = cache_path.with_name(f"{cache_path.name}.building-{os.getpid()}")
+    optimized = cache_path.with_name(f"{cache_path.name}.contiguous-{os.getpid()}")
+    temporary.unlink(missing_ok=True)
+    optimized.unlink(missing_ok=True)
+    total = int(selected.size)
+    log(
+        f"[{_now()}] Building streamed topology cache for {total} structures "
+        f"(cutoff={float(spec['cutoff']):g}) ..."
+    )
+    started = time.perf_counter()
+    try:
+        with h5py.File(temporary, "w") as output:
+            output.attrs["spec_json"] = spec_json
+            output.attrs["selected_count"] = int(total)
+            output.attrs["selected_sha256"] = hashlib.sha256(
+                selected.tobytes()
+            ).hexdigest()
+            output.attrs["created_at"] = _now()
+            output.create_dataset("global_indices", data=selected, compression="gzip")
+            edge_ptr = np.zeros((total + 1,), dtype=np.int64)
+            atom_counts = np.empty((total,), dtype=np.int32)
+            edge_counts = np.empty((total,), dtype=np.int64)
+            shift_nonzero_counts = np.empty((total,), dtype=np.int64)
+            shift_unique_counts = np.empty((total,), dtype=np.int64)
+            edge_dataset = output.create_dataset(
+                "edge_index", shape=(0, 2), maxshape=(None, 2), dtype=np.int32,
+                chunks=(65536, 2), compression="lzf", shuffle=True,
+            )
+            shift_index_dataset = output.create_dataset(
+                "shift_nonzero_local_indices", shape=(0,), maxshape=(None,),
+                dtype=np.uint64, chunks=(65536,), compression="lzf", shuffle=True,
+            )
+            shift_code_dataset = output.create_dataset(
+                "shift_codes", shape=(0,), maxshape=(None,), dtype=np.uint64,
+                chunks=(65536,), compression="lzf", shuffle=True,
+            )
+            shift_value_dataset = output.create_dataset(
+                "shift_unique_values", shape=(0, 3), maxshape=(None, 3),
+                dtype=np.float64, chunks=(65536, 3), compression="lzf", shuffle=True,
+            )
+            edge_buffer: List[np.ndarray] = []
+            index_buffer: List[np.ndarray] = []
+            code_buffer: List[np.ndarray] = []
+            value_buffer: List[np.ndarray] = []
+            buffered_edges = written_edges = 0
+            written_indices = written_values = 0
+
+            def flush() -> None:
+                nonlocal buffered_edges, written_edges, written_indices, written_values
+                if buffered_edges <= 0:
+                    return
+                edges = np.concatenate(edge_buffer, axis=0)
+                new_end = written_edges + int(edges.shape[0])
+                edge_dataset.resize((new_end, 2))
+                edge_dataset[written_edges:new_end] = edges
+                if index_buffer:
+                    local = np.concatenate(index_buffer)
+                    codes = np.concatenate(code_buffer)
+                    new_shift_end = written_indices + int(local.size)
+                    shift_index_dataset.resize((new_shift_end,))
+                    shift_code_dataset.resize((new_shift_end,))
+                    shift_index_dataset[written_indices:new_shift_end] = local
+                    shift_code_dataset[written_indices:new_shift_end] = codes
+                    written_indices = new_shift_end
+                if value_buffer:
+                    values = np.concatenate(value_buffer, axis=0)
+                    new_value_end = written_values + int(values.shape[0])
+                    shift_value_dataset.resize((new_value_end, 3))
+                    shift_value_dataset[written_values:new_value_end] = values
+                    written_values = new_value_end
+                written_edges = new_end
+                buffered_edges = 0
+                edge_buffer.clear(); index_buffer.clear(); code_buffer.clear(); value_buffer.clear()
+
+            emit_every = max(1, min(100, total // 20 or 1))
+            for row, raw_id in enumerate(selected):
+                if stop_flag is not None and stop_flag():
+                    return None
+                cfg = config_getter(int(raw_id))
+                edge_index, shifts = _configuration_neighbor_topology(
+                    cfg, cutoff=float(spec["cutoff"])
+                )
+                count = int(edge_index.shape[1])
+                atom_counts[row] = int(len(cfg.atomic_numbers))
+                edge_counts[row] = count
+                local, codes, values = _encode_bitwise_shift_dictionary(shifts)
+                shift_nonzero_counts[row] = int(local.size)
+                shift_unique_counts[row] = int(values.shape[0])
+                edge_ptr[row + 1] = edge_ptr[row] + count
+                if count:
+                    edge_buffer.append(np.asarray(edge_index.T, dtype=np.int32))
+                    if local.size:
+                        index_buffer.append(local); code_buffer.append(codes); value_buffer.append(values)
+                    buffered_edges += count
+                if buffered_edges >= 250000:
+                    flush()
+                if progress is not None and (row + 1 == total or (row + 1) % emit_every == 0):
+                    progress({
+                        "type": "prep", "task": "Build disk topology cache",
+                        "overall_frac": 0.05 + 0.15 * (row + 1) / max(1, total),
+                        "current": row + 1, "total": total, "stage": "neighbor_list",
+                    })
+            flush()
+            output.create_dataset("edge_ptr", data=edge_ptr, compression="gzip")
+            output.create_dataset("atom_counts", data=atom_counts, compression="gzip")
+            output.create_dataset("edge_counts", data=edge_counts, compression="gzip")
+            shift_ptr = np.zeros((total + 1,), dtype=np.int64)
+            np.cumsum(shift_nonzero_counts, out=shift_ptr[1:])
+            if int(shift_ptr[-1]) != int(written_indices):
+                raise RuntimeError("Topology shift pointer construction is inconsistent")
+            output.create_dataset("shift_ptr", data=shift_ptr, compression="gzip")
+            value_ptr = np.zeros((total + 1,), dtype=np.int64)
+            np.cumsum(shift_unique_counts, out=value_ptr[1:])
+            if int(value_ptr[-1]) != int(written_values):
+                raise RuntimeError("Topology shift dictionary pointer is inconsistent")
+            output.create_dataset("shift_value_ptr", data=value_ptr, compression="gzip")
+
+        # Rewrite variable-length datasets as contiguous arrays for mmap-backed
+        # training reads.  The numerical values are copied without conversion.
+        with h5py.File(temporary, "r") as source, h5py.File(optimized, "w", libver="latest") as output:
+            for name, value in source.attrs.items():
+                output.attrs[name] = value
+            output.attrs["storage_layout"] = "contiguous-mmap-v1"
+            output.attrs["shift_storage"] = "per-structure-bitwise-dictionary-v1"
+            for name in ("global_indices", "edge_ptr", "atom_counts", "edge_counts", "shift_ptr", "shift_value_ptr"):
+                output.create_dataset(name, data=source[name][:])
+            max_atoms = int(np.max(source["atom_counts"][:], initial=0))
+            edge_dtype = _compact_unsigned_dtype_for_upper_bound(max_atoms)
+            output.attrs["edge_index_storage_dtype"] = edge_dtype.name
+            source_edges = source["edge_index"]
+            target_edges = output.create_dataset("edge_index", shape=source_edges.shape, dtype=edge_dtype)
+            for start in range(0, int(source_edges.shape[0]), 1_000_000):
+                end = min(int(source_edges.shape[0]), start + 1_000_000)
+                target_edges[start:end] = source_edges[start:end]
+            source_counts = source["edge_counts"][:]
+            max_edges = int(np.max(source_counts, initial=0))
+            index_dtype = _compact_unsigned_dtype_for_upper_bound(max_edges)
+            output.attrs["shift_index_storage_dtype"] = index_dtype.name
+            source_indices = source["shift_nonzero_local_indices"]
+            target_indices = output.create_dataset("shift_nonzero_local_indices", shape=source_indices.shape, dtype=index_dtype)
+            for start in range(0, int(source_indices.shape[0]), 1_000_000):
+                end = min(int(source_indices.shape[0]), start + 1_000_000)
+                target_indices[start:end] = source_indices[start:end]
+            value_ptr = source["shift_value_ptr"][:]
+            max_values = int(np.max(np.diff(value_ptr), initial=0))
+            code_dtype = _compact_unsigned_dtype_for_upper_bound(max_values)
+            output.attrs["shift_code_storage_dtype"] = code_dtype.name
+            source_codes = source["shift_codes"]
+            target_codes = output.create_dataset("shift_codes", shape=source_codes.shape, dtype=code_dtype)
+            for start in range(0, int(source_codes.shape[0]), 1_000_000):
+                end = min(int(source_codes.shape[0]), start + 1_000_000)
+                target_codes[start:end] = source_codes[start:end]
+            source_values = source["shift_unique_values"]
+            target_values = output.create_dataset("shift_unique_values", shape=source_values.shape, dtype=source_values.dtype)
+            for start in range(0, int(source_values.shape[0]), 1_000_000):
+                end = min(int(source_values.shape[0]), start + 1_000_000)
+                target_values[start:end] = source_values[start:end]
+        optimized.replace(cache_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+        optimized.unlink(missing_ok=True)
+    size_mib = cache_path.stat().st_size / (1024.0 * 1024.0)
+    log(f"[{_now()}] Built disk topology cache in {time.perf_counter() - started:.2f} s: {cache_path} ({size_mib:.1f} MiB).")
+    return str(cache_path)
+
+
+def build_composite_topology_cache(
+    plan: "CompositeStreamPlan",
+    omat_indices: Sequence[int],
+    large_indices: Sequence[int],
+    *,
+    z_table: AtomicNumberTable,
+    cutoff: float,
+    cache_directory: str = "",
+    log: Callable[[str], None] = print,
+    progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stop_flag: Optional[Callable[[], bool]] = None,
+) -> Optional[str]:
+    """Build one exact cache covering the selected Composite train/val ids."""
+    selected = _composite_global_ids(plan, omat_indices, large_indices)
+    source = Path(plan.path).resolve()
+    backend = (
+        "mace-periodic" if HAS_MACE_NEIGHBORHOOD else "ase-periodic"
+    ) + "+exact-nonperiodic-v2"
+    spec = {
+        "version": HDF5_TOPOLOGY_CACHE_VERSION,
+        "kind": "composite",
+        "source": str(source),
+        "source_size": int(source.stat().st_size),
+        "source_mtime_ns": int(source.stat().st_mtime_ns),
+        "selected_sha256": hashlib.sha256(selected.tobytes()).hexdigest(),
+        "selected_count": int(selected.size),
+        "omat_count": int(plan.source_orders.size),
+        "cutoff": format(float(cutoff), ".17g"),
+        "backend": backend,
+    }
+    cache_root = (
+        Path(graph_cache_dir).expanduser()
+        if (graph_cache_dir := str(cache_directory).strip())
+        else _default_topology_cache_directory()
+    ).resolve()
+    key = hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+    cache_path = cache_root / f"{source.stem}.composite.{key}.h5"
+    union_omat = np.unique(np.asarray(omat_indices, dtype=np.int64))
+    union_large = np.unique(np.asarray(large_indices, dtype=np.int64))
+    reader = CompositeAtomicDataDataset(
+        plan, union_omat, union_large, z_table=z_table, cutoff=float(cutoff)
+    )
+    omat_count = int(plan.source_orders.size)
+    omat_size = int(union_omat.size)
+
+    def getter(global_id: int) -> Configuration:
+        value = int(global_id)
+        if value < omat_count:
+            local = int(np.searchsorted(union_omat, value))
+        else:
+            local = omat_size + int(np.searchsorted(union_large, value - omat_count))
+        return reader._configuration_at(local)
+
+    try:
+        reader._ensure_handles()
+        return _build_topology_cache_from_getter(
+            cache_path=cache_path, spec=spec, selected=selected,
+            config_getter=getter, log=log, progress=progress, stop_flag=stop_flag,
+        )
+    finally:
+        reader.close()
+
+
 class HDF5AtomicDataDataset(Dataset):
     """Map-style graph dataset whose structures and topology remain on disk."""
 
@@ -3209,6 +3693,7 @@ class CompositeAtomicDataDataset(Dataset):
         *,
         z_table: AtomicNumberTable,
         cutoff: float,
+        topology_cache: Optional[str] = None,
     ) -> None:
         self.plan = plan
         self.omat_indices = np.asarray(omat_indices, dtype=np.uint32)
@@ -3220,6 +3705,8 @@ class CompositeAtomicDataDataset(Dataset):
         self._parquet_streams: Dict[int, Dict[str, Any]] = {}
         self._large_handle = None
         self._handle_pid: Optional[int] = None
+        self.topology_cache = str(topology_cache or "")
+        self._topology_view: Optional[_TopologyCacheView] = None
         self.curriculum_roles = np.concatenate([
             np.full(self.omat_indices.size, "foundation", dtype=object),
             np.full(self.large_indices.size, "response", dtype=object),
@@ -3229,7 +3716,15 @@ class CompositeAtomicDataDataset(Dataset):
             (plan.large_plan.atom_ptr[self.large_indices + 1]
              - plan.large_plan.atom_ptr[self.large_indices]).astype(np.int64, copy=False),
         ])
+        self._global_ids = np.concatenate([
+            self.omat_indices.astype(np.int64, copy=False),
+            (
+                int(plan.source_orders.size) + self.large_indices
+            ).astype(np.int64, copy=False),
+        ])
         self.edge_counts = None
+        if self.topology_cache:
+            self.attach_topology_cache(self.topology_cache)
 
     def __len__(self) -> int:
         return int(self.omat_indices.size + self.large_indices.size)
@@ -3238,9 +3733,26 @@ class CompositeAtomicDataDataset(Dataset):
         pid = os.getpid()
         if self._handle_pid == pid and self._large_handle is not None:
             return
+        topology_cache = self.topology_cache
         self.close()
         self._large_handle = h5py.File(self.plan.large_plan.path, "r")
+        if topology_cache:
+            self.attach_topology_cache(topology_cache)
         self._handle_pid = pid
+
+    def attach_topology_cache(self, path: str) -> None:
+        """Attach a cache whose global id space covers this dataset exactly."""
+        if self._topology_view is not None:
+            self._topology_view.close()
+        self.topology_cache = str(path or "")
+        self._topology_view = (
+            _TopologyCacheView(self.topology_cache, self._global_ids)
+            if self.topology_cache else None
+        )
+        self.edge_counts = (
+            self._topology_view.edge_counts.copy()
+            if self._topology_view is not None else None
+        )
 
     def _parquet_file(self, source_order: int) -> Any:
         handle = self._parquet_handles.get(int(source_order))
@@ -3366,6 +3878,20 @@ class CompositeAtomicDataDataset(Dataset):
                 packed = self._large_handle["sources/omat24/packed"]
                 start = int(packed["atom_ptr"][selector])
                 end = int(packed["atom_ptr"][selector + 1])
+                material_id = str(packed["material_id"].asstr()[selector])
+                configuration_id = str(
+                    packed["configuration_id"].asstr()[selector]
+                )
+                source_order = int(self.plan.source_orders[selector])
+                source_row = int(packed["source_row_index"][selector])
+                source_path = Path(self.plan.source_files[source_order])
+                corpus_name = source_path.parent.parent.name or source_path.stem
+                raw_method = str(self._large_handle["sources/omat24"].attrs.get(
+                    "method_id", "PBE+U"
+                ))
+                if raw_method.startswith("OMat24/"):
+                    raw_method = raw_method.split("/", 1)[1]
+                method_id = f"OMat24:{raw_method}"
                 props: Dict[str, Any] = {
                     "energy": float(packed["energy"][selector]),
                     "forces": np.asarray(packed["forces"][start:end], dtype=np.float64),
@@ -3373,15 +3899,13 @@ class CompositeAtomicDataDataset(Dataset):
                     "stress_volume_normalized": float(
                         packed["stress_volume_normalized"][selector]
                     ),
-                    "method_id": str(self._large_handle["sources/omat24"].attrs.get(
-                        "method_id", "OMat24/PBE+U"
-                    )),
-                    "group_id": str(packed["material_id"].asstr()[selector]),
-                    "system_id": str(packed["material_id"].asstr()[selector]),
-                    "sample_id": str(packed["configuration_id"].asstr()[selector]),
+                    "method_id": method_id,
+                    "group_id": f"OMat24:{material_id}",
+                    "system_id": material_id,
+                    "sample_id": f"OMat24:{configuration_id}",
                     "provenance_id": (
-                        f"OMat24:{int(self.plan.source_orders[selector])}:"
-                        f"{int(packed['source_row_index'][selector])}"
+                        f"ColabFit:{corpus_name}:{configuration_id}:"
+                        f"packed:{source_order}:{source_row}"
                     ),
                     "energy_reference": "OMat24 PBE+U",
                     "dataset_role": "l1-foundation",
@@ -3399,7 +3923,7 @@ class CompositeAtomicDataDataset(Dataset):
                     },
                     cell=np.asarray(packed["cell"][selector], dtype=np.float64),
                     pbc=tuple(bool(value) for value in packed["pbc"][selector]),
-                    head="OMat24/PBE+U",
+                    head=method_id,
                 )
             source_order = int(self.plan.source_orders[selector])
             row_index = int(self.plan.row_indices[selector])
@@ -3420,36 +3944,171 @@ class CompositeAtomicDataDataset(Dataset):
             cfg.property_weights["energy"] = 0.0
         return cfg
 
+    def _packed_configurations_at(
+        self, selectors: Sequence[int]
+    ) -> Dict[int, Configuration]:
+        """Read packed OMat24 rows in contiguous atom spans.
+
+        Packed arrays are already in selector order.  Grouping adjacent atom
+        pointers into one HDF5 slice avoids one HDF5 read per field per row and
+        never constructs Arrow/Python row objects.
+        """
+        if not self.plan.omat_packed:
+            return {}
+        packed = self._large_handle["sources/omat24/packed"]
+        values = np.asarray(selectors, dtype=np.int64).reshape(-1)
+        if values.size == 0:
+            return {}
+        order = np.argsort(values, kind="stable")
+        sorted_values = values[order]
+        if np.any(sorted_values < 0) or np.any(
+            sorted_values >= int(packed["atom_ptr"].shape[0]) - 1
+        ):
+            raise IndexError("Packed OMat24 selector is outside atom_ptr")
+        starts = np.asarray(packed["atom_ptr"][sorted_values.tolist()], dtype=np.int64)
+        ends = np.asarray(
+            packed["atom_ptr"][(sorted_values + 1).tolist()], dtype=np.int64
+        )
+        numbers_by_selector: Dict[int, np.ndarray] = {}
+        positions_by_selector: Dict[int, np.ndarray] = {}
+        forces_by_selector: Dict[int, np.ndarray] = {}
+        cursor = 0
+        while cursor < values.size:
+            run_end = cursor + 1
+            while run_end < values.size and starts[run_end] == ends[run_end - 1]:
+                run_end += 1
+            atom_start = int(starts[cursor])
+            atom_end = int(ends[run_end - 1])
+            numbers = np.asarray(
+                packed["atomic_numbers"][atom_start:atom_end], dtype=int
+            )
+            positions = np.asarray(
+                packed["positions"][atom_start:atom_end], dtype=np.float64
+            )
+            forces = np.asarray(
+                packed["forces"][atom_start:atom_end], dtype=np.float64
+            )
+            local = 0
+            for offset in range(cursor, run_end):
+                count = int(ends[offset] - starts[offset])
+                selector = int(sorted_values[offset])
+                right = local + count
+                numbers_by_selector[selector] = numbers[local:right]
+                positions_by_selector[selector] = positions[local:right]
+                forces_by_selector[selector] = forces[local:right]
+                local = right
+            cursor = run_end
+        energies = np.asarray(packed["energy"][sorted_values.tolist()], dtype=np.float64)
+        cells = np.asarray(packed["cell"][sorted_values.tolist()], dtype=np.float64)
+        pbc_values = np.asarray(packed["pbc"][sorted_values.tolist()], dtype=np.bool_)
+        stresses = np.asarray(packed["stress"][sorted_values.tolist()], dtype=np.float64)
+        normalized = np.asarray(
+            packed["stress_volume_normalized"][sorted_values.tolist()], dtype=np.bool_
+        )
+        configuration_ids = [
+            str(value)
+            for value in packed["configuration_id"].asstr()[sorted_values.tolist()]
+        ]
+        material_ids = [
+            str(value)
+            for value in packed["material_id"].asstr()[sorted_values.tolist()]
+        ]
+        raw_method = str(self._large_handle["sources/omat24"].attrs.get(
+            "method_id", "PBE+U"
+        ))
+        if raw_method.startswith("OMat24/"):
+            raw_method = raw_method.split("/", 1)[1]
+        method_id = f"OMat24:{raw_method}"
+        output: Dict[int, Configuration] = {}
+        for offset, selector in enumerate(sorted_values):
+            key = int(selector)
+            props: Dict[str, Any] = {
+                "energy": float(energies[offset]),
+                "forces": forces_by_selector[key],
+                "stress": stresses[offset],
+                "stress_volume_normalized": float(normalized[offset]),
+                "method_id": method_id,
+                "group_id": f"OMat24:{material_ids[offset]}",
+                "system_id": material_ids[offset],
+                "sample_id": f"OMat24:{configuration_ids[offset]}",
+                "provenance_id": (
+                    f"ColabFit:{Path(self.plan.source_files[int(self.plan.source_orders[key])]).parent.parent.name}"
+                    f":{configuration_ids[offset]}:packed:"
+                    f"{int(self.plan.source_orders[key])}:"
+                    f"{int(packed['source_row_index'][key])}"
+                ),
+                "energy_reference": "OMat24 PBE+U",
+                "dataset_role": "l1-foundation",
+                "curriculum_role": "base+joint",
+            }
+            output[key] = Configuration(
+                atomic_numbers=numbers_by_selector[key],
+                positions=positions_by_selector[key],
+                properties=props,
+                property_weights={
+                    "energy": 1.0, "forces": 1.0, "stress": 1.0,
+                    "stress_volume_normalized": 1.0,
+                },
+                cell=cells[offset],
+                pbc=tuple(bool(value) for value in pbc_values[offset]),
+                head=method_id,
+            )
+        return output
+
     def __getitem__(self, item: int) -> AtomicData:
         self._ensure_handles()
         position = int(item)
+        topology = (
+            self._topology_view.topology(position)
+            if self._topology_view is not None else None
+        )
         return AtomicData.from_config(
             self._configuration_at(position),
             z_table=self.z_table,
             cutoff=self.cutoff,
+            topology=topology,
         )
 
     def __getitems__(self, items: Sequence[int]) -> List[AtomicData]:
         self._ensure_handles()
-        return [
-            AtomicData.from_config(
-                self._configuration_at(int(item)),
-                z_table=self.z_table,
-                cutoff=self.cutoff,
-            )
-            for item in items
+        positions = [int(item) for item in items]
+        packed_positions = [
+            position for position in positions if position < self.omat_indices.size
         ]
+        packed_configs = self._packed_configurations_at([
+            int(self.omat_indices[position]) for position in packed_positions
+        ])
+        output: List[AtomicData] = []
+        for position in positions:
+            if position < self.omat_indices.size and self.plan.omat_packed:
+                cfg = packed_configs[int(self.omat_indices[position])]
+            else:
+                cfg = self._configuration_at(position)
+            topology = (
+                self._topology_view.topology(position)
+                if self._topology_view is not None else None
+            )
+            output.append(AtomicData.from_config(
+                cfg, z_table=self.z_table, cutoff=self.cutoff, topology=topology
+            ))
+        return output
 
     def close(self) -> None:
-        if self._large_handle is not None:
+        large_handle = getattr(self, "_large_handle", None)
+        if large_handle is not None:
             try:
-                self._large_handle.close()
+                large_handle.close()
             except Exception:
                 pass
-        self._large_handle = None
-        self._parquet_handles.clear()
-        self._embedded_streams.clear()
-        self._parquet_streams.clear()
+        if hasattr(self, "_large_handle"):
+            self._large_handle = None
+        getattr(self, "_parquet_handles", {}).clear()
+        getattr(self, "_embedded_streams", {}).clear()
+        getattr(self, "_parquet_streams", {}).clear()
+        topology_view = getattr(self, "_topology_view", None)
+        if topology_view is not None:
+            topology_view.close()
+            self._topology_view = None
         self._handle_pid = None
 
     def __getstate__(self) -> Dict[str, Any]:
@@ -3458,6 +4117,7 @@ class CompositeAtomicDataDataset(Dataset):
         state["_embedded_streams"] = {}
         state["_parquet_streams"] = {}
         state["_large_handle"] = None
+        state["_topology_view"] = None
         state["_handle_pid"] = None
         return state
 
@@ -4557,7 +5217,11 @@ def dynamic_parameter_reference_ranges(
     stability_high = max(stability_low * 5.0, min(2.0, 4.0 * hardness))
     min_validation = 0.2 if 0 < structures < 50 else 0.1 if structures < 500 else 0.05
     max_validation = 0.3 if 0 < structures < 50 else 0.2
-    min_subset = min(100.0, 10000.0 / structures) if structures else 1.0
+    recommended_search_structures = max(100, 5 * len(elements))
+    min_subset = (
+        min(100.0, 100.0 * recommended_search_structures / structures)
+        if structures else 1.0
+    )
     lr_high = 2e-3 if channels >= 96 or active_physics >= 4 else 5e-3
     channel_range = "64-128" if active_physics >= 4 else "32-96"
 
@@ -4594,7 +5258,11 @@ def dynamic_parameter_reference_ranges(
         "chem_aug_prob": "0-0.30; start at 0.05 only after a stable non-augmented baseline",
         "chem_aug_noise_std": "0-0.10 standardized descriptor units",
         "chem_aug_mix_max": "0-0.30; keep below 0.15 for chemically narrow datasets",
-        "auto_subset": f"{min_subset:.3g}-100%; aim for at least 100 structures per search trial",
+        "auto_subset": (
+            f"{min_subset:.3g}-100%; aim for at least "
+            f"{recommended_search_structures} sampled structures "
+            f"(5 per detected element, minimum 100)"
+        ),
     }
 
 
@@ -8330,6 +8998,10 @@ class TrainConfig:
     # same graph every epoch. Geometry and labels remain in canonical HDF5.
     cache_neighbor_graphs: bool = True
     graph_cache_dir: str = ""
+    # Internal comparison control used by Auto Research. ``None`` preserves the
+    # regular device-aware policy; a positive value freezes the MPS topology
+    # budget so changing a loss weight cannot also change batches/step counts.
+    mps_edge_budget_override: Optional[int] = None
     # Composite Joint epochs use every response record and a rotating,
     # deterministic foundation window. This prevents rare L2/L3 labels from
     # being diluted by tens of millions of OMat24 L1 structures.
@@ -8717,15 +9389,23 @@ def _additional_physics_loss(
 
 # --------------------------------------------------------------------------
 # AutoSearch.
-# Greedy random search with a small Bayesian surrogate for later-stage
-# exploitation.
+# Paired one-factor sensitivity screening followed by low-dimensional,
+# physics-group local refinement and independent confirmation.
 # --------------------------------------------------------------------------
 
 @dataclass
 class AutoSearchConfig:
-    """Configuration for automatic hyperparameter search."""
+    """Configuration for sensitivity-aware automatic hyperparameter research.
+
+    ``n_trials`` is deliberately the budget for the *grouped refinement* phase.
+    Auto Research always precedes it with deterministic one-factor experiments
+    for every active parameter and, when a candidate improves the baseline,
+    with a paired independent confirmation.  This keeps a high-dimensional
+    mixed-physics search from treating a sparse Gaussian-process fit as evidence
+    for the effect of any individual setting.
+    """
     level: int = 0          # 0=off; 1=loss weights; 2=all HP; 3=HP+JFT; 4=HP+JFT+Arch
-    n_trials: int = 20      # number of candidate trials (excluding the baseline)
+    n_trials: int = 20      # grouped local-refinement trials (excluding baseline/screening)
     trial_epochs: int = 10  # short epoch budget per trial
     seed: int = 42
     subset_fraction: float = 0.01  # fraction of each dataset used per trial (default 1%)
@@ -8737,6 +9417,44 @@ class AutoSearchConfig:
     # ``None`` selects the dimensions implied by ``level``. A tuple is an exact,
     # user-editable selection and may add or remove any compatible dimension.
     search_params: Optional[Tuple[str, ...]] = None
+    # Two anchors are sufficient to estimate a directional one-factor effect for
+    # continuous variables while keeping the automatic screen practical. Choice,
+    # boolean, and integer domains remain exhaustively screened when small.
+    sensitivity_points: int = 2
+    # Limit the dimensionality passed to the local surrogate within one physical
+    # group. It is a guard against returning to the original all-parameter BO.
+    max_group_dimensions: int = 4
+    # A parameter must improve the paired baseline by this fraction before it is
+    # promoted from one-factor screening into grouped refinement.
+    min_relative_effect: float = 0.005
+    # Confirmation uses a second deterministic subset/initialization and a
+    # modestly longer short-run budget. Both baseline and candidate are rerun.
+    confirmation_epoch_multiplier: float = 1.5
+    confirmation_seed_offset: int = 104_729
+    # Energy and forces that are already active in the baseline are protected
+    # by default. Explicit ``required_targets`` may extend or replace that set.
+    protect_active_core_targets: bool = True
+    required_targets: Tuple[str, ...] = ()
+    # A candidate is invalid when any required target regresses beyond this
+    # fraction at its selected epoch. This prevents an optional response metric
+    # from purchasing a materially worse interatomic potential.
+    max_required_target_regression: float = 0.10
+    # Auto Research calibrates each target against the baseline history and
+    # freezes those scales for every candidate. Coverage guards prevent a trial
+    # from winning by dropping difficult validation labels.
+    calibrate_validation_scales: bool = True
+    min_validation_observations: int = 2
+    min_validation_coverage_fraction: float = 0.95
+    # Compare a short rolling mean instead of the single luckiest epoch.
+    score_smoothing_window: int = 3
+    # A short search trial that exhibits the trainer's monotonic RSS leak signal
+    # is not a viable production candidate and is stopped before exhausting the
+    # entire search budget.
+    reject_memory_leaking_trials: bool = True
+    max_trial_memory_growth_mib: float = 768.0
+    # Optional GUI-provided metadata used only for a transparent search-subset
+    # confidence warning. It never changes a user's selected split silently.
+    dataset_capability: Dict[str, Any] = field(default_factory=dict)
 
 
 _AUTOSEARCH_SAMPLERS = {
@@ -8821,7 +9539,10 @@ def search_space_spec_from_editor(name: str, kind: str, domain_text: str) -> tup
 def _auto_emit(pq: Callable, trial: int, n_trials: int,
                best_loss: float, trial_loss: float,
                best_params: Dict[str, Any], trial_params: Dict[str, Any],
-               improved: bool) -> None:
+               improved: bool, *, phase: str = "refinement",
+               source: str = "", changed_params: Sequence[str] = (),
+               group: str = "", sensitivity: Optional[Dict[str, Any]] = None,
+               confirmation: Optional[Dict[str, Any]] = None) -> None:
     """Push an auto_search progress event to the GUI queue."""
     try:
         pq({
@@ -8833,7 +9554,26 @@ def _auto_emit(pq: Callable, trial: int, n_trials: int,
             "params": dict(best_params),
             "trial_params": dict(trial_params),
             "improved": improved,
+            "phase": str(phase),
+            "source": str(source),
+            "changed_params": tuple(str(name) for name in changed_params),
+            "group": str(group),
         })
+        if sensitivity is not None:
+            pq({
+                "type": "auto_search_sensitivity",
+                "trial": trial,
+                "n_trials": n_trials,
+                "phase": str(phase),
+                "sensitivity": dict(sensitivity),
+            })
+        if confirmation is not None:
+            pq({
+                "type": "auto_search_confirmation",
+                "trial": trial,
+                "n_trials": n_trials,
+                "confirmation": dict(confirmation),
+            })
     except Exception:
         pass
 
@@ -9036,11 +9776,62 @@ class _BayesianCore:
             return None
 
 class AutoSearchEngine:
-    """Greedy random search engine with optional Bayesian guidance.
+    """Sensitivity-aware Auto Research engine for mixed-granularity models.
 
-    The search begins with pure exploration, then gradually shifts toward
-    surrogate-guided proposals once enough observations have been collected.
+    A single high-dimensional surrogate cannot identify independent effects
+    from a handful of short, noisy mixed-physics training runs. This engine
+    therefore uses a staged experimental design:
+
+    1. establish a deterministic baseline;
+    2. perturb one active parameter at a time against that unchanged baseline;
+    3. combine only sensitivity-supported dimensions inside small physical
+       groups and optimize each group locally; and
+    4. repeat the winning candidate and baseline with a separate deterministic
+       subset/initialization before allowing the GUI to apply it.
+
+    Bayesian expected improvement is retained only inside those low-dimensional
+    group refinements. It is never used as the sole evidence that a parameter
+    mattered independently.
     """
+
+    # Keep coupled quantities together during the conditional local phase. The
+    # group order is intentionally physical rather than alphabetical: receptive
+    # field / backbone choices are resolved before domain solvers whose signal
+    # depends on those local features, and loss balance is tuned before cascade
+    # scheduling.
+    PARAMETER_GROUPS: Dict[str, Tuple[str, ...]] = {
+        "backbone_optimizer": (
+            "lr", "batch_size", "r_max", "num_channels", "num_interactions",
+            "num_radial_basis", "field_scale", "force_loss", "force_huber_delta",
+        ),
+        "objective_balance": (
+            "w_energy", "w_forces", "w_dipole", "w_polarizability",
+            "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
+            "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di",
+            "w_dmi",
+        ),
+        "qeq_pme": (
+            "qeq_smearing", "qeq_hardness_min", "qeq_pme_smearing",
+            "qeq_pme_lr_wavelength", "qeq_stability_floor",
+        ),
+        "deq_polarization": ("deq_damping", "deq_max_iter", "deq_tol", "deq_alpha_max"),
+        "d4_dispersion": ("d4_functional",),
+        "spin": ("spin_cutoff",),
+        "film_coupling": ("coupling_iterations", "coupling_tol"),
+        "continuous_chemistry": (
+            "chem_aug_prob", "chem_aug_noise_std", "chem_aug_mix_max",
+        ),
+        "joint_schedule": (
+            "joint_stages", "lr_ground_scale", "lr_response_scale", "warmup_epochs",
+            "w_dipole_final", "w_alpha_final",
+        ),
+        "architecture": (
+            "e3mu_use_parity", "e3mu_use_l3", "rbf_type", "enable_continuous_chem",
+            "enable_qeq", "enable_pme", "enable_deq", "enable_d4", "enable_spin",
+            "enable_film", "enable_dmi",
+        ),
+    }
+    GROUP_ORDER: Tuple[str, ...] = tuple(PARAMETER_GROUPS)
 
     # Search space: param_name → (sampler_type, *args)
     SEARCH_SPACE: Dict[str, tuple] = {
@@ -9177,6 +9968,74 @@ class AutoSearchEngine:
         "w_dmi": "DMI_effective",
     }
 
+    @staticmethod
+    def _positive_loss_sampler(name: str, spec: tuple) -> tuple:
+        """Remove the explicit zero atom from a required loss dimension."""
+        kind = str(spec[0])
+        if kind == "zero_log_uniform":
+            return ("log_uniform", float(spec[1]), float(spec[2]))
+        if kind == "choice":
+            values = [
+                value for value in spec[1]
+                if not isinstance(value, (int, float, np.integer, np.floating))
+                or float(value) > 0.0
+            ]
+            if not values:
+                raise ValueError(
+                    f"Required Auto Research target {name!r} has no positive search values"
+                )
+            return ("choice", values)
+        if kind == "uniform":
+            low, high = float(spec[1]), float(spec[2])
+            if high <= 0.0:
+                raise ValueError(
+                    f"Required Auto Research target {name!r} has no positive search interval"
+                )
+            return ("uniform", max(np.finfo(float).tiny, low), high)
+        return spec
+
+    def _subset_diagnostics(self) -> Dict[str, Any]:
+        """Estimate whether a GUI-selected search subset is statistically thin."""
+        capability = dict(getattr(self.auto_cfg, "dataset_capability", {}) or {})
+        try:
+            structures = max(0, int(capability.get("structures", 0)))
+        except (TypeError, ValueError, OverflowError):
+            structures = 0
+        if structures <= 0:
+            return {"available": False, "warnings": []}
+        elements = {
+            int(value)
+            for value in capability.get("elements", [])
+            if isinstance(value, (int, np.integer)) or str(value).strip().isdigit()
+        }
+        fraction = min(1.0, max(0.0, float(self.auto_cfg.subset_fraction)))
+        sampled = max(1, int(math.ceil(structures * fraction)))
+        validation = max(1, int(round(sampled * float(self.base_cfg.val_fraction))))
+        recommended_sampled = max(100, 5 * len(elements))
+        recommended_validation = max(16, min(64, max(1, len(elements) // 2)))
+        warnings: List[str] = []
+        if sampled < recommended_sampled:
+            warnings.append(
+                f"sampled structures {sampled} < recommended {recommended_sampled} "
+                f"for {len(elements)} elements"
+            )
+        if validation < recommended_validation:
+            warnings.append(
+                f"estimated validation structures {validation} < recommended "
+                f"{recommended_validation}"
+            )
+        return {
+            "available": True,
+            "structures": structures,
+            "elements": len(elements),
+            "subset_fraction": fraction,
+            "estimated_sampled_structures": sampled,
+            "estimated_validation_structures": validation,
+            "recommended_sampled_structures": recommended_sampled,
+            "recommended_validation_structures": recommended_validation,
+            "warnings": warnings,
+        }
+
     def __init__(self, base_cfg: "TrainConfig", auto_cfg: AutoSearchConfig, tmp_dir: str) -> None:
         self.base_cfg  = base_cfg
         self.auto_cfg  = auto_cfg
@@ -9200,11 +10059,42 @@ class AutoSearchEngine:
             if name not in self.SEARCH_SPACE:
                 raise ValueError(f"Unknown Auto Research override parameter: {name!r}")
             self.search_space[name] = normalize_search_space_spec(name, spec)
-        # Dataset masks and architecture relevance determine availability. The
-        # current numeric value does not: zero must remain searchable.
+        # Dataset masks and architecture relevance determine availability. Zero
+        # remains searchable for optional objectives, while required targets are
+        # explicitly restricted to positive loss weights above.
         self._params = list(dict.fromkeys(
             name for name in requested if name not in excluded
         ))
+        valid_targets = set(self.LOSS_PARAM_TO_TARGET.values()) | {"Di"}
+        explicit_required = tuple(
+            str(value) for value in getattr(auto_cfg, "required_targets", ())
+            if str(value).strip()
+        )
+        unknown_required = sorted(set(explicit_required) - valid_targets)
+        if unknown_required:
+            raise ValueError(
+                f"Unknown required Auto Research target(s): {unknown_required}"
+            )
+        if explicit_required:
+            required_targets = explicit_required
+        elif bool(getattr(auto_cfg, "protect_active_core_targets", True)):
+            required_targets = tuple(
+                target
+                for parameter, target in (("w_energy", "energy"), ("w_forces", "forces"))
+                if float(getattr(base_cfg, parameter, 0.0)) > 0.0
+            )
+        else:
+            required_targets = ()
+        self.required_targets = tuple(dict.fromkeys(required_targets))
+        self.required_loss_params = {
+            parameter
+            for parameter, target in self.LOSS_PARAM_TO_TARGET.items()
+            if target in self.required_targets
+        }
+        for parameter in self.required_loss_params:
+            self.search_space[parameter] = self._positive_loss_sampler(
+                parameter, self.search_space[parameter]
+            )
         fixed_loss_params = {
             name
             for name in self.LOSS_PARAM_TO_TARGET
@@ -9217,7 +10107,44 @@ class AutoSearchEngine:
                 if name in fixed_loss_params
             )
         )
-        self._bo       = _BayesianCore(self._params, self.search_space) if self._params else None
+        self.score_targets: Tuple[str, ...] = self.validation_targets
+        self.score_scales: Dict[str, float] = {}
+        self.score_coverage: Dict[str, int] = {}
+        self.required_target_references: Dict[str, float] = {}
+        self.required_target_limits: Dict[str, float] = {}
+        self.metric_calibration_available: bool = False
+        self.subset_diagnostics = self._subset_diagnostics()
+        # The old global BO is intentionally not constructed. Sparse observations
+        # across all mixed-physics dimensions made its proposal direction mostly
+        # indistinguishable from random sampling. Local BO instances are created
+        # only after sensitivity screening selects a small physical group.
+        self._bo = None
+        self.sensitivity_results: Dict[str, Dict[str, Any]] = {}
+        self.last_report: Dict[str, Any] = {}
+
+    @staticmethod
+    def _values_equal(left: Any, right: Any) -> bool:
+        """Compare candidate values without treating booleans as numbers."""
+        if isinstance(left, (bool, np.bool_)) or isinstance(right, (bool, np.bool_)):
+            return bool(left) is bool(right)
+        if isinstance(left, (int, float, np.integer, np.floating)) and isinstance(
+            right, (int, float, np.integer, np.floating)
+        ):
+            return bool(math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12))
+        return left == right
+
+    @staticmethod
+    def _plain_value(value: Any) -> Any:
+        """Convert NumPy scalar candidates into progress-event friendly values."""
+        return value.item() if isinstance(value, np.generic) else value
+
+    @classmethod
+    def parameter_group(cls, name: str) -> str:
+        """Return the physical group owning an Auto Research dimension."""
+        for group, members in cls.PARAMETER_GROUPS.items():
+            if name in members:
+                return group
+        return "other"
 
     # Helper methods.
 
@@ -9286,36 +10213,221 @@ class AutoSearchEngine:
             "chem_aug_mix_max":    float(mc.chem_aug_mix_max),
         }
 
+    @classmethod
+    def _distinct_values(cls, values: Sequence[Any]) -> List[Any]:
+        """Preserve order while removing equivalent candidate values."""
+        unique: List[Any] = []
+        for value in values:
+            if not any(cls._values_equal(value, seen) for seen in unique):
+                unique.append(cls._plain_value(value))
+        return unique
+
+    @staticmethod
+    def _sample_value(spec: tuple, rng: "np.random.Generator") -> Any:
+        """Draw one value from a normalized editable sampler specification."""
+        kind = str(spec[0])
+        if kind == "zero_log_uniform":
+            lo, hi, zero_probability = float(spec[1]), float(spec[2]), float(spec[3])
+            return (
+                0.0
+                if float(rng.random()) < zero_probability
+                else float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            )
+        if kind == "log_uniform":
+            lo, hi = float(spec[1]), float(spec[2])
+            return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+        if kind == "uniform":
+            return float(rng.uniform(float(spec[1]), float(spec[2])))
+        if kind == "choice":
+            options = list(spec[1])
+            return options[int(rng.integers(0, len(options)))]
+        if kind == "randint":
+            return int(rng.integers(int(spec[1]), int(spec[2]) + 1))
+        if kind == "bool":
+            return bool(rng.integers(0, 2))
+        raise ValueError(f"Unknown sampler type: {kind}")
+
+    def _sample_from_space(
+        self,
+        names: Sequence[str],
+        space: Dict[str, tuple],
+        rng: "np.random.Generator",
+    ) -> Dict[str, Any]:
+        return {
+            name: self._plain_value(self._sample_value(space[name], rng))
+            for name in names
+        }
+
+    def _screening_values(self, name: str, reference: Any) -> List[Any]:
+        """Return deterministic one-factor anchors for one editable domain.
+
+        Continuous domains receive low/high anchors (and the explicit zero atom
+        for optional objectives). Discrete choices are screened exhaustively so
+        a category cannot win only because random search happened to sample it.
+        """
+        spec = self.search_space[name]
+        kind = str(spec[0])
+        points = max(1, min(3, int(getattr(self.auto_cfg, "sensitivity_points", 2))))
+        values: List[Any]
+        if kind == "bool":
+            values = [not bool(reference)]
+        elif kind == "choice":
+            values = list(spec[1])
+        elif kind == "randint":
+            lo, hi = int(spec[1]), int(spec[2])
+            midpoint = int(round(0.5 * (lo + hi)))
+            values = [lo, hi, midpoint]
+            values = values[:max(points, 2)]
+        elif kind == "uniform":
+            lo, hi = float(spec[1]), float(spec[2])
+            values = [lo, hi, 0.5 * (lo + hi)][:max(points, 2)]
+        elif kind == "log_uniform":
+            lo, hi = float(spec[1]), float(spec[2])
+            values = [lo, hi, math.sqrt(lo * hi)][:max(points, 2)]
+        elif kind == "zero_log_uniform":
+            lo, hi = float(spec[1]), float(spec[2])
+            midpoint = math.sqrt(lo * hi)
+            # Zero is a separate model-selection hypothesis, not merely the
+            # lower tail of a log distribution, so it is always tested.
+            values = [0.0, lo, hi]
+            if points >= 3:
+                values.append(midpoint)
+        else:  # normalize_search_space_spec makes this unreachable.
+            raise ValueError(f"Unknown sampler type: {kind}")
+        return [
+            value for value in self._distinct_values(values)
+            if not self._values_equal(value, reference)
+        ]
+
+    def _sensitivity_plan(self, current: Dict[str, Any]) -> List[Tuple[str, Any]]:
+        """Build the fixed-baseline one-factor experiment list.
+
+        The effective value is checked after conditional constraints, preventing
+        redundant tests such as a spin cutoff that is clamped back to its current
+        local cutoff.
+        """
+        plan: List[Tuple[str, Any]] = []
+        seen: Dict[str, List[Any]] = {}
+        for name in self._params:
+            reference = current[name]
+            for proposed in self._screening_values(name, reference):
+                candidate = self._constrain_cutoff_pair({**current, name: proposed})
+                effective = self._plain_value(candidate.get(name, proposed))
+                if self._values_equal(effective, reference):
+                    continue
+                previous = seen.setdefault(name, [])
+                if any(self._values_equal(effective, value) for value in previous):
+                    continue
+                previous.append(effective)
+                plan.append((name, effective))
+        return plan
+
+    def planned_trial_counts(self) -> Dict[str, int]:
+        """Return a transparent upper-bound on the staged Auto Research cost."""
+        current = self._constrain_cutoff_pair(self._extract_current(self.base_cfg))
+        return {
+            "baseline": 1,
+            "sensitivity": len(self._sensitivity_plan(current)),
+            "refinement": max(0, int(self.auto_cfg.n_trials)),
+            # The pair is skipped only when screening/refinement finds no
+            # distinct candidate worth checking; showing it here is safer for
+            # an up-front runtime estimate.
+            "confirmation": 2,
+        }
+
+    def _local_search_space(self, name: str, center: Any) -> tuple:
+        """Narrow one global sampler around a screened useful anchor."""
+        spec = self.search_space[name]
+        kind = str(spec[0])
+        if kind == "uniform":
+            lo, hi = float(spec[1]), float(spec[2])
+            pivot = min(hi, max(lo, float(center)))
+            radius = 0.25 * (hi - lo)
+            local_lo, local_hi = max(lo, pivot - radius), min(hi, pivot + radius)
+            return ("uniform", local_lo, local_hi) if local_lo < local_hi else spec
+        if kind == "log_uniform":
+            lo, hi = float(spec[1]), float(spec[2])
+            pivot = min(hi, max(lo, float(center)))
+            log_radius = 0.25 * (math.log(hi) - math.log(lo))
+            local_lo = max(lo, math.exp(math.log(pivot) - log_radius))
+            local_hi = min(hi, math.exp(math.log(pivot) + log_radius))
+            return ("log_uniform", local_lo, local_hi) if local_lo < local_hi else spec
+        if kind == "zero_log_uniform":
+            lo, hi = float(spec[1]), float(spec[2])
+            if float(center) <= 0.0:
+                return ("choice", self._distinct_values([0.0, lo, math.sqrt(lo * hi)]))
+            pivot = min(hi, max(lo, float(center)))
+            log_radius = 0.25 * (math.log(hi) - math.log(lo))
+            local_lo = max(lo, math.exp(math.log(pivot) - log_radius))
+            local_hi = min(hi, math.exp(math.log(pivot) + log_radius))
+            return (
+                "choice",
+                self._distinct_values([0.0, local_lo, pivot, local_hi]),
+            )
+        if kind == "choice":
+            options = list(spec[1])
+            try:
+                index = next(
+                    i for i, value in enumerate(options)
+                    if self._values_equal(value, center)
+                )
+            except StopIteration:
+                index = 0
+            lo_index, hi_index = max(0, index - 1), min(len(options), index + 2)
+            return ("choice", self._distinct_values(options[lo_index:hi_index]))
+        if kind == "randint":
+            lo, hi = int(spec[1]), int(spec[2])
+            pivot = min(hi, max(lo, int(round(float(center)))))
+            radius = max(1, int(math.ceil(0.25 * (hi - lo))))
+            return ("randint", max(lo, pivot - radius), min(hi, pivot + radius))
+        if kind == "bool":
+            return ("choice", [bool(center), not bool(center)])
+        return spec
+
+    def _selected_refinement_groups(self, baseline_score: float) -> List[Tuple[str, List[str]]]:
+        """Select sensitivity-supported low-dimensional physical groups."""
+        threshold = max(0.0, float(getattr(self.auto_cfg, "min_relative_effect", 0.005)))
+        limit = max(1, int(getattr(self.auto_cfg, "max_group_dimensions", 4)))
+        denominator = max(1.0, abs(float(baseline_score)))
+        grouped: Dict[str, List[Tuple[float, str]]] = {}
+        fallback: List[Tuple[float, str]] = []
+        for name in self._params:
+            result = self.sensitivity_results.get(name, {})
+            score = float(result.get("best_score", float("inf")))
+            if not math.isfinite(score):
+                continue
+            relative = (float(baseline_score) - score) / denominator
+            fallback.append((relative, name))
+            if relative >= threshold:
+                grouped.setdefault(self.parameter_group(name), []).append((relative, name))
+        if not grouped and fallback:
+            # A neutral screen should still receive one small local experiment;
+            # it guards against a shallow non-monotonic optimum without opening
+            # the original high-dimensional random search again.
+            best_relative, best_name = max(fallback, key=lambda item: item[0])
+            grouped[self.parameter_group(best_name)] = [(best_relative, best_name)]
+
+        result_groups: List[Tuple[str, List[str], float]] = []
+        for group, scored in grouped.items():
+            scored.sort(key=lambda item: item[0], reverse=True)
+            result_groups.append((group, [name for _score, name in scored[:limit]], scored[0][0]))
+
+        order = {name: index for index, name in enumerate(self.GROUP_ORDER)}
+        # Resolve backbone first, then work from smaller measured effects toward
+        # larger ones. This reduces the chance that a large objective-weight
+        # change masks a solver's conditional local signal.
+        result_groups.sort(
+            key=lambda item: (
+                0 if item[0] == "backbone_optimizer" else 1,
+                item[2],
+                order.get(item[0], len(order)),
+            )
+        )
+        return [(group, names) for group, names, _score in result_groups]
+
     def _sample_candidate(self, rng: "np.random.Generator") -> Dict[str, Any]:
         """Sample one random candidate over all level params."""
-        candidate: Dict[str, Any] = {}
-        for p in self._params:
-            spec = self.search_space[p]
-            kind = spec[0]
-            if kind == "zero_log_uniform":
-                lo, hi, zero_probability = spec[1], spec[2], spec[3]
-                candidate[p] = (
-                    0.0
-                    if float(rng.random()) < float(zero_probability)
-                    else float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
-                )
-            elif kind == "log_uniform":
-                lo, hi = spec[1], spec[2]
-                candidate[p] = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
-            elif kind == "uniform":
-                lo, hi = spec[1], spec[2]
-                candidate[p] = float(rng.uniform(lo, hi))
-            elif kind == "choice":
-                opts = spec[1]
-                candidate[p] = opts[int(rng.integers(0, len(opts)))]
-            elif kind == "randint":
-                lo, hi = int(spec[1]), int(spec[2])
-                candidate[p] = int(rng.integers(lo, hi + 1))
-            elif kind == "bool":
-                candidate[p] = bool(rng.integers(0, 2))
-            else:
-                raise ValueError(f"Unknown sampler type: {kind}")
-        return candidate
+        return self._sample_from_space(self._params, self.search_space, rng)
 
     def _constrain_cutoff_pair(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Apply the conditional spin/local cutoff constraint to a flat trial."""
@@ -9329,8 +10441,23 @@ class AutoSearchEngine:
         )
         return constrained
 
-    def _build_trial_cfg(self, params: Dict[str, Any], trial_idx: int) -> "TrainConfig":
-        """Build a TrainConfig for a single trial from flat param dict."""
+    def _build_trial_cfg(
+        self,
+        params: Dict[str, Any],
+        trial_idx: int,
+        *,
+        seed: Optional[int] = None,
+        epochs: Optional[int] = None,
+        suffix: str = "",
+    ) -> "TrainConfig":
+        """Build a TrainConfig for a single staged trial from flat parameters."""
+        for parameter in self.required_loss_params:
+            value = float(params.get(parameter, getattr(self.base_cfg, parameter)))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"{parameter} controls required target "
+                    f"{self.LOSS_PARAM_TO_TARGET[parameter]!r} and must remain positive"
+                )
         model_values = asdict(self.base_cfg.model)
         for name in ModelConfig.__dataclass_fields__:
             if name in params:
@@ -9365,7 +10492,7 @@ class AutoSearchEngine:
                 float(model_values["spin_cutoff"]), float(model_values["r_max"])
             )
         mc = ModelConfig(**model_values)
-        tmp_path = str(Path(self.tmp_dir) / f"trial_{trial_idx:04d}.tmp.pt")
+        tmp_path = str(Path(self.tmp_dir) / f"trial_{trial_idx:04d}{suffix}.tmp.pt")
 
         # Use joint mode when response data exists so response weights are
         # meaningfully evaluated during search.
@@ -9380,6 +10507,24 @@ class AutoSearchEngine:
         # causing excessive MPSGraph shape compilation and memory caching.
         _bs_raw = int(params.get("batch_size", self.base_cfg.batch_size))
         _bs     = max(1, _bs_raw)
+        _fixed_edge_budget = getattr(
+            self.base_cfg, "mps_edge_budget_override", None
+        )
+        try:
+            _fixed_edge_budget = (
+                int(_fixed_edge_budget) if _fixed_edge_budget is not None else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            _fixed_edge_budget = None
+        if _fixed_edge_budget is None or _fixed_edge_budget <= 0:
+            # Freeze the comparison topology even when a candidate sets a
+            # derivative loss to zero. Otherwise one-factor screening changes
+            # both the objective and the number/composition of optimizer steps.
+            _fixed_edge_budget = (
+                12000
+                if bool({"forces", "bec"} & set(self.validation_targets))
+                else 30000
+            )
 
         return TrainConfig(
             mode                   = _mode,
@@ -9391,13 +10536,16 @@ class AutoSearchEngine:
             base_ckpt              = "",   # Search trials always start from scratch.
             out_ckpt               = tmp_path,
             model                  = mc,
-            epochs                 = int(self.auto_cfg.trial_epochs),
+            epochs                 = int(
+                self.auto_cfg.trial_epochs if epochs is None else epochs
+            ),
             lr                     = float(params.get("lr",            self.base_cfg.lr)),
             batch_size             = _bs,
             val_fraction           = self.base_cfg.val_fraction,
-            # Keep one deterministic subset/split across all candidates so the
-            # objective remains comparable and parsed data can be reused safely.
-            seed                   = self.base_cfg.seed,
+            # One-factor and local candidates share a deterministic split and
+            # initialization. Confirmation overrides this seed for a paired,
+            # independent check of both baseline and candidate.
+            seed                   = int(self.base_cfg.seed if seed is None else seed),
             w_energy               = float(params.get("w_energy",      self.base_cfg.w_energy)),
             w_forces               = float(params.get("w_forces",      self.base_cfg.w_forces)),
             force_loss             = str(params.get("force_loss", self.base_cfg.force_loss)),
@@ -9423,15 +10571,276 @@ class AutoSearchEngine:
             stream_hdf5            = bool(self.base_cfg.stream_hdf5),
             cache_neighbor_graphs  = bool(self.base_cfg.cache_neighbor_graphs),
             graph_cache_dir        = str(self.base_cfg.graph_cache_dir),
+            mps_edge_budget_override = int(_fixed_edge_budget),
             validation_targets     = self.validation_targets,
         )
+
+    # Auto Research metric calibration and robust scoring.
+
+    @staticmethod
+    def _metric_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
+        values: Dict[str, float] = {}
+        counts: Dict[str, int] = {}
+
+        def add(name: str, value: Any) -> None:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if math.isfinite(numeric):
+                values[str(name)] = numeric
+
+        add("energy", payload.get("energy_mae"))
+        add("forces", payload.get("force_mae"))
+        for name, value in dict(payload.get("multitask_mae", {})).items():
+            add(str(name), value)
+        for name, value in dict(payload.get("validation_counts", {})).items():
+            try:
+                counts[str(name)] = max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        memory = dict(payload.get("memory", {}))
+        try:
+            memory_growth = float(memory.get("rss_growth_mib", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            memory_growth = 0.0
+        return {
+            "epoch": int(payload.get("epoch", 0)),
+            "values": values,
+            "counts": counts,
+            "memory_growth_mib": memory_growth,
+            "memory_leak_warning": bool(payload.get("memory_leak_warning", False)),
+        }
+
+    @staticmethod
+    def _target_value(snapshot: Dict[str, Any], target: str) -> Optional[float]:
+        values = dict(snapshot.get("values", {}))
+        aliases = (target, "Di") if target == "Di_effective" else (target,)
+        for name in aliases:
+            if name in values and math.isfinite(float(values[name])):
+                return float(values[name])
+        return None
+
+    @staticmethod
+    def _target_count(snapshot: Dict[str, Any], target: str) -> int:
+        counts = dict(snapshot.get("counts", {}))
+        aliases = (target, "Di") if target == "Di_effective" else (target,)
+        return max((int(counts.get(name, 0)) for name in aliases), default=0)
+
+    def _score_metric_history(
+        self,
+        history: Sequence[Dict[str, Any]],
+        *,
+        scales: Dict[str, float],
+        coverage: Dict[str, int],
+        required_limits: Optional[Dict[str, float]] = None,
+    ) -> Tuple[float, Optional[Dict[str, Any]]]:
+        """Return the best smoothed, coverage-safe score and its metric window."""
+        snapshots = [dict(item) for item in history if dict(item).get("values")]
+        if not snapshots or not scales:
+            return float("inf"), None
+        requested_window = max(
+            1, int(getattr(self.auto_cfg, "score_smoothing_window", 3))
+        )
+        window = min(requested_window, len(snapshots))
+        coverage_fraction = min(
+            1.0,
+            max(
+                0.0,
+                float(getattr(
+                    self.auto_cfg, "min_validation_coverage_fraction", 0.95
+                )),
+            ),
+        )
+        limits = dict(required_limits or {})
+        best_score = float("inf")
+        best_window: Optional[Dict[str, Any]] = None
+        for end in range(window, len(snapshots) + 1):
+            chunk = snapshots[end - window:end]
+            means: Dict[str, float] = {}
+            valid = True
+            for target, scale in scales.items():
+                values: List[float] = []
+                required_count = int(math.ceil(
+                    coverage_fraction * max(0, int(coverage.get(target, 0)))
+                ))
+                for snapshot in chunk:
+                    value = self._target_value(snapshot, target)
+                    if value is None or self._target_count(snapshot, target) < required_count:
+                        valid = False
+                        break
+                    values.append(value)
+                if not valid:
+                    break
+                means[target] = float(np.mean(values))
+                if target in limits and means[target] > float(limits[target]):
+                    valid = False
+                    break
+            if not valid:
+                continue
+            score = float(np.mean([
+                means[target] / max(float(scale), np.finfo(float).tiny)
+                for target, scale in scales.items()
+            ]))
+            if math.isfinite(score) and score < best_score:
+                best_score = score
+                best_window = {
+                    "epoch_start": int(chunk[0].get("epoch", 0)),
+                    "epoch_end": int(chunk[-1].get("epoch", 0)),
+                    "values": means,
+                    "score": score,
+                }
+        return best_score, best_window
+
+    def _best_target_window_value(
+        self,
+        history: Sequence[Dict[str, Any]],
+        target: str,
+        coverage: Dict[str, int],
+    ) -> Optional[float]:
+        """Return the best rolling validation MAE for one protected target."""
+        snapshots = [dict(item) for item in history if dict(item).get("values")]
+        if not snapshots:
+            return None
+        window = min(
+            max(1, int(getattr(self.auto_cfg, "score_smoothing_window", 3))),
+            len(snapshots),
+        )
+        coverage_fraction = min(
+            1.0,
+            max(
+                0.0,
+                float(getattr(
+                    self.auto_cfg, "min_validation_coverage_fraction", 0.95
+                )),
+            ),
+        )
+        required_count = int(math.ceil(
+            coverage_fraction * max(0, int(coverage.get(target, 0)))
+        ))
+        best: Optional[float] = None
+        for end in range(window, len(snapshots) + 1):
+            values: List[float] = []
+            for snapshot in snapshots[end - window:end]:
+                value = self._target_value(snapshot, target)
+                if value is None or self._target_count(snapshot, target) < required_count:
+                    values = []
+                    break
+                values.append(value)
+            if values:
+                mean_value = float(np.mean(values))
+                if best is None or mean_value < best:
+                    best = mean_value
+        return best
+
+    def _calibrate_from_baseline(
+        self,
+        history: Sequence[Dict[str, Any]],
+    ) -> Tuple[float, Dict[str, Any], List[str]]:
+        """Freeze score targets/scales/coverage from one baseline trajectory."""
+        minimum = max(
+            1, int(getattr(self.auto_cfg, "min_validation_observations", 2))
+        )
+        scales: Dict[str, float] = {}
+        coverage: Dict[str, int] = {}
+        dropped: List[str] = []
+        for target in self.validation_targets:
+            observations = [
+                value
+                for snapshot in history
+                for value in [self._target_value(snapshot, target)]
+                if value is not None and math.isfinite(value)
+            ]
+            max_count = max(
+                (self._target_count(snapshot, target) for snapshot in history),
+                default=0,
+            )
+            if not observations or max_count < minimum:
+                if target in self.required_targets:
+                    raise ValueError(
+                        f"Required Auto Research target {target!r} has only "
+                        f"{max_count} validation observations; at least {minimum} are required"
+                    )
+                dropped.append(target)
+                continue
+            if bool(getattr(self.auto_cfg, "calibrate_validation_scales", True)):
+                reference = float(np.median(np.asarray(observations, dtype=float)))
+                physical_floor = float(VALIDATION_MAE_SCALES.get(target, 1.0)) * 1e-6
+                scales[target] = max(reference, physical_floor, np.finfo(float).tiny)
+            else:
+                scales[target] = float(VALIDATION_MAE_SCALES.get(target, 1.0))
+            coverage[target] = int(max_count)
+        if not scales:
+            raise ValueError(
+                "Auto Research baseline has no sufficiently covered validation targets"
+            )
+        self.score_targets = tuple(scales)
+        self.score_scales = dict(scales)
+        self.score_coverage = dict(coverage)
+        baseline_score, best_window = self._score_metric_history(
+            history, scales=scales, coverage=coverage
+        )
+        if best_window is None or not math.isfinite(baseline_score):
+            raise FloatingPointError(
+                "Auto Research could not form a finite smoothed baseline score"
+            )
+        tolerance = max(
+            0.0,
+            float(getattr(self.auto_cfg, "max_required_target_regression", 0.10)),
+        )
+        self.required_target_references = {
+            target: reference
+            for target in self.required_targets
+            for reference in [self._best_target_window_value(history, target, coverage)]
+            if reference is not None
+        }
+        self.required_target_limits = {
+            target: max(
+                float(reference) * (1.0 + tolerance),
+                float(reference) + scales[target] * tolerance,
+            )
+            for target, reference in self.required_target_references.items()
+            if target in scales
+        }
+        return baseline_score, best_window, dropped
 
     # Main search loop.
 
     @staticmethod
-    def _make_progress(pq_put: Callable, trial_idx: int, n_trials: int) -> Callable:
-        """Return a progress callback that emits auto_search_epoch events."""
+    def _make_progress(
+        pq_put: Callable,
+        trial_idx: int,
+        n_trials: int,
+        phase: str = "refinement",
+        *,
+        metrics_sink: Optional[List[Dict[str, Any]]] = None,
+        trial_state: Optional[Dict[str, Any]] = None,
+        auto_cfg: Optional[AutoSearchConfig] = None,
+    ) -> Callable:
+        """Return a progress callback that records metrics and emits epochs."""
         def _cb(d: Dict[str, Any]) -> None:
+            if d.get("type") == "metrics":
+                snapshot = AutoSearchEngine._metric_snapshot(d)
+                if metrics_sink is not None:
+                    metrics_sink.append(snapshot)
+                if trial_state is not None and auto_cfg is not None:
+                    growth_limit = max(
+                        0.0,
+                        float(getattr(auto_cfg, "max_trial_memory_growth_mib", 768.0)),
+                    )
+                    leaking = bool(snapshot.get("memory_leak_warning", False))
+                    over_limit = (
+                        growth_limit > 0.0
+                        and float(snapshot.get("memory_growth_mib", 0.0)) > growth_limit
+                    )
+                    if bool(getattr(auto_cfg, "reject_memory_leaking_trials", True)) and (
+                        leaking or over_limit
+                    ):
+                        trial_state["abort_reason"] = (
+                            "monotonic RSS growth detected"
+                            if leaking else f"RSS growth exceeded {growth_limit:g} MiB"
+                        )
+                        trial_state["stop"] = True
             if d.get("type") == "epoch":
                 pq_put({
                     "type":     "auto_search_epoch",
@@ -9439,6 +10848,7 @@ class AutoSearchEngine:
                     "n_trials": n_trials,
                     "epoch":    int(d.get("epoch", 0)),
                     "epochs":   int(d.get("epochs", 1)),
+                    "phase":    str(phase),
                 })
             # Suppress detailed prep events to keep the GUI quieter during search.
         return _cb
@@ -9449,19 +10859,33 @@ class AutoSearchEngine:
         pq_put: Callable,
         stop_flag: Callable,
     ) -> "Tuple[Dict[str, Any], float]":
-        """Run the search and return ``(best_params, best_validation_score)``."""
+        """Run staged Auto Research and return a independently confirmed result.
+
+        The baseline, every one-factor perturbation, and all local refinements
+        use the same seed and parsed-data cache. That common-random-number setup
+        removes split and initialization noise from the sensitivity comparison.
+        Only the final confirmation changes the seed, and it changes it for both
+        baseline and candidate as a paired validation experiment.
+        """
         rng = np.random.default_rng(self.auto_cfg.seed)
         current = self._constrain_cutoff_pair(self._extract_current(self.base_cfg))
-        best_params = dict(current)
+        sensitivity_plan = self._sensitivity_plan(current)
+        refinement_budget = max(0, int(self.auto_cfg.n_trials))
+        # This is an upper bound until the baseline establishes which selected
+        # targets actually occur in the sampled validation split.
+        planned_total = len(sensitivity_plan) + refinement_budget + 2
+        self.sensitivity_results = {}
+        self.last_report = {}
 
         if str(self.base_cfg.device).lower() in ("auto", "mps") and _mps_is_available():
             torch.mps.synchronize()
             torch.mps.empty_cache()
 
-        # Cache parsed datasets so repeated trials do not re-read large XYZ files.
-        _data_cache: Dict[str, Any] = {}
+        # Cache parsed datasets and graph topology within one seed. A
+        # confirmation seed intentionally receives a distinct cached split.
+        data_cache: Dict[str, Any] = {}
 
-        def _cleanup_failed_trial(path: str) -> None:
+        def cleanup_trial(path: str) -> None:
             try:
                 os.remove(path)
             except OSError:
@@ -9471,137 +10895,620 @@ class AutoSearchEngine:
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
 
+        trial_counter = 0
+
+        def evaluate(
+            parameters: Dict[str, Any],
+            *,
+            phase: str,
+            source: str,
+            changed: Sequence[str],
+            group: str = "",
+            seed: Optional[int] = None,
+            epochs: Optional[int] = None,
+            suffix: str = "",
+            enforce_required_targets: bool = True,
+        ) -> "Optional[float]":
+            """Run one short trial and convert failures into an explicit score."""
+            nonlocal trial_counter
+            trial_counter += 1
+            cfg = self._build_trial_cfg(
+                parameters,
+                trial_counter,
+                seed=seed,
+                epochs=epochs,
+                suffix=suffix,
+            )
+            changed_text = ", ".join(
+                f"{name}={_fmt_p(parameters[name])}"
+                for name in changed if name in parameters
+            ) or "fixed baseline"
+            log(
+                f"[{_now()}] Auto Research {phase} {trial_counter}/{planned_total} "
+                f"[{source}{'/' + group if group else ''}]: {changed_text}"
+            )
+            metric_history: List[Dict[str, Any]] = []
+            trial_state: Dict[str, Any] = {"stop": False}
+            progress = self._make_progress(
+                pq_put,
+                trial_counter,
+                planned_total,
+                phase,
+                metrics_sink=metric_history,
+                trial_state=trial_state,
+                auto_cfg=self.auto_cfg,
+            )
+            try:
+                _checkpoint, raw_score = train_dual_layer(
+                    cfg,
+                    log,
+                    progress,
+                    lambda: bool(stop_flag() or trial_state.get("stop", False)),
+                    _cache=data_cache,
+                )
+                if stop_flag():
+                    cleanup_trial(cfg.out_ckpt)
+                    return None
+                if trial_state.get("abort_reason"):
+                    raise FloatingPointError(
+                        f"trial rejected: {trial_state['abort_reason']}"
+                    )
+                raw_score = float(raw_score)
+                if not math.isfinite(raw_score):
+                    raise FloatingPointError("trial returned a non-finite validation score")
+                if self.metric_calibration_available:
+                    score, selected_window = self._score_metric_history(
+                        metric_history,
+                        scales=self.score_scales,
+                        coverage=self.score_coverage,
+                        required_limits=(
+                            self.required_target_limits
+                            if enforce_required_targets else None
+                        ),
+                    )
+                    if selected_window is None or not math.isfinite(score):
+                        guard = "required-target guard or validation coverage"
+                        raise FloatingPointError(
+                            f"trial has no finite calibrated score after {guard}"
+                        )
+                    log(
+                        f"[{_now()}] Auto Research {phase} calibrated score={score:.6g} "
+                        f"over epochs {selected_window['epoch_start']}-"
+                        f"{selected_window['epoch_end']} (trainer score={raw_score:.6g})."
+                    )
+                else:
+                    score = raw_score
+            except Exception as exc:
+                score = float("inf")
+                log(
+                    f"[{_now()}] Auto Research {phase} {trial_counter}: FAILED "
+                    f"[{source}] {type(exc).__name__}: {exc}."
+                )
+            finally:
+                cleanup_trial(cfg.out_ckpt)
+            return score
+
         # Baseline trial using the current GUI parameters.
-        log(f"[{_now()}] AutoSearch: running baseline trial "
-            f"({self.auto_cfg.trial_epochs} epochs, subset={self.auto_cfg.subset_fraction:.0%})…")
-        cfg0 = self._build_trial_cfg(current, trial_idx=0)
-        _prog0 = self._make_progress(pq_put, 0, self.auto_cfg.n_trials)
+        log(
+            f"[{_now()}] Auto Research: baseline + {len(sensitivity_plan)} "
+            f"one-factor trials + up to {refinement_budget} group refinements "
+            "(pre-coverage upper bound); "
+            f"subset={self.auto_cfg.subset_fraction:.0%}, "
+            f"epochs={self.auto_cfg.trial_epochs}."
+        )
+        if self.subset_diagnostics.get("warnings"):
+            log(
+                f"[{_now()}] WARN: Auto Research subset confidence is limited: "
+                + "; ".join(self.subset_diagnostics["warnings"])
+                + ". Increase Sample % before treating small score differences as physical."
+            )
+        baseline_cfg = self._build_trial_cfg(current, trial_idx=0)
+        baseline_history: List[Dict[str, Any]] = []
+        baseline_state: Dict[str, Any] = {"stop": False}
+        baseline_progress = self._make_progress(
+            pq_put,
+            0,
+            planned_total,
+            "baseline",
+            metrics_sink=baseline_history,
+            trial_state=baseline_state,
+            auto_cfg=self.auto_cfg,
+        )
         try:
-            _, best_loss = train_dual_layer(
-                cfg0, log, _prog0, stop_flag, _cache=_data_cache
+            _checkpoint, raw_baseline_score = train_dual_layer(
+                baseline_cfg,
+                log,
+                baseline_progress,
+                lambda: bool(stop_flag() or baseline_state.get("stop", False)),
+                _cache=data_cache,
             )
         except Exception as exc:
-            _cleanup_failed_trial(cfg0.out_ckpt)
+            cleanup_trial(baseline_cfg.out_ckpt)
             raise RuntimeError(
                 "AutoSearch baseline failed with the currently selected "
                 f"architecture and parameters: {type(exc).__name__}: {exc}"
             ) from exc
         if stop_flag():
-            _cleanup_failed_trial(cfg0.out_ckpt)
-            log(f"[{_now()}] AutoSearch: stopped during baseline trial.")
-            return best_params, float("inf")
-        if not math.isfinite(best_loss):
-            _cleanup_failed_trial(cfg0.out_ckpt)
+            cleanup_trial(baseline_cfg.out_ckpt)
+            log(f"[{_now()}] Auto Research: stopped during baseline trial.")
+            return dict(current), float("inf")
+        if baseline_state.get("abort_reason"):
+            cleanup_trial(baseline_cfg.out_ckpt)
+            raise FloatingPointError(
+                "AutoSearch baseline is not safe for repeated trials: "
+                f"{baseline_state['abort_reason']}"
+            )
+        raw_baseline_score = float(raw_baseline_score)
+        if not math.isfinite(raw_baseline_score):
+            cleanup_trial(baseline_cfg.out_ckpt)
             raise FloatingPointError(
                 "AutoSearch baseline returned a non-finite validation score."
             )
-        try:
-            os.remove(cfg0.out_ckpt)
-        except Exception:
-            pass
-        log(f"[{_now()}] AutoSearch: baseline normalized multi-task score={best_loss:.4f}")
-        if self._bo is not None:
-            self._bo.add_observation(current, best_loss)
-        _auto_emit(pq_put, 0, self.auto_cfg.n_trials, best_loss, best_loss,
-                   best_params, current, improved=False)
-
-        # Three-phase schedule:
-        #   Phase 1: pure random exploration
-        #   Phase 2: alternate BO-guided and random proposals
-        #   Phase 3: mostly exploit the surrogate, with periodic random refresh
-        _n  = self.auto_cfg.n_trials
-        _p1 = max(1, _n // 3)                       # phase 1 ends (exclusive)
-        _p2 = max(_p1 + 1, 2 * _n // 3)             # phase 2 ends (exclusive)
-
-        for i in range(_n):
-            if stop_flag():
-                log(f"[{_now()}] AutoSearch: stopped at trial {i}.")
-                break
-
-            if i < _p1:
-                # Phase 1: explore broadly with pure random search.
-                candidate = self._sample_candidate(rng)
-                _src = "explore"
-            elif i < _p2:
-                # Phase 2: balance exploration and exploitation.
-                _want_bo = ((i - _p1) % 2 == 0) and (self._bo is not None)
-                if _want_bo:
-                    bo_cand = self._bo.suggest(rng)
-                    candidate = bo_cand if bo_cand is not None else self._sample_candidate(rng)
-                    _src = "BO" if bo_cand is not None else "random(BO-init)"
-                else:
-                    candidate = self._sample_candidate(rng)
-                    _src = "random"
-            else:
-                # Phase 3: mostly exploit the surrogate, with one random trial
-                # every five iterations to avoid premature convergence.
-                _want_bo = ((i - _p2) % 5 != 4) and (self._bo is not None)
-                if _want_bo:
-                    bo_cand = self._bo.suggest(rng)
-                    candidate = bo_cand if bo_cand is not None else self._sample_candidate(rng)
-                    _src = "BO" if bo_cand is not None else "random(BO-init)"
-                else:
-                    candidate = self._sample_candidate(rng)
-                    _src = "random"
-
-            merged = self._constrain_cutoff_pair({**best_params, **candidate})
-            trial_cfg = self._build_trial_cfg(merged, trial_idx=i + 1)
-
-            log(f"[{_now()}] AutoSearch trial {i+1}/{_n} [phase {'1-explore' if i<_p1 else '2-balance' if i<_p2 else '3-exploit'}/{_src}]: "
-                f"{', '.join(f'{k}={_fmt_p(v)}' for k, v in candidate.items())}")
-
-            _prog = self._make_progress(pq_put, i + 1, _n)
+        dropped_targets: List[str] = []
+        if baseline_history:
             try:
-                _, trial_loss = train_dual_layer(
-                    trial_cfg, log, _prog, stop_flag, _cache=_data_cache
+                baseline_score, baseline_window, dropped_targets = (
+                    self._calibrate_from_baseline(baseline_history)
                 )
-                if stop_flag():
-                    _cleanup_failed_trial(trial_cfg.out_ckpt)
-                    log(f"[{_now()}] AutoSearch: stopped during trial {i + 1}.")
-                    break
-                if not math.isfinite(trial_loss):
-                    raise FloatingPointError(
-                        "trial returned a non-finite validation score"
-                    )
-            except Exception as exc:
-                trial_loss = float("inf")
-                log(
-                    f"[{_now()}] AutoSearch trial {i+1}: FAILED "
-                    f"[{_src}] {type(exc).__name__}: {exc}. "
-                    "The search will continue."
-                )
-                _auto_emit(
-                    pq_put, i + 1, _n, best_loss, trial_loss,
-                    best_params, merged, improved=False,
-                )
-                _cleanup_failed_trial(trial_cfg.out_ckpt)
-                continue
-
-            # The surrogate is updated with every trial, not only the winners.
-            if self._bo is not None:
-                self._bo.add_observation(merged, trial_loss)
-
-            improved = trial_loss < best_loss
-            if improved:
-                best_loss   = trial_loss
-                best_params = dict(merged)
-                log(f"[{_now()}] AutoSearch trial {i+1}: IMPROVED → "
-                    f"normalized score={trial_loss:.4f} [{_src}]")
-            else:
-                log(f"[{_now()}] AutoSearch trial {i+1}: no improvement "
-                    f"(trial={trial_loss:.4f} >= best={best_loss:.4f}) [{_src}]")
-
-            _auto_emit(pq_put, i + 1, _n, best_loss, trial_loss,
-                       best_params, merged, improved)
-
-            try:
-                os.remove(trial_cfg.out_ckpt)
             except Exception:
-                pass
+                cleanup_trial(baseline_cfg.out_ckpt)
+                raise
+            self.metric_calibration_available = True
+        else:
+            # Keep the engine testable with external/custom training callables
+            # that predate metrics progress events. Real ``train_dual_layer``
+            # always emits those events and therefore takes the calibrated path.
+            baseline_score = raw_baseline_score
+            baseline_window = {"epoch_start": 0, "epoch_end": 0, "values": {}}
+            self.score_targets = self.validation_targets
+            self.score_scales = {
+                target: float(VALIDATION_MAE_SCALES.get(target, 1.0))
+                for target in self.score_targets
+            }
+            self.score_coverage = {}
+            self.required_target_references = {}
+            self.required_target_limits = {}
+            self.metric_calibration_available = False
+            log(
+                f"[{_now()}] Auto Research did not receive validation metrics; "
+                "using legacy scalar trial scores without target calibration."
+            )
+        unsupported_loss_params = {
+            parameter
+            for parameter in self._params
+            if parameter in self.LOSS_PARAM_TO_TARGET
+            and self.metric_calibration_available
+            and self.LOSS_PARAM_TO_TARGET[parameter] not in self.score_targets
+        }
+        if unsupported_loss_params:
+            self._params = [
+                parameter for parameter in self._params
+                if parameter not in unsupported_loss_params
+            ]
+        sensitivity_plan = self._sensitivity_plan(current)
+        planned_total = len(sensitivity_plan) + refinement_budget + 2
+        cleanup_trial(baseline_cfg.out_ckpt)
+        if self.metric_calibration_available:
+            log(
+                f"[{_now()}] Auto Research baseline calibrated score={baseline_score:.6g} "
+                f"over epochs {baseline_window['epoch_start']}-{baseline_window['epoch_end']} "
+                f"(trainer score={raw_baseline_score:.6g}); targets={list(self.score_targets)}."
+            )
+            log(
+                f"[{_now()}] Auto Research frozen calibration: "
+                f"scales={json.dumps({name: round(value, 6) for name, value in self.score_scales.items()}, sort_keys=True)} "
+                f"coverage={json.dumps(self.score_coverage, sort_keys=True)} "
+                f"required_references={json.dumps({name: round(value, 6) for name, value in self.required_target_references.items()}, sort_keys=True)} "
+                f"required_limits={json.dumps({name: round(value, 6) for name, value in self.required_target_limits.items()}, sort_keys=True)}."
+            )
+        else:
+            log(
+                f"[{_now()}] Auto Research baseline legacy scalar score={baseline_score:.6g}."
+            )
+        if dropped_targets or unsupported_loss_params:
+            log(
+                f"[{_now()}] Auto Research excluded insufficiently covered targets="
+                f"{sorted(set(dropped_targets))}; skipped dimensions="
+                f"{sorted(unsupported_loss_params)}."
+            )
+        log(
+            f"[{_now()}] Auto Research effective plan: {len(sensitivity_plan)} "
+            f"one-factor trials + up to {refinement_budget} group refinements + "
+            "paired confirmation."
+        )
 
-        log(f"[{_now()}] AutoSearch complete. Best normalized multi-task score={best_loss:.4f}")
-        log(f"[{_now()}] Best params: {best_params}")
-        return best_params, best_loss
+        best_observed_params = dict(current)
+        best_observed_score = float(baseline_score)
+        _auto_emit(
+            pq_put, 0, planned_total, best_observed_score, baseline_score,
+            best_observed_params, current, improved=False,
+            phase="baseline", source="paired-reference",
+        )
+
+        def consider(parameters: Dict[str, Any], score: float) -> bool:
+            nonlocal best_observed_params, best_observed_score
+            if math.isfinite(score) and score < best_observed_score:
+                best_observed_params = dict(parameters)
+                best_observed_score = float(score)
+                return True
+            return False
+
+        # Phase 1: one-factor sensitivity screen. Each experiment starts from
+        # ``current`` instead of the last winner, so its delta is independently
+        # attributable to one editable parameter under the selected mixed model.
+        for name, value in sensitivity_plan:
+            if stop_flag():
+                log(f"[{_now()}] Auto Research: stopped during sensitivity screening.")
+                return dict(current), float("inf")
+            candidate = self._constrain_cutoff_pair({**current, name: value})
+            score = evaluate(
+                candidate,
+                phase="sensitivity",
+                source="one-factor",
+                changed=(name,),
+                group=self.parameter_group(name),
+            )
+            if score is None:
+                return dict(current), float("inf")
+            record = self.sensitivity_results.setdefault(
+                name,
+                {
+                    "parameter": name,
+                    "group": self.parameter_group(name),
+                    "reference": self._plain_value(current[name]),
+                    "trials": [],
+                },
+            )
+            record["trials"].append(
+                {
+                    "value": self._plain_value(candidate[name]),
+                    "score": float(score) if math.isfinite(score) else None,
+                }
+            )
+            finite_trials = [
+                entry for entry in record["trials"]
+                if entry["score"] is not None and math.isfinite(float(entry["score"]))
+            ]
+            failures = len(record["trials"]) - len(finite_trials)
+            if finite_trials:
+                best_trial = min(finite_trials, key=lambda entry: float(entry["score"]))
+                parameter_best_score = float(best_trial["score"])
+                record["best_value"] = self._plain_value(best_trial["value"])
+                record["best_score"] = parameter_best_score
+                absolute_effect = float(baseline_score) - parameter_best_score
+                record["absolute_effect"] = absolute_effect
+                record["relative_effect"] = absolute_effect / max(1.0, abs(float(baseline_score)))
+            else:
+                record["best_value"] = self._plain_value(current[name])
+                record["best_score"] = float("inf")
+                record["absolute_effect"] = float("-inf")
+                record["relative_effect"] = float("-inf")
+            record["failure_rate"] = failures / float(max(1, len(record["trials"])))
+            record["confidence"] = (
+                "high" if len(finite_trials) >= 2 and failures == 0
+                else "moderate" if finite_trials
+                else "failed"
+            )
+            record["status"] = (
+                "beneficial" if float(record["absolute_effect"]) > 0.0
+                else "neutral_or_adverse" if finite_trials else "unstable"
+            )
+            improved = consider(candidate, score)
+            _auto_emit(
+                pq_put, trial_counter, planned_total, best_observed_score, score,
+                best_observed_params, candidate, improved,
+                phase="sensitivity", source="one-factor", changed_params=(name,),
+                group=self.parameter_group(name), sensitivity=copy.deepcopy(record),
+            )
+
+        groups = self._selected_refinement_groups(baseline_score)
+        selected_groups = [
+            {"group": group, "parameters": list(parameters)}
+            for group, parameters in groups
+        ]
+        if groups:
+            log(
+                f"[{_now()}] Auto Research sensitivity selected "
+                + "; ".join(
+                    f"{group}({', '.join(parameters)})"
+                    for group, parameters in groups
+                )
+                + "."
+            )
+        else:
+            log(f"[{_now()}] Auto Research sensitivity found no refinable dimensions.")
+
+        # Phase 2: conditional group refinement. A group anchor first tests the
+        # simultaneous composition of individually useful values. Subsequent
+        # local points use a group-only surrogate; the global parameter space is
+        # never passed to BO again.
+        incumbent = dict(current)
+        incumbent_score = float(baseline_score)
+        refinement_remaining = refinement_budget
+        for group_index, (group, names) in enumerate(groups):
+            if stop_flag() or refinement_remaining <= 0:
+                break
+            groups_left = len(groups) - group_index
+            slots = max(1, refinement_remaining // max(1, groups_left))
+            local_space = {
+                name: self._local_search_space(
+                    name,
+                    self.sensitivity_results[name].get("best_value", incumbent[name]),
+                )
+                for name in names
+            }
+            local_bo = _BayesianCore(names, local_space)
+            local_bo.add_observation(
+                {name: incumbent[name] for name in names}, incumbent_score
+            )
+            seen = {
+                tuple(repr(self._plain_value(incumbent[name])) for name in names)
+            }
+
+            anchor_values = {
+                name: self.sensitivity_results[name].get("best_value", incumbent[name])
+                for name in names
+            }
+            anchor = self._constrain_cutoff_pair({**incumbent, **anchor_values})
+            anchor_key = tuple(repr(self._plain_value(anchor[name])) for name in names)
+            if anchor_key not in seen and slots > 0:
+                seen.add(anchor_key)
+                score = evaluate(
+                    anchor,
+                    phase="group_refinement",
+                    source="group-anchor",
+                    changed=names,
+                    group=group,
+                )
+                refinement_remaining -= 1
+                slots -= 1
+                if score is None:
+                    return dict(current), float("inf")
+                if math.isfinite(score):
+                    local_bo.add_observation({name: anchor[name] for name in names}, score)
+                    if score < incumbent_score:
+                        incumbent, incumbent_score = dict(anchor), float(score)
+                    improved = consider(anchor, score)
+                else:
+                    improved = False
+                _auto_emit(
+                    pq_put, trial_counter, planned_total, best_observed_score, score,
+                    best_observed_params, anchor, improved,
+                    phase="group_refinement", source="group-anchor",
+                    changed_params=names, group=group,
+                )
+
+            for _local_index in range(max(0, slots)):
+                if stop_flag() or refinement_remaining <= 0:
+                    break
+                source = "local-design"
+                proposal: Optional[Dict[str, Any]] = None
+                if local_bo.ready:
+                    proposal = local_bo.suggest(rng, n_candidates=512)
+                    source = "local-BO" if proposal is not None else source
+                if proposal is None:
+                    proposal = self._sample_from_space(names, local_space, rng)
+                candidate = self._constrain_cutoff_pair({**incumbent, **proposal})
+                candidate_key = tuple(
+                    repr(self._plain_value(candidate[name])) for name in names
+                )
+                # Draw a small number of alternatives before giving up on a
+                # discrete local neighborhood that has been fully evaluated.
+                attempts = 0
+                while candidate_key in seen and attempts < 8:
+                    proposal = self._sample_from_space(names, local_space, rng)
+                    candidate = self._constrain_cutoff_pair({**incumbent, **proposal})
+                    candidate_key = tuple(
+                        repr(self._plain_value(candidate[name])) for name in names
+                    )
+                    source = "local-design"
+                    attempts += 1
+                if candidate_key in seen:
+                    break
+                seen.add(candidate_key)
+                score = evaluate(
+                    candidate,
+                    phase="group_refinement",
+                    source=source,
+                    changed=names,
+                    group=group,
+                )
+                refinement_remaining -= 1
+                if score is None:
+                    return dict(current), float("inf")
+                if math.isfinite(score):
+                    local_bo.add_observation({name: candidate[name] for name in names}, score)
+                    if score < incumbent_score:
+                        incumbent, incumbent_score = dict(candidate), float(score)
+                    improved = consider(candidate, score)
+                else:
+                    improved = False
+                _auto_emit(
+                    pq_put, trial_counter, planned_total, best_observed_score, score,
+                    best_observed_params, candidate, improved,
+                    phase="group_refinement", source=source,
+                    changed_params=names, group=group,
+                )
+
+        # Phase 3: a candidate cannot become the GUI's "best" value until the
+        # same short protocol reproduces its advantage on a different deterministic
+        # subset and initialization. Both arms use exactly the same confirmation
+        # seed, so the comparison remains paired.
+        candidate_changed = any(
+            not self._values_equal(best_observed_params.get(name), current.get(name))
+            for name in self._params
+        )
+        confirmation: Dict[str, Any] = {
+            "attempted": bool(candidate_changed),
+            "confirmed": False,
+            "baseline_score": None,
+            "candidate_score": None,
+            "baseline_aggregate": float(baseline_score),
+            "candidate_aggregate": None,
+        }
+        final_params = dict(current)
+        final_score = float(baseline_score)
+        if candidate_changed and not stop_flag():
+            confirmation_seed = int(self.base_cfg.seed) + int(
+                getattr(self.auto_cfg, "confirmation_seed_offset", 104_729)
+            )
+            confirmation_epochs = max(
+                int(self.auto_cfg.trial_epochs),
+                int(math.ceil(
+                    float(self.auto_cfg.trial_epochs)
+                    * max(1.0, float(getattr(
+                        self.auto_cfg, "confirmation_epoch_multiplier", 1.5
+                    )))
+                )),
+            )
+            log(
+                f"[{_now()}] Auto Research confirmation: paired seed="
+                f"{confirmation_seed}, epochs={confirmation_epochs}."
+            )
+            baseline_confirmation = evaluate(
+                current,
+                phase="confirmation",
+                source="baseline",
+                changed=(),
+                seed=confirmation_seed,
+                epochs=confirmation_epochs,
+                suffix="_confirm_baseline",
+                enforce_required_targets=False,
+            )
+            if baseline_confirmation is None:
+                return dict(current), float("inf")
+            candidate_confirmation = evaluate(
+                best_observed_params,
+                phase="confirmation",
+                source="candidate",
+                changed=tuple(
+                    name for name in self._params
+                    if not self._values_equal(best_observed_params.get(name), current.get(name))
+                ),
+                seed=confirmation_seed,
+                epochs=confirmation_epochs,
+                suffix="_confirm_candidate",
+            )
+            if candidate_confirmation is None:
+                return dict(current), float("inf")
+            confirmation["baseline_score"] = (
+                float(baseline_confirmation) if math.isfinite(baseline_confirmation) else None
+            )
+            confirmation["candidate_score"] = (
+                float(candidate_confirmation) if math.isfinite(candidate_confirmation) else None
+            )
+            if math.isfinite(baseline_confirmation) and math.isfinite(candidate_confirmation):
+                baseline_aggregate = 0.5 * (float(baseline_score) + float(baseline_confirmation))
+                candidate_aggregate = 0.5 * (
+                    float(best_observed_score) + float(candidate_confirmation)
+                )
+                confirmation["baseline_aggregate"] = baseline_aggregate
+                confirmation["candidate_aggregate"] = candidate_aggregate
+                minimum_relative_gain = max(
+                    0.0, float(getattr(self.auto_cfg, "min_relative_effect", 0.005))
+                )
+                initial_required_gain = minimum_relative_gain * max(
+                    1.0, abs(float(baseline_score))
+                )
+                paired_required_gain = minimum_relative_gain * max(
+                    1.0, abs(float(baseline_confirmation))
+                )
+                aggregate_required_gain = minimum_relative_gain * max(
+                    1.0, abs(float(baseline_aggregate))
+                )
+                initial_pass = (
+                    float(best_observed_score)
+                    < float(baseline_score) - initial_required_gain
+                )
+                paired_pass = (
+                    float(candidate_confirmation)
+                    < float(baseline_confirmation) - paired_required_gain
+                )
+                aggregate_pass = (
+                    candidate_aggregate
+                    < baseline_aggregate - aggregate_required_gain
+                )
+                confirmation.update({
+                    "initial_delta": float(baseline_score) - float(best_observed_score),
+                    "paired_delta": float(baseline_confirmation) - float(candidate_confirmation),
+                    "aggregate_delta": baseline_aggregate - candidate_aggregate,
+                    "initial_required_gain": initial_required_gain,
+                    "paired_required_gain": paired_required_gain,
+                    "aggregate_required_gain": aggregate_required_gain,
+                    "initial_pass": initial_pass,
+                    "paired_pass": paired_pass,
+                    "aggregate_pass": aggregate_pass,
+                })
+                if initial_pass and paired_pass and aggregate_pass:
+                    final_params = dict(best_observed_params)
+                    final_score = float(candidate_aggregate)
+                    confirmation["confirmed"] = True
+                    log(
+                        f"[{_now()}] Auto Research confirmation accepted candidate: "
+                        f"{candidate_aggregate:.6g} vs baseline {baseline_aggregate:.6g}."
+                    )
+                else:
+                    final_score = float(baseline_aggregate)
+                    log(
+                        f"[{_now()}] Auto Research confirmation rejected the provisional "
+                        "winner; retaining the baseline configuration "
+                        f"(initial_pass={initial_pass}, paired_pass={paired_pass}, "
+                        f"aggregate_pass={aggregate_pass})."
+                    )
+            else:
+                log(
+                    f"[{_now()}] Auto Research confirmation was non-finite; "
+                    "retaining the baseline configuration."
+                )
+            _auto_emit(
+                pq_put, trial_counter, planned_total, final_score,
+                float(candidate_confirmation), final_params, best_observed_params,
+                improved=bool(confirmation["confirmed"]), phase="confirmation",
+                source="paired-holdout", changed_params=tuple(
+                    name for name in self._params
+                    if not self._values_equal(best_observed_params.get(name), current.get(name))
+                ), confirmation=confirmation,
+            )
+
+        self.last_report = {
+            "strategy": "paired_one_factor_then_grouped_local_bo",
+            "score_policy": (
+                "baseline_calibrated_smoothed_pareto_guard"
+                if self.metric_calibration_available
+                else "legacy_scalar_fallback"
+            ),
+            "metric_calibration_available": bool(self.metric_calibration_available),
+            "score_targets": list(self.score_targets),
+            "score_scales": dict(self.score_scales),
+            "score_coverage": dict(self.score_coverage),
+            "required_targets": list(self.required_targets),
+            "required_target_references": dict(self.required_target_references),
+            "required_target_limits": dict(self.required_target_limits),
+            "dropped_targets": list(dropped_targets),
+            "skipped_loss_dimensions": sorted(unsupported_loss_params),
+            "score_smoothing_window": int(getattr(
+                self.auto_cfg, "score_smoothing_window", 3
+            )),
+            "subset_diagnostics": dict(self.subset_diagnostics),
+            "baseline_score": float(baseline_score),
+            "planned_trials": int(planned_total),
+            "executed_trials": int(trial_counter),
+            "sensitivity_trials": int(len(sensitivity_plan)),
+            "refinement_budget": int(refinement_budget),
+            "refinement_executed": int(refinement_budget - refinement_remaining),
+            "selected_groups": selected_groups,
+            "sensitivity": copy.deepcopy(self.sensitivity_results),
+            "confirmation": dict(confirmation),
+            "final_score": float(final_score),
+            "final_confirmed": bool(confirmation["confirmed"]),
+        }
+        log(
+            f"[{_now()}] Auto Research complete. "
+            f"{'Confirmed' if confirmation['confirmed'] else 'Baseline retained'} "
+            f"normalized score={final_score:.6g}"
+        )
+        log(f"[{_now()}] Best params: {final_params}")
+        return final_params, final_score
 
 
 def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callable] = None, stop_flag: Optional[Callable] = None, _cache: Optional[Dict] = None) -> "Tuple[str, float]":
@@ -9772,12 +11679,17 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         )
         split_info = dict(composite_plan.split_info)
         zs = list(composite_plan.elements)
+        composite_storage = (
+            "packed OMat24 arrays"
+            if composite_plan.omat_packed
+            else "embedded materialized Parquet shards"
+        )
         log(
             f"[{_now()}] Composite HDF5 streaming index: "
             f"train={split_info['train_structures']} val={split_info['val_structures']} "
             f"(OMat24={split_info['train_omat24']}/{split_info['val_omat24']}, "
             f"Large={split_info['train_large']}/{split_info['val_large']}); "
-            "Parquet/HDF5 numerical arrays remain on disk."
+            f"{composite_storage} remain on disk."
         )
         log(f"[{_now()}] Grouped split: {json.dumps(split_info, sort_keys=True)}")
         static_cfgs = static_fields = resp_cfgs = resp_fields = []
@@ -9997,12 +11909,51 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             z_table=z_table,
             cutoff=float(model.cfg.r_max),
         )
+        if bool(getattr(cfg, "cache_neighbor_graphs", True)):
+            cache_omat = np.unique(np.concatenate((
+                composite_plan.train_omat_indices.astype(np.int64, copy=False),
+                composite_plan.val_omat_indices.astype(np.int64, copy=False),
+            )))
+            cache_large = np.unique(np.concatenate((
+                composite_plan.train_large_indices.astype(np.int64, copy=False),
+                composite_plan.val_large_indices.astype(np.int64, copy=False),
+            )))
+            topology_cache = build_composite_topology_cache(
+                composite_plan,
+                cache_omat,
+                cache_large,
+                z_table=z_table,
+                cutoff=float(model.cfg.r_max),
+                cache_directory=str(getattr(cfg, "graph_cache_dir", "")),
+                log=log,
+                progress=progress,
+                stop_flag=stop_flag,
+            )
+            if topology_cache is None:
+                return _cancelled_result("composite topology-cache construction")
+            train_data.attach_topology_cache(topology_cache)
+            val_data.attach_topology_cache(topology_cache)
+        else:
+            log(
+                f"[{_now()}] Composite HDF5 uses on-demand neighbor construction; "
+                "enable cache_neighbor_graphs to reuse exact topology across epochs."
+            )
         train_atoms = int(np.sum(train_data.atom_counts, dtype=np.int64))
-        avg_n = float("nan")
+        if train_data.edge_counts is not None:
+            train_edges = int(np.sum(train_data.edge_counts, dtype=np.int64))
+            avg_n = float(train_edges) / float(max(1, train_atoms))
+        else:
+            avg_n = float("nan")
         log(
             f"[{_now()}] Composite dataset streaming: train={len(train_data)} "
-            f"val={len(val_data)} mode={cfg.mode}; source shards are opened lazily "
-            "and RAM retains only selectors/masks."
+            f"val={len(val_data)} mode={cfg.mode} "
+            + (f"avg_neighbors/atom={avg_n:.2f}; " if math.isfinite(avg_n) else "")
+            + (
+                "packed OMat24 arrays are read in contiguous batch spans; "
+                if composite_plan.omat_packed
+                else "source shards are opened lazily; "
+            )
+            + "RAM retains only selectors/masks."
         )
     elif stream_plan is not None:
         topology_cache: Optional[str] = None
@@ -10251,11 +12202,18 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             seed: int,
             *,
             shuffle: bool,
+            max_edges: Optional[int] = None,
         ) -> None:
             self.ds = ds
             self.batch_size = max(1, int(batch_size))
             self.seed = int(seed)
             self.shuffle = bool(shuffle)
+            self.edge_budget = int(max_edges) if max_edges is not None else None
+            self.edge_counts = getattr(ds, "edge_counts", None)
+            self.requested_batch_size = int(self.batch_size)
+            self.structure_loads: List[int] = []
+            self.edge_loads: List[int] = []
+            self.oversized_structures = 0
             self.epoch = 0
             self.omat_count = int(ds.omat_indices.size)
             self.large_count = int(ds.large_indices.size)
@@ -10271,6 +12229,19 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     self.omat_by_source[int(source_order)] = local[
                         np.argsort(rows[local], kind="stable")
                     ]
+            preview_count = self.omat_count
+            if self.ds.plan.mode == "joint" and self.large_count:
+                ratio = max(
+                    1e-12,
+                    float(getattr(cfg, "composite_joint_foundation_ratio", 4.0)),
+                )
+                preview_count = min(
+                    self.omat_count,
+                    max(1, int(round(ratio * self.large_count))),
+                )
+            preview = self._role_batches(np.arange(preview_count, dtype=np.int64))
+            preview.extend(self._role_batches(self.large_local))
+            self._update_batch_stats(preview)
 
         def _omat_epoch_indices(self, rng: np.random.Generator) -> np.ndarray:
             if self.omat_count == 0:
@@ -10304,20 +12275,63 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     blocks.append(kept)
             return np.concatenate(blocks) if blocks else np.zeros((0,), dtype=np.int64)
 
+        def _role_batches(self, indices: np.ndarray) -> List[List[int]]:
+            values = np.asarray(indices, dtype=np.int64).reshape(-1)
+            if values.size == 0:
+                return []
+            if self.edge_counts is None or self.edge_budget is None:
+                return [
+                    values[start:start + self.batch_size].tolist()
+                    for start in range(0, int(values.size), self.batch_size)
+                ]
+            # Preserve source/selector order so packed HDF5 rows are read in
+            # contiguous spans.  A sequential greedy split still enforces the
+            # same edge budget; best-fit reordering would destroy read locality.
+            loads = np.asarray(self.edge_counts[values], dtype=np.int64)
+            batches: List[List[int]] = []
+            current: List[int] = []
+            current_load = 0
+            for value, load in zip(values, loads):
+                item = int(load)
+                if current and (
+                    len(current) >= self.batch_size
+                    or current_load + item > self.edge_budget
+                ):
+                    batches.append(current)
+                    current = []
+                    current_load = 0
+                current.append(int(value))
+                current_load += item
+            if current:
+                batches.append(current)
+            return batches
+
+        def _update_batch_stats(self, batches: Sequence[Sequence[int]]) -> None:
+            self.structure_loads = [len(batch) for batch in batches]
+            if self.edge_counts is not None:
+                self.edge_loads = [
+                    int(np.sum(
+                        self.edge_counts[np.asarray(batch, dtype=np.int64)],
+                        dtype=np.int64,
+                    ))
+                    for batch in batches
+                ]
+                self.oversized_structures = int(sum(
+                    int(value > self.edge_budget)
+                    for value in self.edge_loads
+                )) if self.edge_budget is not None else 0
+            else:
+                self.edge_loads = []
+                self.oversized_structures = 0
+
         def __iter__(self) -> Iterable[List[int]]:
             rng = np.random.default_rng(self.seed + self.epoch)
             omat = self._omat_epoch_indices(rng)
             large = self.large_local.copy()
             if self.shuffle:
                 rng.shuffle(large)
-            omat_batches = [
-                omat[start:start + self.batch_size].tolist()
-                for start in range(0, int(omat.size), self.batch_size)
-            ]
-            large_batches = [
-                large[start:start + self.batch_size].tolist()
-                for start in range(0, int(large.size), self.batch_size)
-            ]
+            omat_batches = self._role_batches(omat)
+            large_batches = self._role_batches(large)
             if omat_batches and large_batches:
                 merged: List[List[int]] = []
                 omat_step = max(1, int(math.ceil(len(omat_batches) / len(large_batches))))
@@ -10329,6 +12343,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 merged.extend(omat_batches[cursor:])
             else:
                 merged = omat_batches + large_batches
+            self._update_batch_stats(merged)
             self.epoch += 1
             return iter(merged)
 
@@ -10338,6 +12353,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 omat_count = min(self.omat_count, max(1, int(round(ratio * self.large_count))))
             else:
                 omat_count = self.omat_count
+            if self.edge_counts is not None and self.edge_budget is not None:
+                return len(self._role_batches(np.arange(omat_count, dtype=np.int64))) + len(
+                    self._role_batches(self.large_local)
+                )
             return int(math.ceil(omat_count / self.batch_size)) + int(
                 math.ceil(self.large_count / self.batch_size)
             )
@@ -10345,21 +12364,38 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     def _make_loader(ds: Sequence[AtomicData], *, shuffle: bool) -> Any:
         # Clamp the batch size so tiny validation sets still produce a batch.
         _eff_bs = max(1, min(int(cfg.batch_size), len(ds) if ds else 1))
+        _configured_edge_budget = getattr(cfg, "mps_edge_budget_override", None)
+        try:
+            _configured_edge_budget = int(_configured_edge_budget)
+        except (TypeError, ValueError, OverflowError):
+            _configured_edge_budget = None
+        if _configured_edge_budget is not None and _configured_edge_budget <= 0:
+            _configured_edge_budget = None
         kwargs: Dict[str, Any] = dict(
             collate_fn=_collate,
             num_workers=int(_dl_num_workers),
             pin_memory=bool(_dl_pin_memory),
         )
         if isinstance(ds, CompositeAtomicDataDataset):
+            edge_budget = (
+                _configured_edge_budget
+                if _configured_edge_budget is not None
+                else 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
+            ) if device.type == "mps" else None
             kwargs["batch_sampler"] = _CompositeCurriculumBatchSampler(
-                ds, _eff_bs, int(cfg.seed), shuffle=shuffle
+                ds, _eff_bs, int(cfg.seed), shuffle=shuffle,
+                max_edges=edge_budget,
             )
         elif device.type == "mps":
             # Force/BEC training differentiates through positions twice. Bound
             # edges rather than only structures because edge count drives memory.
             # Apply the same policy to validation, where conservative forces
             # still construct the higher-order graph; only training shuffles.
-            edge_budget = 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
+            edge_budget = (
+                _configured_edge_budget
+                if _configured_edge_budget is not None
+                else 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
+            )
             kwargs["batch_sampler"] = _FixedGraphBatchSampler(
                 ds,
                 _eff_bs,
@@ -11861,6 +13897,15 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     name: float(total / count)
                     for name, (total, count) in val_extra_metrics.items()
                     if count > 0
+                },
+                "validation_counts": {
+                    **({"energy": int(val_emae_n)} if val_emae_n > 0 else {}),
+                    **({"forces": int(val_fmae_n)} if val_fmae_n > 0 else {}),
+                    **{
+                        name: int(count)
+                        for name, (_total, count) in val_extra_metrics.items()
+                        if count > 0
+                    },
                 },
                 "physics_residual_max": dict(val_residual_max),
                 "memory": dict(memory),
@@ -15199,8 +17244,19 @@ class App(tk.Tk):
                     pass
 
     def _store_auto_best(
-        self, best_params: Dict[str, Any], best_score: float, level: int
+        self, best_params: Dict[str, Any], best_score: float, level: int,
+        *, confirmed: bool = True,
     ) -> None:
+        if not confirmed:
+            self._auto_best_params = {}
+            self._auto_best_score = float(best_score)
+            self._auto_best_level = int(level)
+            self._auto_best_text_var.set(
+                "No independently confirmed improvement; the current baseline was retained."
+            )
+            if self._auto_apply_button is not None:
+                self._auto_apply_button.set_enabled(False, "No confirmed improvement")
+            return
         self._auto_best_params = dict(best_params)
         self._auto_best_score = float(best_score)
         self._auto_best_level = int(level)
@@ -15273,6 +17329,7 @@ class App(tk.Tk):
                 search_space_overrides=dynamic_architecture_search_space(
                     base_cfg.model, self._dataset_capability
                 ),
+                dataset_capability=dict(self._dataset_capability),
             )
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("Auto Search Error", str(e))
@@ -15327,6 +17384,9 @@ class App(tk.Tk):
                     "score": float(best_loss),
                     "level": level,
                     "dataset_revision": search_dataset_revision,
+                    "confirmed": bool(
+                        dict(engine.last_report.get("confirmation", {})).get("confirmed", False)
+                    ),
                 })
                 self._progress_q.put({"type": "run_complete", "stopped": bool(self._stop)})
             except Exception as e:
@@ -15437,6 +17497,7 @@ class App(tk.Tk):
                         dict(d.get("params", {})),
                         float(d.get("score", float("inf"))),
                         int(d.get("level", 0)),
+                        confirmed=bool(d.get("confirmed", True)),
                     )
                 else:
                     self._auto_best_text_var.set(
@@ -15960,10 +18021,10 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "1 loss weights; 2 +backbone; 3 +cascade; 4 +active physics solvers.",
     ),
     "auto_trials": _p(
-        "AutoSearch trials",
-        "Sets candidate evaluations after the current-configuration baseline.",
-        "Search transitions from random exploration to Gaussian-process-guided proposals.",
-        "5-20 for development; 30-100 for a serious search.",
+        "Group refinement trials",
+        "Sets the local-refinement budget after deterministic one-factor screening.",
+        "Every active parameter is first compared against the same mixed-architecture baseline; only sensitivity-supported physical groups use a local Gaussian-process proposal.",
+        "5-20 for development; 30-100 for deeper interaction refinement. Screening and paired confirmation are added automatically.",
     ),
     "auto_trial_epochs": _p(
         "Epochs per search trial",
@@ -16686,6 +18747,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._auto_best_params: Dict[str, Any] = {}
         self._auto_best_score: Optional[float] = None
         self._auto_best_level = 0
+        self._auto_search_report: Dict[str, Any] = {}
         self._custom_search_specs: Dict[str, tuple] = {}
         self._search_space_customized = False
         self._metric_history: List[Dict[str, Any]] = []
@@ -17130,7 +19192,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
     def _populate_search_page(self, layout: QtWidgets.QVBoxLayout) -> None:
         card = Card(
             "Auto Research / AutoSearch",
-            "The selected architecture is locked. Search automatically attaches only its active solver parameters.",
+            "Architecture stays locked. Every active dimension is screened against the same baseline before low-dimensional physical-group refinement.",
             PALETTE["yellow"],
         )
         self._add_field_grid(
@@ -17147,7 +19209,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                         "4: + Active Physics Solvers",
                     ),
                 ),
-                ("auto_trials", "Trials", None),
+                ("auto_trials", "Group refinement trials", None),
                 ("auto_trial_epochs", "Trial epochs", None),
                 ("auto_subset", "Sample %", None),
             ),
@@ -17186,20 +19248,23 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
         table_card = Card(
             "Active Search Dimensions",
-            "The table updates immediately when architecture, labels, losses, or search level change.",
+            "One-factor effects use a fixed baseline, calibrated target scales, and protected core PES objectives. Values remain provisional until paired confirmation.",
             PALETTE["surface"],
         )
-        self.search_table = QtWidgets.QTableWidget(0, 6)
+        self.search_table = QtWidgets.QTableWidget(0, 8)
         self.search_table.setHorizontalHeaderLabels(
-            ("Parameter", "Sampler", "Domain (JSON)", "Best / current", "Last tried", "Status")
+            (
+                "Parameter", "Sampler", "Domain (JSON)", "Provisional best",
+                "Last tried", "Status", "Independent effect", "Phase",
+            )
         )
         search_header = self.search_table.horizontalHeader()
         search_header.setMinimumSectionSize(72)
-        for column in range(6):
+        for column in range(8):
             search_header.setSectionResizeMode(
                 column, QtWidgets.QHeaderView.ResizeMode.Interactive
             )
-        for column, width in enumerate((145, 105, 285, 115, 105, 82)):
+        for column, width in enumerate((145, 105, 285, 115, 105, 105, 135, 125)):
             self.search_table.setColumnWidth(column, width)
         self.search_table.verticalHeader().setVisible(False)
         self.search_table.setAlternatingRowColors(True)
@@ -18266,7 +20331,12 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         for button in self.training_buttons:
             button.setEnabled(not running)
         self.auto_run_button.setEnabled(not running)
-        self.auto_apply_button.setEnabled(bool(self._auto_best_params) and not running)
+        confirmation = dict(self._auto_search_report.get("confirmation", {}))
+        self.auto_apply_button.setEnabled(
+            bool(self._auto_best_params)
+            and (not self._auto_search_report or bool(confirmation.get("confirmed", False)))
+            and not running
+        )
         if label:
             self.header_status.setText(label)
             self.state_value.setText(label)
@@ -18650,6 +20720,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 lock_selected_architecture=True,
                 search_space_overrides=search_overrides,
                 search_params=tuple(selected_params),
+                dataset_capability=dict(self._capability),
             )
             tmp_dir = str(self._artifact_dir_for_checkpoint(str(self.value("out_ckpt"))) / "auto_trials")
             engine = self.backend.AutoSearchEngine(base, auto_cfg, tmp_dir)
@@ -18673,7 +20744,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             item = QtWidgets.QTableWidgetItem(error)
             item.setForeground(QtGui.QColor(PALETTE["danger"]))
             self.search_table.setItem(0, 0, item)
-            self.search_table.setSpan(0, 0, 1, 6)
+            self.search_table.setSpan(0, 0, 1, 8)
             del blocker
             return
         self.search_table.clearSpans()
@@ -18686,13 +20757,16 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             sampler, search_domain = self.backend.search_space_spec_to_editor(
                 _engine.search_space[parameter]
             )
-            cells = (parameter, sampler, search_domain, str(current), "", "Active")
+            cells = (
+                parameter, sampler, search_domain, str(current), "", "Pending",
+                "Not screened", "Awaiting baseline",
+            )
             for column, text in enumerate(cells):
                 item = QtWidgets.QTableWidgetItem(text)
                 if column not in (1, 2):
                     item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                 if column == 5:
-                    item.setForeground(QtGui.QColor("#4B806A"))
+                    item.setForeground(QtGui.QColor("#8A7B54"))
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, gui_key)
                 self.search_table.setItem(row, column, item)
             tooltip = self._tooltip_html(gui_key)
@@ -18839,9 +20913,19 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._search_context_revision += 1
         context_revision = self._search_context_revision
         self._invalidate_auto_result("Search in progress")
-        self.auto_summary.setText(
-            f"Searching {len(params)} active dimensions inside the fixed architecture."
+        counts = engine.planned_trial_counts()
+        summary_text = (
+            f"Fixed-baseline screen: {counts['sensitivity']} one-factor trials for "
+            f"{len(params)} dimensions, then up to {counts['refinement']} group "
+            f"refinements and a paired confirmation "
+            f"({counts['baseline'] + counts['sensitivity'] + counts['refinement'] + counts['confirmation']} max runs). "
+            f"Protected targets: {', '.join(engine.required_targets) or 'none'}."
         )
+        if engine.subset_diagnostics.get("warnings"):
+            summary_text += " Subset warning: " + "; ".join(
+                engine.subset_diagnostics["warnings"]
+            ) + "."
+        self.auto_summary.setText(summary_text)
         self._reset_dashboard(str(self.value("out_ckpt")), "Auto Research")
 
         def work() -> None:
@@ -18867,6 +20951,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     "dataset_revision": revision,
                     "architecture_signature": architecture_signature,
                     "context_revision": context_revision,
+                    "report": dict(engine.last_report),
                 }
             )
             self.bus.event.emit(
@@ -18887,6 +20972,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
     def _invalidate_auto_result(self, reason: str) -> None:
         self._auto_best_params.clear()
         self._auto_best_score = None
+        self._auto_search_report = {}
         if hasattr(self, "auto_apply_button"):
             self.auto_apply_button.setEnabled(False)
         if hasattr(self, "auto_summary"):
@@ -18906,11 +20992,23 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._auto_best_params = dict(event.get("params", {}))
         self._auto_best_score = float(event.get("score", float("inf")))
         self._auto_best_level = int(event.get("level", 0))
+        self._auto_search_report = dict(event.get("report", {}))
+        confirmation = dict(self._auto_search_report.get("confirmation", {}))
         self.auto_apply_button.setEnabled(
-            bool(self._auto_best_params) and not self._training_running
+            bool(self._auto_best_params)
+            and (not self._auto_search_report or bool(confirmation.get("confirmed", False)))
+            and not self._training_running
+        )
+        screen_trials = int(self._auto_search_report.get("sensitivity_trials", 0))
+        group_trials = int(self._auto_search_report.get("refinement_executed", 0))
+        outcome = (
+            "Independently confirmed"
+            if bool(confirmation.get("confirmed", False))
+            else "No independently confirmed improvement; baseline retained"
         )
         self.auto_summary.setText(
-            f"Best result ready: normalized score {self._auto_best_score:.6g}; "
+            f"{outcome}. Score {self._auto_best_score:.6g}; "
+            f"{screen_trials} one-factor and {group_trials} group trials; "
             f"{len(self._auto_best_params)} values can be applied."
         )
 
@@ -19000,12 +21098,19 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             trials = int(event.get("n_trials", 1))
             epoch = int(event.get("epoch", 0))
             epochs = int(event.get("epochs", 1))
+            phase = str(event.get("phase", "refinement")).replace("_", " ").title()
             prefix = "Baseline" if trial == 0 else f"Trial {trial}/{trials}"
-            self.header_progress.setText(f"Auto Research  {prefix}  Epoch {epoch}/{epochs}")
+            self.header_progress.setText(
+                f"Auto Research  {phase}  {prefix}  Epoch {epoch}/{epochs}"
+            )
             self.epoch_value.setText(f"{prefix}: {epoch} / {epochs}")
             self.progress_bar.setValue(int(1000 * epoch / max(1, epochs)))
         elif kind == "auto_search":
             self._consume_search_trial(event)
+        elif kind == "auto_search_sensitivity":
+            self._consume_search_sensitivity(event)
+        elif kind == "auto_search_confirmation":
+            self._consume_search_confirmation(event)
         elif kind == "auto_complete":
             self._store_auto_result(event)
         elif kind == "base_checkpoint":
@@ -19029,9 +21134,13 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         best_score = float(event.get("best_loss", float("nan")))
         trial_score = float(event.get("trial_loss", float("nan")))
         improved = bool(event.get("improved", False))
+        phase = str(event.get("phase", "refinement"))
+        source = str(event.get("source", ""))
+        changed = {str(name) for name in event.get("changed_params", ())}
         self.progress_bar.setValue(int(1000 * trial / trials))
         self.header_progress.setText(
-            f"Auto Research {trial}/{trials}  best={best_score:.4g}  trial={trial_score:.4g}"
+            f"Auto Research {phase.replace('_', ' ')} {trial}/{trials}  "
+            f"provisional={best_score:.4g}  trial={trial_score:.4g}"
         )
         best = dict(event.get("params", {}))
         latest = dict(event.get("trial_params", {}))
@@ -19041,18 +21150,31 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 continue
             parameter = first.text()
             if parameter in best:
-                self.search_table.setItem(
-                    row, 3, QtWidgets.QTableWidgetItem(str(self.backend._fmt_p(best[parameter])))
+                best_item = QtWidgets.QTableWidgetItem(
+                    str(self.backend._fmt_p(best[parameter]))
                 )
-            if parameter in latest:
-                self.search_table.setItem(
-                    row, 4, QtWidgets.QTableWidgetItem(str(self.backend._fmt_p(latest[parameter])))
+                best_item.setFlags(best_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.search_table.setItem(row, 3, best_item)
+            if parameter in latest and parameter in changed:
+                latest_item = QtWidgets.QTableWidgetItem(
+                    str(self.backend._fmt_p(latest[parameter]))
                 )
-                status_text = (
-                    "Failed" if not math.isfinite(trial_score)
-                    else "Improved" if improved else "Tried"
+                latest_item.setFlags(
+                    latest_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable
                 )
+                self.search_table.setItem(row, 4, latest_item)
+                if not math.isfinite(trial_score):
+                    status_text = "Failed"
+                elif phase == "sensitivity":
+                    status_text = "Improved" if improved else "Screened"
+                elif phase == "group_refinement":
+                    status_text = "Refined"
+                elif phase == "confirmation":
+                    status_text = "Confirmed" if improved else "Rejected"
+                else:
+                    status_text = "Tried"
                 status = QtWidgets.QTableWidgetItem(status_text)
+                status.setFlags(status.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                 status.setForeground(
                     QtGui.QColor(
                         "#B6536A" if not math.isfinite(trial_score)
@@ -19060,6 +21182,67 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     )
                 )
                 self.search_table.setItem(row, 5, status)
+                phase_item = QtWidgets.QTableWidgetItem(
+                    f"{phase.replace('_', ' ').title()}"
+                    + (f" / {source}" if source else "")
+                )
+                phase_item.setFlags(
+                    phase_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable
+                )
+                self.search_table.setItem(row, 7, phase_item)
+
+    def _consume_search_sensitivity(self, event: Dict[str, Any]) -> None:
+        """Render one fixed-baseline parameter effect as it becomes available."""
+        result = dict(event.get("sensitivity", {}))
+        parameter = str(result.get("parameter", ""))
+        if not parameter:
+            return
+        relative = float(result.get("relative_effect", float("nan")))
+        failure_rate = float(result.get("failure_rate", 0.0))
+        confidence = str(result.get("confidence", ""))
+        status_text = str(result.get("status", "screened"))
+        if math.isfinite(relative):
+            effect_text = f"{relative:+.2%} ({confidence})"
+            effect_color = "#3F8065" if relative > 0.0 else "#B6536A"
+        else:
+            effect_text = f"Unstable ({failure_rate:.0%} failed)"
+            effect_color = "#B6536A"
+        for row in range(self.search_table.rowCount()):
+            item = self.search_table.item(row, 0)
+            if item is None or item.text() != parameter:
+                continue
+            effect = QtWidgets.QTableWidgetItem(effect_text)
+            effect.setFlags(effect.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            effect.setForeground(QtGui.QColor(effect_color))
+            effect.setToolTip(
+                "One-factor effect relative to the unchanged baseline. "
+                f"Failure rate: {failure_rate:.0%}; confidence: {confidence}."
+            )
+            self.search_table.setItem(row, 6, effect)
+            status = QtWidgets.QTableWidgetItem(status_text.replace("_", " ").title())
+            status.setFlags(status.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            status.setForeground(QtGui.QColor(effect_color))
+            self.search_table.setItem(row, 5, status)
+            phase = QtWidgets.QTableWidgetItem(
+                f"One-factor / {str(result.get('group', 'other'))}"
+            )
+            phase.setFlags(phase.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.search_table.setItem(row, 7, phase)
+            break
+
+    def _consume_search_confirmation(self, event: Dict[str, Any]) -> None:
+        confirmation = dict(event.get("confirmation", {}))
+        if not confirmation:
+            return
+        confirmed = bool(confirmation.get("confirmed", False))
+        baseline = confirmation.get("baseline_aggregate")
+        candidate = confirmation.get("candidate_aggregate")
+        if baseline is not None and candidate is not None:
+            self.header_progress.setText(
+                "Auto Research confirmation "
+                + ("accepted" if confirmed else "rejected")
+                + f"  candidate={float(candidate):.4g}  baseline={float(baseline):.4g}"
+            )
 
     @staticmethod
     def _format_eta(seconds: float) -> str:

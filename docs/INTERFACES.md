@@ -91,6 +91,22 @@ e3mu run-task request.json --output result.json
 The request schema is
 [`coupling/task_request.schema.json`](../coupling/task_request.schema.json).
 
+## Agent Skill Installation
+
+The portable skill source is [`skills/e3-miu-gnn/`](../skills/e3-miu-gnn/SKILL.md).
+Link or copy that directory to the skill root used by the host runtime:
+
+| Runtime | User or project destination |
+| --- | --- |
+| Codex | `${CODEX_HOME:-$HOME/.codex}/skills/e3-miu-gnn` |
+| Agent Skills standard | `~/.agents/skills/e3-miu-gnn` or `.agents/skills/e3-miu-gnn` |
+| Claude Code | `~/.claude/skills/e3-miu-gnn` or `.claude/skills/e3-miu-gnn` |
+| OpenCode | `~/.config/opencode/skills/e3-miu-gnn` or `.opencode/skills/e3-miu-gnn` |
+
+Restart or reload the host after installation. The bundled scripts accept
+`--repo /path/to/E3-miu-GNN`, so a user-level skill remains connected to the
+intended source checkout without embedding machine-specific paths.
+
 ## Checkpoint Modes
 
 `model_mode=auto` uses checkpoint metadata in this order:

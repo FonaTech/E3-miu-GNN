@@ -31,7 +31,8 @@ architecture.*
 - **Training and evaluation:** mask-aware mixed-label losses, group-safe fixed
   splits, staged base/response/joint training, normalized multi-task model
   selection, live plots, memory diagnostics, safe checkpoints, and a
-  dataset-aware Auto Research search space.
+  dataset-aware Auto Research workflow with paired one-factor sensitivity
+  screening, physical-group local refinement, and independent confirmation.
 - **Data tooling:** canonical ragged HDF5, deterministic tier construction,
   strict validation, provenance records, source-specific masking, and
   rights-aware Hugging Face staging.
@@ -137,8 +138,11 @@ python E3_miu_GNN.py evaluate \
 Canonical HDF5 training and evaluation stream structures and labels by
 default. Exact neighbor topology is cached once in a read-only, memory-mapped
 layout, CPU assembly is bounded to a two-batch prefetch window, and only the
-current batch is transferred to the accelerator. Use `--no-stream-hdf5` only for materialized
-debug comparisons; legacy extXYZ input is still parsed into memory. Measured
+current batch is transferred to the accelerator. Plus and Max use lossless
+packed HDF5 arrays; contiguous rows are fetched as a batch and Composite caches
+use the same source-, selection-, cutoff-, and backend-keyed exact topology
+format. Use `--no-stream-hdf5` only for materialized debug comparisons; legacy
+extXYZ input is still parsed into memory. Measured
 Tiny RAM and I/O trade-offs are reported in
 [Training and validation](docs/TRAINING_AND_VALIDATION.md#memory-behavior).
 
@@ -147,6 +151,15 @@ Convert an extXYZ file into the canonical schema:
 ```bash
 python Datasets_Preparation.py dataset-extxyz \
   input.extxyz.gz output.h5
+```
+
+Convert an older self-contained Composite file from embedded Parquet to the
+training-optimized packed layout without overwriting the source:
+
+```bash
+python Datasets_Preparation.py dataset-composite-pack-omat \
+  neo_plus_l1_l2_l3.h5 \
+  --output neo_plus_l1_l2_l3_packed.h5
 ```
 
 Run `python E3_miu_GNN.py --help` for training, evaluation, self-test, and GUI
@@ -215,19 +228,19 @@ silently mixed.
 | Standard | 46,414 | 135.1 MB | Portable mixed-granularity training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
 | Large | 613,267 | 1.23 GB | Trajectory-rich training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
 | Plus | 25,819,271 | 40.63 GB portable single-file HDF5 | 25% material-family OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
-| Max | 101,283,549 | 134.39 GB portable single-file HDF5 | Full deduplicated OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
+| Max | 101,283,549 | 137.61 GB portable single-file HDF5 | Full deduplicated OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
 
 Plus uses schema `e3mu-composite-hdf5-v1`. Its complete Large geometry,
-labels, masks, and provenance are embedded in the Plus HDF5 itself. Each of the
-635 declared OMat24 source shards is represented by an internal Parquet shard
-containing only selected rows. The runtime opens these through an HDF5-backed
-reader, so copying the single `.h5` file to another machine does not require the
-original OMat24 tree. Arrow logical types and float64 bit patterns are
-preserved. The original row number remains in `selection/source_row_index`.
+labels, masks, and provenance are embedded in the Plus HDF5 itself. The selected
+rows from the 635 declared OMat24 source shards are stored as ragged packed HDF5
+arrays under `sources/omat24/packed`. Geometry and labels retain their source
+float64 values without quantization. Copying the single `.h5` file to another
+machine does not require the original OMat24 tree, and the original row number
+remains in `selection/source_row_index`.
 
 Max contains 100,670,282 unique OMat24 configurations after removing 154,252
 duplicate configuration IDs, plus all 613,267 Large records. It uses the same
-self-contained materialized-Parquet storage and staged Base -> Response -> Joint
+self-contained packed storage and staged Base -> Response -> Joint
 curriculum as Plus.
 
 Large-scale pretraining is currently in progress. The present release provides

@@ -149,6 +149,22 @@ sampled.
 
 ![Neo dataset tiers](assets/generated/dataset-tiers.png)
 
+## Composite packed tiers
+
+Plus and Max use `e3mu-composite-hdf5-v1` and are self-contained single-file
+datasets. Their selected OMat24 rows are stored under
+`sources/omat24/packed` with ragged `atom_ptr`, atomic numbers, positions,
+forces, cells, periodic flags, stress, energies, and stable identifiers. The
+packed writer preserves source float64 geometry and labels without quantization;
+it does not depend on an external OMat24 directory at runtime. The complete Neo
+Large payload remains embedded in the same file.
+
+At training time, `E3_miu_GNN.py` builds or reuses an exact topology cache keyed
+by the composite file, selected structure ids, cutoff, and neighborhood backend.
+The cache stores edge counts for MPS edge-budget batching and bitwise-exact
+periodic-shift dictionaries. This changes host decoding and graph reuse, not
+the numerical labels or the model cutoff.
+
 | Tier | Structures | Atoms | Elements | Periodic structures | File size | Distribution |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | Tiny | 5,575 | 371,803 | 85 | 3,978 | 21.3 MB | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
@@ -156,7 +172,7 @@ sampled.
 | Standard | 46,414 | 2,316,736 | 85 | 28,284 | 135.1 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
 | Large | 613,267 | 17,760,024 | 89 | 511,274 | 1.23 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
 | Plus | 25,819,271 | 488,227,614 | 94 | 25,717,278 | 40.63 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_plus_l1_l2_l3.h5) |
-| Max | 101,283,549 | 1,899,323,661 | 94 | 101,181,556 | 134.39 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_max_l1_l2_l3.h5) |
+| Max | 101,283,549 | 1,899,323,661 | 94 | 101,181,556 | 137.61 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_max_l1_l2_l3.h5) |
 
 The fixed split counts are:
 

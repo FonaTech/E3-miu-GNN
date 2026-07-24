@@ -43,6 +43,9 @@ print(manifest["inference"]["outputs"]["recommended"])
 
 Safe state-dict checkpoints load with PyTorch `weights_only=True`. A trusted
 legacy pickled module requires the explicit `allow_unsafe_legacy=True` opt-in.
+The loader supports native mixed-granularity bundles, native dual-layer bundles,
+and reconstructable state-dict bundles; future configuration fields are ignored
+by older readers while known fields retain their typed values.
 
 ## ASE Calculator
 
