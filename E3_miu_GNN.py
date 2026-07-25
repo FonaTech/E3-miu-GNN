@@ -25897,7 +25897,15 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                         260,
                         min(360, int(round(0.39 * available_width))),
                     )
-                    target_height = max(460, row_height * rows, available_height)
+                    row_gap_px = 32
+                    outer_y_px = 24
+                    target_height = max(
+                        460,
+                        row_height * rows
+                        + row_gap_px * (rows - 1)
+                        + 2 * outer_y_px,
+                        available_height,
+                    )
                 self._resize_analysis_canvas(target_height)
                 regression_export_panels = list(replay_panels)
                 for index, (stage_id, replayed_epoch, metric_name, metric) in enumerate(
@@ -26154,9 +26162,15 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             ]
             canvas_width = max(1.0, float(self.canvas.width()))
             canvas_height = max(1.0, float(self.canvas.height()))
-            outer_x_px = min(24.0, 0.04 * canvas_width)
+            outer_x_px = min(32.0, 0.06 * canvas_width)
+            column_gap_px = min(36.0, 0.08 * canvas_width)
             slot_width = max(
-                1.0, (canvas_width - 2.0 * outer_x_px) / 2.0
+                1.0,
+                (
+                    canvas_width
+                    - 2.0 * outer_x_px
+                    - column_gap_px
+                ) / 2.0,
             )
             label_allowance_px = min(
                 56.0, max(42.0, 0.18 * slot_width)
@@ -26175,7 +26189,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     center_x = (
                         0.5 * canvas_width
                         if len(visible_axes) == 1
-                        else outer_x_px + (axis_index + 0.5) * slot_width
+                        else (
+                            outer_x_px
+                            + axis_index * (slot_width + column_gap_px)
+                            + 0.5 * slot_width
+                        )
                     )
                     x_px = max(0.0, center_x - 0.5 * side_px)
                     axis.set_position((
@@ -26191,10 +26209,15 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 # for an odd final row, and text measurements cannot move or
                 # progressively shrink the axes between redraws.
                 rows = int(math.ceil(len(visible_axes) / 2.0))
-                outer_y_px = min(10.0, 0.02 * canvas_height)
+                outer_y_px = min(24.0, 0.04 * canvas_height)
+                row_gap_px = min(32.0, 0.06 * canvas_height)
                 slot_height = max(
                     1.0,
-                    (canvas_height - 2.0 * outer_y_px) / max(1, rows),
+                    (
+                        canvas_height
+                        - 2.0 * outer_y_px
+                        - row_gap_px * (rows - 1)
+                    ) / max(1, rows),
                 )
                 top_px = min(48.0, max(38.0, 0.135 * slot_height))
                 bottom_px = min(50.0, max(40.0, 0.14 * slot_height))
@@ -26209,11 +26232,14 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 for axis_index, axis in enumerate(visible_axes):
                     row_index, column_index = divmod(axis_index, 2)
                     center_x = (
-                        outer_x_px + (column_index + 0.5) * slot_width
+                        outer_x_px
+                        + column_index * (slot_width + column_gap_px)
+                        + 0.5 * slot_width
                     )
                     row_bottom = (
                         outer_y_px
-                        + (rows - row_index - 1) * slot_height
+                        + (rows - row_index - 1)
+                        * (slot_height + row_gap_px)
                     )
                     x_px = max(0.0, center_x - 0.5 * side_px)
                     y_px = (
