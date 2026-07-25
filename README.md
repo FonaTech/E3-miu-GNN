@@ -27,10 +27,12 @@ architecture.*
   traceless single-ion anisotropy, optional Dzyaloshinskii-Moriya interaction,
   magnetic moments, and effective spin fields.
 - **Cross-granularity feedback:** charge, electrostatic potential, and spin
-  invariants modulate atomic message passing through bounded FiLM gates.
+  invariants modulate atomic message passing through bounded FiLM gates;
+  label-aware activity masks keep L2/L3 mechanisms off L1-only foundation graphs.
 - **Training and evaluation:** mask-aware mixed-label losses, group-safe fixed
   splits, staged base/response/joint training, normalized multi-task model
-  selection, live plots, memory diagnostics, safe checkpoints, and a
+  selection, conservative cell-strain stress, BEC sum-rule and coupling
+  constraints, live plots, memory diagnostics, safe checkpoints, and a
   dataset-aware Auto Research workflow with paired one-factor sensitivity
   screening, physical-group local refinement, and independent confirmation.
 - **Data tooling:** canonical ragged HDF5, deterministic tier construction,
@@ -51,7 +53,7 @@ with electric response
 
 ```math
 E_{\mathrm{resp}}
-= -\boldsymbol{\mu}\cdot\boldsymbol{\mathcal E}
+= -\boldsymbol{\mu}_{\mathrm{permanent}}\cdot\boldsymbol{\mathcal E}
 - \frac{1}{2}\boldsymbol{\mathcal E}^{\mathsf T}
 \boldsymbol{\alpha}\boldsymbol{\mathcal E}.
 ```
@@ -60,6 +62,9 @@ Forces and spin fields remain derivatives of the same energy:
 
 ```math
 \mathbf F_i=-\frac{\partial E_{\mathrm{tot}}}{\partial \mathbf R_i},
+\qquad
+\boldsymbol\sigma=\frac{1}{V}\mathrm{sym}
+\frac{\partial E_{\mathrm{tot}}}{\partial\boldsymbol\varepsilon},
 \qquad
 \mathbf H_i^{\mathrm{eff}}=-\frac{\partial E_{\mathrm{spin}}}{\partial \mathbf S_i},
 \qquad
@@ -86,7 +91,7 @@ flowchart LR
     Q --> H
     P --> H
     S --> H
-    H --> O[Energy, forces, response tensors, spin field]
+    H --> O[Energy, forces, stress, response tensors, spin field]
 ```
 
 ## Quick start
@@ -175,7 +180,7 @@ workflow engines, and LLM agents:
 ```bash
 python -m pip install -e .
 e3mu --pretty inspect model.pt
-e3mu predict model.pt POSCAR --properties energy,forces --output prediction.json
+e3mu predict model.pt POSCAR --properties energy,forces,stress --output prediction.json
 ```
 
 ```python
@@ -186,6 +191,7 @@ atoms = read("POSCAR")
 atoms.calc = E3MUCalculator("model.pt", device="auto", model_mode="auto")
 energy = atoms.get_potential_energy()
 forces = atoms.get_forces()
+stress = atoms.get_stress()  # fully periodic cells; use a stress-trained checkpoint
 ```
 
 Checkpoint inspection reports the trained inference mode, supported elements,
@@ -223,12 +229,12 @@ silently mixed.
 
 | Neo tier | Structures | Approximate size | Intended use | Download |
 | --- | ---: | ---: | --- | --- |
-| Tiny | 5,575 | 21.3 MB | Fast functional checks | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
-| Small | 15,221 | 52.8 MB | Intermediate experiments | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
-| Standard | 46,414 | 135.1 MB | Portable mixed-granularity training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
-| Large | 613,267 | 1.23 GB | Trajectory-rich training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
-| Plus | 25,819,271 | 40.63 GB portable single-file HDF5 | 25% material-family OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
-| Max | 101,283,549 | 137.61 GB portable single-file HDF5 | Full deduplicated OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
+| Tiny | 5,780 | 21.0 MB | Fast functional checks | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
+| Small | 16,703 | 53.7 MB | Intermediate experiments | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
+| Standard | 46,414 | 129.7 MB | Portable mixed-granularity training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
+| Large | 613,267 | 1.31 GB | Trajectory-rich training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
+| Plus | 25,819,271 | 41.06 GB portable single-file HDF5 | 25% material-family OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
+| Max | 101,283,549 | 138.04 GB portable single-file HDF5 | Full deduplicated OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
 
 Plus uses schema `e3mu-composite-hdf5-v1`. Its complete Large geometry,
 labels, masks, and provenance are embedded in the Plus HDF5 itself. The selected
@@ -243,6 +249,17 @@ duplicate configuration IDs, plus all 613,267 Large records. It uses the same
 self-contained packed storage and staged Base -> Response -> Joint
 curriculum as Plus.
 
+The 2026-07-25 Tiny-Large revision adds raw non-OMat24 stress supervision from
+MPtrj and JARVIS-DFPT. Standard contains 22,873 stress records, including 112
+records with matched BEC and clamped-ion piezoelectric tensors and 12,000 with
+matched spin states. Large contains 505,848 stress records, including the same
+112 L2 records and 72,929 spin-conditioned L3 records. No paired
+target-minus-reference magnetoelastic labels have been fabricated; that loss
+remains disabled until the constrained-spin DFT campaign is completed. The
+current Plus and Max binaries embed this enriched Large payload. Their combined
+stress counts are 25,711,852 and 101,176,130, respectively; each retains the
+112 matched L2 records and 72,929 spin-conditioned L3 records from Large.
+
 Large-scale pretraining is currently in progress. The present release provides
 the architecture, training system, datasets, and validation tools; validated
 pretrained checkpoints will be published in a later project version.
@@ -254,7 +271,7 @@ the archive-level redistribution terms for the transformed `BEC/H2O`,
 
 ## Verified behavior
 
-The current source tree passes 127 regression tests and the deterministic
+The current source tree passes 166 regression tests and the deterministic
 physics self-test. The checked invariants include:
 
 - rotation and reflection behavior of energy, force, dipole, and
@@ -263,6 +280,9 @@ physics self-test. The checked invariants include:
   under simultaneous spin reversal;
 - graph-wise charge conservation and QEq stationarity;
 - conservative forces against finite differences;
+- conservative stress, clamped-ion piezoelectric response, stress-component
+  closure, and full-coupled magnetoelastic response against affine finite
+  differences;
 - differentiable QEq, PME, polarization, D4, FiLM, and Layer-3 losses;
 - HDF5 mask semantics, group-safe splits, checkpoint round trips, and VASP
   magnetic mapping.
