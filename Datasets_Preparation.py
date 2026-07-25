@@ -126,17 +126,19 @@ NEO_HF_TIER_PATHS: Dict[str, str] = {
     "tiny": "canonical/neo_tiny_l1_l2_l3.h5",
     "small": "canonical/neo_small_l1_l2_l3.h5",
     "standard": "canonical/neo_mixed_l1_l2_l3.h5",
+    "se": "canonical/neo_se_l1_l2_l3.h5",
     "large": "canonical/neo_large_l1_l2_l3.h5",
     "plus": "canonical/neo_plus_l1_l2_l3.h5",
     "max": "canonical/neo_max_l1_l2_l3.h5",
 }
-# Local format/capability analysis includes the temporary Plus Half tier.  It
+# Local format/capability analysis also includes the temporary Plus Half tier. It
 # intentionally remains separate from ``NEO_HF_TIER_PATHS`` so release staging
-# and public documentation continue to expose only the six production tiers.
+# and public documentation expose the named SE mirror instead.
 NEO_ANALYSIS_TIER_PATHS: Dict[str, str] = {
     "tiny": NEO_HF_TIER_PATHS["tiny"],
     "small": NEO_HF_TIER_PATHS["small"],
     "standard": NEO_HF_TIER_PATHS["standard"],
+    "se": NEO_HF_TIER_PATHS["se"],
     "plus_half": "canonical/neo_plus_half_l1_l2_l3.h5",
     "large": NEO_HF_TIER_PATHS["large"],
     "plus": NEO_HF_TIER_PATHS["plus"],
@@ -147,14 +149,42 @@ NEO_HF_REQUIRED_DOCUMENTS: Tuple[str, ...] = (
     "README.md",
     "SOURCES_AND_PROCESSING.md",
     "DATA_SCHEMA.md",
+    "VIEWER_TABLES.md",
     "LICENSES_AND_ATTRIBUTION.md",
     "HUGGINGFACE_UPLOAD.md",
 )
+NEO_HF_VIEWER_FILES: Tuple[str, ...] = (
+    "viewer/structure_examples/train.parquet",
+    "viewer/structure_examples/validation.parquet",
+    "viewer/structure_examples/test.parquet",
+    "viewer/tier_summary.parquet",
+    "viewer/label_coverage.parquet",
+    "viewer/source_coverage.parquet",
+    "viewer/manifest.json",
+)
+NEO_HF_VIEWER_CONFIGS: Dict[str, Dict[str, str]] = {
+    "structure_examples": {
+        "train": "viewer/structure_examples/train.parquet",
+        "validation": "viewer/structure_examples/validation.parquet",
+        "test": "viewer/structure_examples/test.parquet",
+    },
+    "tier_summary": {"train": "viewer/tier_summary.parquet"},
+    "label_coverage": {"train": "viewer/label_coverage.parquet"},
+    "source_coverage": {"train": "viewer/source_coverage.parquet"},
+}
 _NEO_HF_ALLOWED_RIGHTS_STATUSES = {
     "allowed",
     "allowed_with_attribution",
     "allowed_with_conditions",
 }
+
+
+def _neo_viewer_output_file(output_directory: Path, relative_path: str) -> Path:
+    """Resolve a repository ``viewer/...`` path inside a Viewer directory."""
+    parts = Path(str(relative_path)).parts
+    if len(parts) < 2 or parts[0] != "viewer" or ".." in parts:
+        raise ValueError(f"Invalid Viewer repository path: {relative_path!r}")
+    return output_directory.joinpath(*parts[1:])
 
 
 def assign_stable_group_splits(
@@ -4577,6 +4607,957 @@ def analyze_neo_dataset_formats(
     return result
 
 
+def _neo_viewer_label_family(label: str) -> str:
+    for family, labels in _NEO_TIER_LABEL_FAMILIES.items():
+        if str(label) in labels:
+            return str(family)
+    return "auxiliary"
+
+
+def _neo_viewer_mask_intersection(handle: Any, names: Sequence[str]) -> int:
+    masks = handle["masks"]
+    if any(name not in masks for name in names):
+        return 0
+    combined: Optional[np.ndarray] = None
+    for name in names:
+        values = np.asarray(masks[name], dtype=np.bool_)
+        combined = values if combined is None else combined & values
+    return int(np.count_nonzero(combined)) if combined is not None else 0
+
+
+def _neo_viewer_external_links(handle: Any) -> List[str]:
+    links: List[str] = []
+
+    def visit(group: Any, prefix: str = "") -> None:
+        for name in group:
+            location = f"{prefix}/{name}"
+            link = group.get(name, getlink=True)
+            if isinstance(link, h5py.ExternalLink):
+                links.append(location)
+                continue
+            child = group.get(name)
+            if isinstance(child, h5py.Group):
+                visit(child, location)
+
+    visit(handle)
+    return links
+
+
+def _neo_viewer_tier_details(
+    root: Path,
+    tier: str,
+    relative_path: str,
+    manifest_entry: Dict[str, Any],
+) -> Dict[str, Any]:
+    path = (root / relative_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Viewer tier is missing: {path}")
+    with h5py.File(path, "r") as handle:
+        schema = str(handle.attrs.get("schema_version", ""))
+        if schema not in {HDF5_SCHEMA_VERSION, COMPOSITE_HDF5_SCHEMA_VERSION}:
+            raise ValueError(f"Unsupported Viewer tier schema in {path}: {schema!r}")
+        atom_ptr = handle["structures/atom_ptr"]
+        response_structures = max(0, int(atom_ptr.shape[0]) - 1)
+        response_atoms = int(atom_ptr[-1]) if atom_ptr.shape[0] else 0
+        label_counts = {
+            str(name): int(np.count_nonzero(dataset[:]))
+            for name, dataset in handle["masks"].items()
+        }
+        omat24_structures = 0
+        omat24_atoms = 0
+        storage = "canonical-ragged-hdf5"
+        response_tier = str(tier)
+        response_source_sha256: Optional[str] = None
+        self_contained = True
+        if schema == COMPOSITE_HDF5_SCHEMA_VERSION:
+            omat = handle["sources/omat24"]
+            packed = omat.get("packed")
+            omat24_structures = int(handle.attrs.get("omat24_structures", 0))
+            omat24_atoms = (
+                int(packed.attrs.get("atoms", 0))
+                if isinstance(packed, h5py.Group) else 0
+            )
+            storage = str(omat.attrs.get("storage", ""))
+            for name in ("energy", "forces", "stress"):
+                label_counts[name] = int(label_counts.get(name, 0)) + omat24_structures
+            response_source = handle["sources/neo_large"]
+            original = str(response_source.attrs.get("original_path", ""))
+            response_tier = "standard" if "mixed" in original else "large"
+            response_source_sha256 = str(
+                response_source.attrs.get("source_sha256", "")
+            ) or None
+            self_contained = bool(
+                omat.attrs.get("embedded", False)
+                and response_source.attrs.get("embedded", False)
+                and not _neo_viewer_external_links(handle)
+            )
+        structures = response_structures + omat24_structures
+        atoms = response_atoms + omat24_atoms
+        declared_structures = int(manifest_entry.get("structures", structures))
+        declared_atoms = int(manifest_entry.get("atoms", atoms))
+        if declared_structures != structures or declared_atoms != atoms:
+            raise ValueError(
+                f"Viewer manifest counts disagree for {tier}: "
+                f"manifest={declared_structures}/{declared_atoms}, "
+                f"HDF5={structures}/{atoms}"
+            )
+        declared_labels = dict(manifest_entry.get("labels", {}))
+        for name in ("energy", "forces", "stress"):
+            if name in declared_labels and int(declared_labels[name]) != int(
+                label_counts.get(name, 0)
+            ):
+                raise ValueError(
+                    f"Viewer manifest label count disagrees for {tier}/{name}"
+                )
+        sources = dict(manifest_entry.get("sources", {}))
+        if not sources:
+            if schema == COMPOSITE_HDF5_SCHEMA_VERSION:
+                metadata = json.loads(str(handle.attrs.get("metadata_json", "{}")))
+                sources = {
+                    f"OMat24/{item.get('name', 'unknown')}": int(
+                        item.get("selected_unique", 0)
+                    )
+                    for item in metadata.get("omat24", {}).get("corpora", [])
+                }
+                sources.update({
+                    str(name): int(count)
+                    for name, count in dict(
+                        metadata.get("neo_large", {}).get("sources", {})
+                    ).items()
+                })
+            else:
+                sources = dict(sorted(collections.Counter(
+                    str(value) for value in handle["metadata/source"].asstr()[:]
+                ).items()))
+        splits = dict(manifest_entry.get("splits", {}))
+        if not splits:
+            if schema == COMPOSITE_HDF5_SCHEMA_VERSION:
+                codes = np.asarray(handle["selection/split_code"], dtype=np.uint8)
+                counts = np.bincount(codes, minlength=3)
+                splits = {
+                    name: int(counts[index])
+                    for index, name in enumerate(("train", "val", "test"))
+                }
+                response_splits = collections.Counter(
+                    str(value) for value in handle["metadata/split"].asstr()[:]
+                )
+                for name, count in response_splits.items():
+                    splits[name] = int(splits.get(name, 0)) + int(count)
+            else:
+                splits = dict(sorted(collections.Counter(
+                    str(value) for value in handle["metadata/split"].asstr()[:]
+                ).items()))
+        elements = [int(value) for value in manifest_entry.get("elements", [])]
+        if not elements:
+            if schema == COMPOSITE_HDF5_SCHEMA_VERSION:
+                elements = [int(value) for value in json.loads(
+                    str(handle.attrs.get("elements_json", "[]"))
+                )]
+            else:
+                elements = sorted(int(value) for value in np.unique(
+                    handle["structures/atomic_numbers"][:]
+                ))
+        mechanisms = {
+            "stress_bec_piezoelectric": _neo_viewer_mask_intersection(
+                handle, ("stress", "bec", "piezoelectric")
+            ),
+            "stress_spins": _neo_viewer_mask_intersection(
+                handle, ("stress", "spins")
+            ),
+            "paired_magnetoelastic": _neo_viewer_mask_intersection(
+                handle, ("magnetoelastic_stress", "reference_spins", "spins")
+            ),
+        }
+    actual_bytes = int(path.stat().st_size)
+    declared_bytes = int(manifest_entry.get("bytes", actual_bytes))
+    if actual_bytes != declared_bytes:
+        raise ValueError(
+            f"Viewer manifest byte count disagrees for {tier}: "
+            f"manifest={declared_bytes}, file={actual_bytes}"
+        )
+    checksum = str(manifest_entry.get("sha256", "")) or sha256_file(str(path))
+    return {
+        "tier": str(tier),
+        "path": str(relative_path),
+        "schema_version": schema,
+        "format_family": (
+            "composite_packed_hdf5"
+            if schema == COMPOSITE_HDF5_SCHEMA_VERSION
+            else "canonical_ragged_hdf5"
+        ),
+        "storage": storage,
+        "self_contained": bool(self_contained),
+        "structures": int(structures),
+        "atoms": int(atoms),
+        "bytes": actual_bytes,
+        "elements": elements,
+        "labels": label_counts,
+        "sources": dict(sorted((str(k), int(v)) for k, v in sources.items())),
+        "splits": dict(sorted((str(k), int(v)) for k, v in splits.items())),
+        "omat24_structures": int(omat24_structures),
+        "response_structures": int(response_structures),
+        "response_tier": response_tier,
+        "response_source_sha256": response_source_sha256,
+        "mechanisms": mechanisms,
+        "sha256": checksum,
+    }
+
+
+def _neo_viewer_balanced_indices(
+    split_values: np.ndarray,
+    desired_split: Any,
+    source_values: np.ndarray,
+    *,
+    target: int,
+    seed: int,
+    namespace: str,
+) -> np.ndarray:
+    candidates = np.flatnonzero(split_values == desired_split).astype(np.int64)
+    wanted = min(max(0, int(target)), int(candidates.size))
+    if wanted == 0:
+        return np.zeros((0,), dtype=np.int64)
+    groups: Dict[str, List[int]] = {}
+    for index in candidates:
+        groups.setdefault(str(source_values[int(index)]), []).append(int(index))
+    ranked_sources = sorted(
+        groups,
+        key=lambda source: hashlib.sha256(
+            f"neo-viewer-source-v1|{int(seed)}|{namespace}|{source}".encode()
+        ).hexdigest(),
+    )
+    selected: List[int] = []
+    for source in ranked_sources[:wanted]:
+        values = groups[source]
+        key = int(hashlib.sha256(
+            f"neo-viewer-row-v1|{int(seed)}|{namespace}|{source}".encode()
+        ).hexdigest()[:16], 16)
+        selected.append(values[key % len(values)])
+    if len(selected) < wanted:
+        selected_set = set(selected)
+        remaining = np.asarray(
+            [int(index) for index in candidates if int(index) not in selected_set],
+            dtype=np.int64,
+        )
+        need = wanted - len(selected)
+        namespace_code = int(hashlib.sha256(namespace.encode()).hexdigest()[:8], 16)
+        chosen = _stratified_interval_sample(
+            int(remaining.size), need, seed=int(seed),
+            source_order=namespace_code, split_code=0,
+        )
+        selected.extend(int(value) for value in remaining[chosen])
+    return np.asarray(sorted(selected), dtype=np.int64)
+
+
+def _neo_viewer_formula(numbers: np.ndarray) -> str:
+    return Atoms(numbers=np.asarray(numbers, dtype=int)).get_chemical_formula(
+        mode="hill"
+    )
+
+
+def _neo_viewer_canonical_example(
+    handle: Any,
+    index: int,
+    *,
+    tier: str,
+    relative_path: str,
+    hdf5_sha256: str,
+    viewer_split: str,
+) -> Dict[str, Any]:
+    atom_ptr = handle["structures/atom_ptr"]
+    start, end = int(atom_ptr[index]), int(atom_ptr[index + 1])
+    numbers = np.asarray(
+        handle["structures/atomic_numbers"][start:end], dtype=np.int16
+    )
+    available = sorted(
+        str(name) for name, dataset in handle["masks"].items()
+        if bool(dataset[index])
+    )
+    metadata = handle["metadata"]
+
+    def text_value(name: str, default: str = "") -> str:
+        return str(metadata[name].asstr()[index]) if name in metadata else default
+
+    def structure_value(name: str) -> Any:
+        if name not in available or name not in handle["labels"]:
+            return None
+        value = np.asarray(handle["labels"][name][index])
+        return value.item() if value.shape == () else value.tolist()
+
+    def atom_value(name: str) -> Any:
+        if name not in available or name not in handle["labels"]:
+            return None
+        return np.asarray(handle["labels"][name][start:end]).tolist()
+
+    sample_id = text_value("sample_id", f"{tier}-{index}")
+    digest = hashlib.sha256(
+        f"neo-viewer-example-v1|response|{tier}|{index}|{sample_id}".encode()
+    ).hexdigest()[:20]
+    normalized_stress = structure_value("stress_volume_normalized")
+    return {
+        "example_id": f"response-{digest}",
+        "viewer_split": str(viewer_split),
+        "hdf5_split": text_value("split"),
+        "component": "response",
+        "source_tier": str(tier),
+        "source": text_value("source", "unknown"),
+        "method_id": text_value("method_id", "unknown"),
+        "sample_id": sample_id,
+        "group_id": text_value("group_id", sample_id),
+        "system_id": text_value("system_id", sample_id),
+        "formula": _neo_viewer_formula(numbers),
+        "num_atoms": int(numbers.size),
+        "hdf5_path": str(relative_path),
+        "hdf5_sha256": str(hdf5_sha256),
+        "record_index": int(index),
+        "source_row_index": None,
+        "available_labels": available,
+        "atomic_numbers": numbers.tolist(),
+        "positions": np.asarray(
+            handle["structures/positions"][start:end], dtype=np.float64
+        ).tolist(),
+        "cell": np.asarray(
+            handle["structures/cell"][index], dtype=np.float64
+        ).tolist(),
+        "pbc": np.asarray(
+            handle["structures/pbc"][index], dtype=np.bool_
+        ).tolist(),
+        "energy": structure_value("energy"),
+        "forces": atom_value("forces"),
+        "stress": structure_value("stress"),
+        "stress_volume_normalized": (
+            bool(normalized_stress) if normalized_stress is not None else None
+        ),
+        "total_charge": structure_value("total_charge"),
+        "dipole": structure_value("dipole"),
+        "charges": atom_value("charges"),
+        "magnetic_moments": atom_value("magnetic_moments"),
+        "preview_only": True,
+    }
+
+
+def _neo_viewer_foundation_example(
+    handle: Any,
+    index: int,
+    *,
+    tier: str,
+    relative_path: str,
+    hdf5_sha256: str,
+    viewer_split: str,
+    file_paths: Sequence[str],
+) -> Dict[str, Any]:
+    packed = handle["sources/omat24/packed"]
+    atom_ptr = packed["atom_ptr"]
+    start, end = int(atom_ptr[index]), int(atom_ptr[index + 1])
+    numbers = np.asarray(packed["atomic_numbers"][start:end], dtype=np.int16)
+    source_order = int(handle["selection/source_order"][index])
+    source_path = str(file_paths[source_order])
+    corpus = Path(source_path).parts[0] if Path(source_path).parts else source_path
+    sample_id = str(packed["configuration_id"].asstr()[index])
+    material_id = str(packed["material_id"].asstr()[index])
+    digest = hashlib.sha256(
+        f"neo-viewer-example-v1|foundation|{tier}|{index}|{sample_id}".encode()
+    ).hexdigest()[:20]
+    return {
+        "example_id": f"foundation-{digest}",
+        "viewer_split": str(viewer_split),
+        "hdf5_split": ("train", "val", "test")[
+            int(handle["selection/split_code"][index])
+        ],
+        "component": "foundation",
+        "source_tier": str(tier),
+        "source": f"OMat24/{corpus}",
+        "method_id": str(packed.attrs.get("method_id", "OMat24/PBE+U")),
+        "sample_id": sample_id,
+        "group_id": material_id,
+        "system_id": material_id,
+        "formula": _neo_viewer_formula(numbers),
+        "num_atoms": int(numbers.size),
+        "hdf5_path": str(relative_path),
+        "hdf5_sha256": str(hdf5_sha256),
+        "record_index": int(index),
+        "source_row_index": int(handle["selection/source_row_index"][index]),
+        "available_labels": ["energy", "forces", "stress"],
+        "atomic_numbers": numbers.tolist(),
+        "positions": np.asarray(
+            packed["positions"][start:end], dtype=np.float64
+        ).tolist(),
+        "cell": np.asarray(packed["cell"][index], dtype=np.float64).tolist(),
+        "pbc": np.asarray(packed["pbc"][index], dtype=np.bool_).tolist(),
+        "energy": float(packed["energy"][index]),
+        "forces": np.asarray(
+            packed["forces"][start:end], dtype=np.float64
+        ).tolist(),
+        "stress": np.asarray(packed["stress"][index], dtype=np.float64).tolist(),
+        "stress_volume_normalized": bool(
+            packed["stress_volume_normalized"][index]
+        ),
+        "total_charge": None,
+        "dipole": None,
+        "charges": None,
+        "magnetic_moments": None,
+        "preview_only": True,
+    }
+
+
+def _neo_viewer_example_schema() -> Any:
+    nested_float = _pyarrow.list_(_pyarrow.list_(_pyarrow.float64()))
+    return _pyarrow.schema([
+        _pyarrow.field("example_id", _pyarrow.string(), nullable=False),
+        _pyarrow.field("viewer_split", _pyarrow.string(), nullable=False),
+        _pyarrow.field("hdf5_split", _pyarrow.string(), nullable=False),
+        _pyarrow.field("component", _pyarrow.string(), nullable=False),
+        _pyarrow.field("source_tier", _pyarrow.string(), nullable=False),
+        _pyarrow.field("source", _pyarrow.string(), nullable=False),
+        _pyarrow.field("method_id", _pyarrow.string(), nullable=False),
+        _pyarrow.field("sample_id", _pyarrow.string(), nullable=False),
+        _pyarrow.field("group_id", _pyarrow.string(), nullable=False),
+        _pyarrow.field("system_id", _pyarrow.string(), nullable=False),
+        _pyarrow.field("formula", _pyarrow.string(), nullable=False),
+        _pyarrow.field("num_atoms", _pyarrow.int32(), nullable=False),
+        _pyarrow.field("hdf5_path", _pyarrow.string(), nullable=False),
+        _pyarrow.field("hdf5_sha256", _pyarrow.string(), nullable=False),
+        _pyarrow.field("record_index", _pyarrow.int64(), nullable=False),
+        _pyarrow.field("source_row_index", _pyarrow.int64()),
+        _pyarrow.field("available_labels", _pyarrow.list_(_pyarrow.string())),
+        _pyarrow.field("atomic_numbers", _pyarrow.list_(_pyarrow.int16())),
+        _pyarrow.field("positions", nested_float),
+        _pyarrow.field("cell", nested_float),
+        _pyarrow.field("pbc", _pyarrow.list_(_pyarrow.bool_())),
+        _pyarrow.field("energy", _pyarrow.float64()),
+        _pyarrow.field("forces", nested_float),
+        _pyarrow.field("stress", nested_float),
+        _pyarrow.field("stress_volume_normalized", _pyarrow.bool_()),
+        _pyarrow.field("total_charge", _pyarrow.float64()),
+        _pyarrow.field("dipole", _pyarrow.list_(_pyarrow.float64())),
+        _pyarrow.field("charges", _pyarrow.list_(_pyarrow.float64())),
+        _pyarrow.field("magnetic_moments", nested_float),
+        _pyarrow.field("preview_only", _pyarrow.bool_(), nullable=False),
+    ])
+
+
+def _write_neo_viewer_parquet(
+    rows: Sequence[Dict[str, Any]],
+    path: Path,
+    *,
+    schema: Optional[Any] = None,
+) -> Dict[str, Any]:
+    if not rows:
+        raise ValueError(f"Refusing to write an empty Viewer table: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = _pyarrow.Table.from_pylist(list(rows), schema=schema)
+    _pyarrow_parquet.write_table(
+        table, str(path), compression="zstd", compression_level=9,
+        use_dictionary=True, write_statistics=True, version="2.6",
+        row_group_size=min(1024, max(1, int(table.num_rows))),
+    )
+    check = _pyarrow_parquet.ParquetFile(str(path))
+    if int(check.metadata.num_rows) != int(table.num_rows):
+        raise ValueError(f"Viewer Parquet row count changed for {path}")
+    return {
+        "rows": int(table.num_rows),
+        "columns": [str(name) for name in table.column_names],
+        "schema": str(table.schema),
+        "bytes": int(path.stat().st_size),
+        "sha256": sha256_file(str(path)),
+    }
+
+
+def build_neo_huggingface_viewer_tables(
+    neo_root: str,
+    *,
+    output_directory: Optional[str] = None,
+    tier_paths: Optional[Dict[str, str]] = None,
+    examples_per_component_split: int = 16,
+    seed: int = 20260725,
+    verify_hf_datasets: bool = False,
+    report_path: Optional[str] = None,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """Build bounded Parquet tables supported by the Hugging Face Viewer."""
+    if not HAS_H5PY or not HAS_PYARROW:
+        raise RuntimeError("Viewer table construction requires h5py and pyarrow")
+    root = Path(neo_root).expanduser().resolve()
+    output = Path(output_directory or root / "viewer").expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(str(root))
+    if output == root or output in root.parents:
+        raise ValueError(
+            "Viewer output must be a viewer directory, not the Neo root or its parent"
+        )
+    if output.exists():
+        if not overwrite:
+            raise FileExistsError(f"Viewer output already exists: {output}")
+        shutil.rmtree(output)
+    output.mkdir(parents=True, exist_ok=False)
+    paths = dict(tier_paths or NEO_HF_TIER_PATHS)
+    if not paths:
+        raise ValueError("Viewer construction requires at least one tier")
+    manifest_path = root / "manifest.json"
+    source_manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.is_file() else {"canonical_datasets": []}
+    )
+    manifest_entries = {
+        str(item.get("path", "")): dict(item)
+        for item in source_manifest.get("canonical_datasets", [])
+    }
+    details = [
+        _neo_viewer_tier_details(
+            root, tier, relative, manifest_entries.get(str(relative), {})
+        )
+        for tier, relative in paths.items()
+    ]
+    details_by_tier = {str(item["tier"]): item for item in details}
+    recommended_use = {
+        "tiny": "installation checks and short examples",
+        "small": "development experiments",
+        "standard": "default mixed-granularity training",
+        "se": "compact OMat24 foundation plus complete Standard response",
+        "large": "trajectory-rich response training",
+        "plus": "quarter-scale OMat24 foundation plus complete Large response",
+        "max": "full OMat24 foundation plus complete Large response",
+    }
+    tier_rows: List[Dict[str, Any]] = []
+    label_rows: List[Dict[str, Any]] = []
+    source_rows: List[Dict[str, Any]] = []
+    for order, item in enumerate(details):
+        labels = dict(item["labels"])
+        mechanisms = dict(item["mechanisms"])
+        tier_rows.append({
+            "tier_order": int(order),
+            "tier": str(item["tier"]),
+            "hdf5_path": str(item["path"]),
+            "structures": int(item["structures"]),
+            "atoms": int(item["atoms"]),
+            "bytes": int(item["bytes"]),
+            "decimal_gb": float(item["bytes"]) / 1_000_000_000.0,
+            "schema_version": str(item["schema_version"]),
+            "format_family": str(item["format_family"]),
+            "storage": str(item["storage"]),
+            "self_contained": bool(item["self_contained"]),
+            "omat24_structures": int(item["omat24_structures"]),
+            "response_structures": int(item["response_structures"]),
+            "response_tier": str(item["response_tier"]),
+            "element_count": int(len(item["elements"])),
+            "energy_labels": int(labels.get("energy", 0)),
+            "force_labels": int(labels.get("forces", 0)),
+            "stress_labels": int(labels.get("stress", 0)),
+            "piezoelectric_labels": int(labels.get("piezoelectric", 0)),
+            "spin_labels": int(labels.get("spins", 0)),
+            "stress_bec_piezoelectric": int(
+                mechanisms.get("stress_bec_piezoelectric", 0)
+            ),
+            "stress_spins": int(mechanisms.get("stress_spins", 0)),
+            "paired_magnetoelastic": int(
+                mechanisms.get("paired_magnetoelastic", 0)
+            ),
+            "sha256": str(item["sha256"]),
+            "response_source_sha256": item["response_source_sha256"],
+            "recommended_use": recommended_use.get(
+                str(item["tier"]), "specialized training"
+            ),
+            "authoritative_format": "HDF5",
+            "viewer_representation": "metadata and deterministic examples",
+            "complete_training_rows_in_viewer": False,
+        })
+        for label in sorted(labels):
+            count = int(labels[label])
+            label_rows.append({
+                "tier": str(item["tier"]),
+                "label": str(label),
+                "label_family": _neo_viewer_label_family(label),
+                "scope": "atom" if label in HDF5_ATOM_LABELS else "structure",
+                "unit": str(HDF5_UNITS.get(label, "unknown")),
+                "structures_with_label": count,
+                "fraction_of_tier": (
+                    float(count) / float(item["structures"])
+                    if int(item["structures"]) else 0.0
+                ),
+                "active": bool(count > 0),
+                "hdf5_path": str(item["path"]),
+                "hdf5_sha256": str(item["sha256"]),
+            })
+        for source, count in item["sources"].items():
+            source_rows.append({
+                "tier": str(item["tier"]),
+                "source": str(source),
+                "source_family": (
+                    "OMat24" if str(source).startswith("OMat24/")
+                    else str(source).split("/", 1)[0]
+                ),
+                "component": (
+                    "foundation" if str(source).startswith("OMat24/")
+                    else "response"
+                ),
+                "structures": int(count),
+                "fraction_of_tier": (
+                    float(count) / float(item["structures"])
+                    if int(item["structures"]) else 0.0
+                ),
+                "hdf5_path": str(item["path"]),
+                "hdf5_sha256": str(item["sha256"]),
+            })
+
+    example_rows: Dict[str, List[Dict[str, Any]]] = {
+        "train": [], "validation": [], "test": []
+    }
+    response_tier = "standard" if "standard" in paths else next(iter(paths))
+    response_relative = str(paths[response_tier])
+    with h5py.File(root / response_relative, "r") as handle:
+        split_values = np.asarray(handle["metadata/split"].asstr()[:], dtype=object)
+        source_values = np.asarray(handle["metadata/source"].asstr()[:], dtype=object)
+        for viewer_split, hdf5_split in (
+            ("train", "train"), ("validation", "val"), ("test", "test")
+        ):
+            indices = _neo_viewer_balanced_indices(
+                split_values, hdf5_split, source_values,
+                target=int(examples_per_component_split), seed=int(seed),
+                namespace=f"response|{response_tier}|{viewer_split}",
+            )
+            example_rows[viewer_split].extend(
+                _neo_viewer_canonical_example(
+                    handle, int(index), tier=response_tier,
+                    relative_path=response_relative,
+                    hdf5_sha256=str(details_by_tier[response_tier]["sha256"]),
+                    viewer_split=viewer_split,
+                )
+                for index in indices
+            )
+
+    foundation_tier = "se" if "se" in paths else next(
+        (item["tier"] for item in details if item["omat24_structures"] > 0), ""
+    )
+    if foundation_tier:
+        foundation_relative = str(paths[foundation_tier])
+        with h5py.File(root / foundation_relative, "r") as handle:
+            split_codes = np.asarray(handle["selection/split_code"], dtype=np.uint8)
+            source_orders = np.asarray(
+                handle["selection/source_order"], dtype=np.uint16
+            )
+            file_paths = [
+                str(value)
+                for value in handle["sources/omat24/file_paths"].asstr()[:]
+            ]
+            for split_code, viewer_split in enumerate(
+                ("train", "validation", "test")
+            ):
+                indices = _neo_viewer_balanced_indices(
+                    split_codes, int(split_code), source_orders,
+                    target=int(examples_per_component_split), seed=int(seed),
+                    namespace=f"foundation|{foundation_tier}|{viewer_split}",
+                )
+                example_rows[viewer_split].extend(
+                    _neo_viewer_foundation_example(
+                        handle, int(index), tier=foundation_tier,
+                        relative_path=foundation_relative,
+                        hdf5_sha256=str(
+                            details_by_tier[foundation_tier]["sha256"]
+                        ),
+                        viewer_split=viewer_split, file_paths=file_paths,
+                    )
+                    for index in indices
+                )
+
+    files: Dict[str, Dict[str, Any]] = {}
+    for split, rows in example_rows.items():
+        relative = f"viewer/structure_examples/{split}.parquet"
+        files[relative] = _write_neo_viewer_parquet(
+            rows, _neo_viewer_output_file(output, relative),
+            schema=_neo_viewer_example_schema(),
+        )
+    for relative, rows in (
+        ("viewer/tier_summary.parquet", tier_rows),
+        ("viewer/label_coverage.parquet", label_rows),
+        ("viewer/source_coverage.parquet", source_rows),
+    ):
+        files[relative] = _write_neo_viewer_parquet(
+            rows, _neo_viewer_output_file(output, relative)
+        )
+
+    viewer_manifest = {
+        "schema": "e3mu-huggingface-viewer-v1",
+        "created_at": _now(),
+        "dataset_viewer_ready": True,
+        "authoritative_training_format": "HDF5",
+        "viewer_scope": (
+            "Complete tier/label/source summaries plus deterministic bounded "
+            "real-structure examples; not a full Parquet copy of training data."
+        ),
+        "seed": int(seed),
+        "examples_per_component_split": int(examples_per_component_split),
+        "example_components": [
+            {"component": "response", "tier": response_tier},
+            *([{"component": "foundation", "tier": foundation_tier}]
+              if foundation_tier else []),
+        ],
+        "configs": _checkpoint_safe(NEO_HF_VIEWER_CONFIGS),
+        "files": files,
+        "source_manifest": "manifest.json" if manifest_path.is_file() else None,
+        "source_manifest_sha256": (
+            sha256_file(str(manifest_path)) if manifest_path.is_file() else None
+        ),
+        "tiers": [str(item["tier"]) for item in details],
+    }
+    viewer_manifest_path = output / "manifest.json"
+    viewer_manifest_path.write_text(
+        json.dumps(viewer_manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    result = validate_neo_huggingface_viewer_tables(
+        str(root), output_directory=str(output),
+        verify_hf_datasets=bool(verify_hf_datasets),
+    )
+    if not result["valid"]:
+        raise ValueError(
+            "Generated Viewer tables failed validation: "
+            + json.dumps(result["errors"], sort_keys=True)
+        )
+    result.update({
+        "output": str(output),
+        "manifest": str(viewer_manifest_path),
+        "generated_files": len(files),
+    })
+    if report_path:
+        report = Path(report_path).expanduser().resolve()
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            json.dumps(_checkpoint_safe(result), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return result
+
+
+def validate_neo_huggingface_viewer_tables(
+    neo_root: str,
+    *,
+    output_directory: Optional[str] = None,
+    readme_path: Optional[str] = None,
+    verify_hf_datasets: bool = False,
+    report_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate Viewer Parquet files, manifest routing, and optional HF loading."""
+    if not HAS_PYARROW:
+        raise RuntimeError("Viewer validation requires pyarrow")
+    root = Path(neo_root).expanduser().resolve()
+    output = Path(output_directory or root / "viewer").expanduser().resolve()
+    readme = Path(readme_path or root / "README.md").expanduser().resolve()
+    manifest_path = output / "manifest.json"
+    errors: List[str] = []
+    files_report: Dict[str, Dict[str, Any]] = {}
+    if not manifest_path.is_file():
+        errors.append("viewer/manifest.json is missing")
+        payload: Dict[str, Any] = {}
+    else:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if payload.get("schema") != "e3mu-huggingface-viewer-v1":
+            errors.append("Viewer manifest schema is unsupported")
+        if not bool(payload.get("dataset_viewer_ready")):
+            errors.append("Viewer manifest does not declare a ready dataset")
+        if payload.get("configs") != _checkpoint_safe(NEO_HF_VIEWER_CONFIGS):
+            errors.append("Viewer manifest config routing is stale")
+        if set(payload.get("files", {})) != set(NEO_HF_VIEWER_FILES[:-1]):
+            errors.append("Viewer manifest file registry is incomplete or stale")
+    for relative in NEO_HF_VIEWER_FILES:
+        path = _neo_viewer_output_file(output, relative)
+        if not path.is_file():
+            errors.append(f"missing Viewer file: {relative}")
+            continue
+        if path.suffix != ".parquet":
+            continue
+        parquet = _pyarrow_parquet.ParquetFile(str(path))
+        rows = int(parquet.metadata.num_rows)
+        expected = dict(payload.get("files", {}).get(relative, {}))
+        digest = sha256_file(str(path))
+        if rows <= 0:
+            errors.append(f"Viewer table is empty: {relative}")
+        if expected and rows != int(expected.get("rows", -1)):
+            errors.append(f"Viewer row count mismatch: {relative}")
+        if expected and digest != str(expected.get("sha256", "")):
+            errors.append(f"Viewer checksum mismatch: {relative}")
+        if expected and list(parquet.schema_arrow.names) != list(
+            expected.get("columns", [])
+        ):
+            errors.append(f"Viewer column registry mismatch: {relative}")
+        files_report[relative] = {
+            "rows": rows,
+            "columns": list(parquet.schema_arrow.names),
+            "bytes": int(path.stat().st_size),
+            "sha256": digest,
+        }
+    example_ids: List[str] = []
+    preview_references: List[Tuple[str, str, str]] = []
+    for split in ("train", "validation", "test"):
+        relative = f"viewer/structure_examples/{split}.parquet"
+        path = _neo_viewer_output_file(output, relative)
+        if not path.is_file():
+            continue
+        table = _pyarrow_parquet.read_table(
+            str(path), columns=[
+                "example_id", "viewer_split", "preview_only", "num_atoms",
+                "atomic_numbers", "positions", "hdf5_path", "hdf5_sha256",
+            ]
+        )
+        rows = table.to_pylist()
+        for row in rows:
+            example_ids.append(str(row["example_id"]))
+            if str(row["viewer_split"]) != split:
+                errors.append(f"Viewer split mismatch in {relative}")
+            if not bool(row["preview_only"]):
+                errors.append(f"Viewer example lacks preview_only in {relative}")
+            if int(row["num_atoms"]) != len(row["atomic_numbers"]):
+                errors.append(f"atomic-number length mismatch in {relative}")
+            if int(row["num_atoms"]) != len(row["positions"]):
+                errors.append(f"position length mismatch in {relative}")
+            if Path(str(row["hdf5_path"])).is_absolute():
+                errors.append(f"absolute HDF5 path in {relative}")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(row["hdf5_sha256"])):
+                errors.append(f"invalid HDF5 checksum in {relative}")
+            preview_references.append((
+                relative,
+                str(row["hdf5_path"]),
+                str(row["hdf5_sha256"]),
+            ))
+    if len(example_ids) != len(set(example_ids)):
+        errors.append("Viewer example IDs are not unique")
+    tier_path = _neo_viewer_output_file(output, "viewer/tier_summary.parquet")
+    tier_rows: List[Dict[str, Any]] = []
+    tier_by_path: Dict[str, Dict[str, Any]] = {}
+    if tier_path.is_file():
+        tier_rows = _pyarrow_parquet.read_table(
+            str(tier_path), columns=[
+                "tier", "structures", "sha256",
+                "complete_training_rows_in_viewer", "hdf5_path",
+            ]
+        ).to_pylist()
+        actual_tiers = [str(row["tier"]) for row in tier_rows]
+        declared_tiers = [str(value) for value in payload.get("tiers", [])]
+        expected_tiers = [
+            tier for tier in NEO_HF_TIER_PATHS if tier in declared_tiers
+        ]
+        if (
+            actual_tiers != declared_tiers
+            or actual_tiers != expected_tiers
+            or len(actual_tiers) != len(set(actual_tiers))
+        ):
+            errors.append(
+                "Viewer tier order disagrees with the formal release registry"
+            )
+        if any(bool(row["complete_training_rows_in_viewer"]) for row in tier_rows):
+            errors.append("Viewer summary mislabels preview rows as complete data")
+        tier_by_path = {str(row["hdf5_path"]): row for row in tier_rows}
+    for relative, hdf5_path, hdf5_sha256 in preview_references:
+        tier_row = tier_by_path.get(hdf5_path)
+        if tier_row is None:
+            errors.append(f"unregistered HDF5 reference in {relative}: {hdf5_path}")
+        elif str(tier_row["sha256"]) != hdf5_sha256:
+            errors.append(f"HDF5 checksum reference mismatch in {relative}")
+
+    label_path = _neo_viewer_output_file(output, "viewer/label_coverage.parquet")
+    if label_path.is_file():
+        label_rows = _pyarrow_parquet.read_table(str(label_path)).to_pylist()
+        for row in label_rows:
+            hdf5_path = str(row["hdf5_path"])
+            tier_row = tier_by_path.get(hdf5_path)
+            if tier_row is None or str(row["hdf5_sha256"]) != str(
+                tier_row.get("sha256", "") if tier_row else ""
+            ):
+                errors.append(f"invalid label-coverage HDF5 reference: {hdf5_path}")
+                continue
+            structures = int(tier_row["structures"])
+            count = int(row["structures_with_label"])
+            expected_fraction = float(count) / float(structures) if structures else 0.0
+            if count < 0 or count > structures or not math.isclose(
+                float(row["fraction_of_tier"]), expected_fraction,
+                rel_tol=1e-12, abs_tol=1e-15,
+            ):
+                errors.append(
+                    f"invalid label-coverage count or fraction: "
+                    f"{row['tier']}/{row['label']}"
+                )
+
+    source_path = _neo_viewer_output_file(output, "viewer/source_coverage.parquet")
+    if source_path.is_file():
+        source_rows = _pyarrow_parquet.read_table(str(source_path)).to_pylist()
+        source_totals: Dict[str, int] = collections.Counter()
+        for row in source_rows:
+            hdf5_path = str(row["hdf5_path"])
+            tier_row = tier_by_path.get(hdf5_path)
+            if tier_row is None or str(row["hdf5_sha256"]) != str(
+                tier_row.get("sha256", "") if tier_row else ""
+            ):
+                errors.append(f"invalid source-coverage HDF5 reference: {hdf5_path}")
+                continue
+            structures = int(tier_row["structures"])
+            count = int(row["structures"])
+            source_totals[str(row["tier"])] += count
+            expected_fraction = float(count) / float(structures) if structures else 0.0
+            if count < 0 or not math.isclose(
+                float(row["fraction_of_tier"]), expected_fraction,
+                rel_tol=1e-12, abs_tol=1e-15,
+            ):
+                errors.append(
+                    f"invalid source-coverage count or fraction: "
+                    f"{row['tier']}/{row['source']}"
+                )
+        for row in tier_rows:
+            tier = str(row["tier"])
+            if int(source_totals.get(tier, 0)) != int(row["structures"]):
+                errors.append(f"source coverage does not sum to tier size: {tier}")
+    readme_text = readme.read_text(encoding="utf-8") if readme.is_file() else ""
+    for config_name, split_map in NEO_HF_VIEWER_CONFIGS.items():
+        if f"config_name: {config_name}" not in readme_text:
+            errors.append(f"README is missing Viewer config {config_name}")
+        for relative in split_map.values():
+            if str(relative) not in readme_text:
+                errors.append(f"README is missing Viewer path {relative}")
+    hf_report: Dict[str, Any] = {"verified": False}
+    if verify_hf_datasets and not errors:
+        try:
+            import datasets as hf_datasets
+
+            loaded: Dict[str, Dict[str, int]] = {}
+            for config_name, split_map in NEO_HF_VIEWER_CONFIGS.items():
+                dataset = hf_datasets.load_dataset(
+                    str(root), name=config_name,
+                )
+                split_rows = {
+                    str(split): int(len(values)) for split, values in dataset.items()
+                }
+                expected_splits = set(split_map)
+                if set(split_rows) != expected_splits:
+                    raise ValueError(
+                        f"config {config_name} splits are {sorted(split_rows)}, "
+                        f"expected {sorted(expected_splits)}"
+                    )
+                loaded[config_name] = split_rows
+            hf_report = {
+                "verified": True,
+                "datasets_version": str(hf_datasets.__version__),
+                "configs": loaded,
+            }
+        except Exception as exc:
+            errors.append(f"Hugging Face Datasets load failed: {exc}")
+    result = {
+        "schema": "e3mu-huggingface-viewer-validation-v1",
+        "path": str(output),
+        "valid": not errors,
+        "errors": errors,
+        "files": files_report,
+        "configs": _checkpoint_safe(NEO_HF_VIEWER_CONFIGS),
+        "examples": len(example_ids),
+        "hf_datasets": hf_report,
+        "viewer_scope": payload.get("viewer_scope"),
+    }
+    if report_path:
+        report = Path(report_path).expanduser().resolve()
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            json.dumps(_checkpoint_safe(result), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return result
+
+
 def _select_balanced_half_composite_indices(
     source_orders: np.ndarray,
     row_indices: np.ndarray,
@@ -6707,6 +7688,18 @@ def prepare_neo_huggingface_release(
     if missing:
         raise FileNotFoundError(f"Release metadata is incomplete: {missing}")
 
+    viewer_source = root / "viewer"
+    viewer_validation: Optional[Dict[str, Any]] = None
+    if viewer_source.exists():
+        if not viewer_source.is_dir():
+            raise ValueError(f"Neo Viewer path is not a directory: {viewer_source}")
+        viewer_validation = validate_neo_huggingface_viewer_tables(str(root))
+        if not bool(viewer_validation.get("valid")):
+            raise ValueError(
+                "Neo Viewer tables are not release-ready: "
+                + json.dumps(viewer_validation.get("errors", []), sort_keys=True)
+            )
+
     registry = json.loads(
         (root / "provenance/source_registry.json").read_text(encoding="utf-8")
     )
@@ -6773,6 +7766,13 @@ def prepare_neo_huggingface_release(
         unique_metadata[relative] = source
     for relative, source in sorted(unique_metadata.items()):
         _copy_neo_release_metadata(source, output / relative, root)
+
+    if viewer_validation is not None:
+        for relative in NEO_HF_VIEWER_FILES:
+            source = root / relative
+            destination = output / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
 
     (output / ".gitignore").write_text(
         ".DS_Store\n.cache/\n*.partial\n*.building\n",
@@ -6898,6 +7898,10 @@ def prepare_neo_huggingface_release(
         if relative in staged_hdf5:
             item["source_sha256"] = staged_hdf5[relative]["source_sha256"]
             item["role"] = "canonical_hdf5_tier"
+        elif relative.startswith("viewer/") and relative.endswith(".parquet"):
+            item["role"] = "dataset_viewer_table"
+        elif relative == "viewer/manifest.json":
+            item["role"] = "dataset_viewer_manifest"
         else:
             item["role"] = "documentation_or_provenance"
         release_files.append(item)
@@ -6917,11 +7921,27 @@ def prepare_neo_huggingface_release(
         ),
         "rights_issues": rights_issues,
         "tiers": staged_tiers,
+        "dataset_viewer": {
+            "included": viewer_validation is not None,
+            "validation_schema": (
+                viewer_validation.get("schema")
+                if viewer_validation is not None else None
+            ),
+            "configs": (
+                viewer_validation.get("configs", {})
+                if viewer_validation is not None else {}
+            ),
+            "examples": (
+                int(viewer_validation.get("examples", 0))
+                if viewer_validation is not None else 0
+            ),
+        },
         "files": release_files,
         "transformations": [
             "Sanitized absolute local paths in release JSON and HDF5 root metadata.",
             "Completed units_json from the e3mu-hdf5-v1 schema registry.",
             "Added release source checksum and metadata-only transformation attributes.",
+            "Copied validated bounded Parquet Viewer tables without expanding HDF5 rows.",
             "Did not modify any numerical HDF5 dataset, mask, ID, or split.",
         ],
         "excluded": [
@@ -7835,6 +8855,28 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     command.add_argument("neo_root")
     command.add_argument("--output")
 
+    command = subparsers.add_parser(
+        "dataset-viewer-build",
+        help="Build bounded Hugging Face Dataset Viewer Parquet tables",
+    )
+    command.add_argument("neo_root")
+    command.add_argument("--output-directory")
+    command.add_argument("--examples-per-component-split", type=int, default=16)
+    command.add_argument("--seed", type=int, default=20260725)
+    command.add_argument("--verify-hf-datasets", action="store_true")
+    command.add_argument("--report")
+    command.add_argument("--overwrite", action="store_true")
+
+    command = subparsers.add_parser(
+        "dataset-viewer-validate",
+        help="Validate Dataset Viewer tables, checksums, and Dataset Card routing",
+    )
+    command.add_argument("neo_root")
+    command.add_argument("--output-directory")
+    command.add_argument("--readme")
+    command.add_argument("--verify-hf-datasets", action="store_true")
+    command.add_argument("--report")
+
     command = subparsers.add_parser("dataset-omat-composite-build", help="Build Neo Plus/Max from OMat24 + Large")
     command.add_argument("omat_root"); command.add_argument("large_hdf5"); command.add_argument("output"); command.add_argument("--tier", required=True, choices=("plus", "max")); command.add_argument("--seed", type=int, default=20260722); command.add_argument("--report"); command.add_argument("--overwrite", action="store_true")
     command = subparsers.add_parser("dataset-composite-half-build", help="Build local self-contained Standard + 1/N OMat24 corpus")
@@ -7926,6 +8968,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif command == "dataset-validate": result = validate_neo_hdf5(args.input); _write_json(args.output, result)
     elif command == "dataset-summary": result = inspect_composite_dataset(args.input, verify_sources=False) if _core._is_composite_hdf5_path(args.input) else hdf5_dataset_summary(args.input); _write_json(args.output, result)
     elif command == "dataset-format-inventory": result = analyze_neo_dataset_formats(args.neo_root, output_path=args.output)
+    elif command == "dataset-viewer-build":
+        result = build_neo_huggingface_viewer_tables(
+            args.neo_root,
+            output_directory=args.output_directory,
+            examples_per_component_split=args.examples_per_component_split,
+            seed=args.seed,
+            verify_hf_datasets=args.verify_hf_datasets,
+            report_path=args.report,
+            overwrite=args.overwrite,
+        )
+    elif command == "dataset-viewer-validate":
+        result = validate_neo_huggingface_viewer_tables(
+            args.neo_root,
+            output_directory=args.output_directory,
+            readme_path=args.readme,
+            verify_hf_datasets=args.verify_hf_datasets,
+            report_path=args.report,
+        )
     elif command == "dataset-omat-composite-build": result = build_neo_omat24_composite(args.omat_root, args.large_hdf5, args.output, tier=args.tier, seed=args.seed, overwrite=args.overwrite, report_path=args.report)
     elif command == "dataset-composite-half-build": result = build_neo_composite_half(args.parent, args.standard, args.output, seed=args.seed, omat_denominator=args.omat_denominator, max_bytes=int(float(args.max_mb) * 1_000_000), overwrite=args.overwrite, report_path=args.report)
     elif command == "dataset-composite-embed-omat": result = embed_omat24_parquet_in_composite(args.input, output_path=args.output, chunk_bytes=int(float(args.chunk_mb) * 1024 * 1024), overwrite=args.overwrite, report_path=args.report)

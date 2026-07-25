@@ -37,7 +37,7 @@ architecture.*
   screening, physical-group local refinement, and independent confirmation.
 - **Data tooling:** canonical ragged HDF5, deterministic tier construction,
   strict validation, provenance records, source-specific masking, and
-  rights-aware Hugging Face staging.
+  rights-aware Hugging Face staging with supported Dataset Viewer tables.
 
 ## Effective Hamiltonian
 
@@ -143,7 +143,7 @@ python E3_miu_GNN.py evaluate \
 Canonical HDF5 training and evaluation stream structures and labels by
 default. Exact neighbor topology is cached once in a read-only, memory-mapped
 layout, CPU assembly is bounded to a two-batch prefetch window, and only the
-current batch is transferred to the accelerator. Plus and Max use lossless
+current batch is transferred to the accelerator. SE, Plus, and Max use lossless
 packed HDF5 arrays; contiguous rows are fetched as a batch and Composite caches
 use the same source-, selection-, cutoff-, and backend-keyed exact topology
 format. Use `--no-stream-hdf5` only for materialized debug comparisons; legacy
@@ -165,6 +165,14 @@ training-optimized packed layout without overwriting the source:
 python Datasets_Preparation.py dataset-composite-pack-omat \
   neo_plus_l1_l2_l3.h5 \
   --output neo_plus_l1_l2_l3_packed.h5
+```
+
+Build and locally verify the Hugging Face Dataset Viewer tables without
+duplicating the complete HDF5 training rows:
+
+```bash
+python Datasets_Preparation.py dataset-viewer-build \
+  Datasets/Neo --verify-hf-datasets --overwrite
 ```
 
 Run `python E3_miu_GNN.py --help` for training, evaluation, self-test, and GUI
@@ -227,11 +235,17 @@ physical parent groups, and fixed train/validation/test splits. Missing labels
 are never fabricated, and incompatible absolute energy references are not
 silently mixed.
 
+The Hugging Face repository also exposes bounded real-structure previews and
+complete tier, label, and source summary tables. These Parquet views support
+browser inspection; the self-contained HDF5 files remain authoritative for
+training.
+
 | Neo tier | Structures | Approximate size | Intended use | Download |
 | --- | ---: | ---: | --- | --- |
 | Tiny | 5,780 | 21.0 MB | Fast functional checks | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
 | Small | 16,703 | 53.7 MB | Intermediate experiments | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
 | Standard | 46,414 | 129.7 MB | Portable mixed-granularity training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
+| SE | 605,693 | 741.20 MB portable single-file HDF5 | Exact 1/180 OMat24 foundation + complete Standard response corpus | Hugging Face release candidate |
 | Large | 613,267 | 1.31 GB | Trajectory-rich training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
 | Plus | 25,819,271 | 41.06 GB portable single-file HDF5 | 25% material-family OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
 | Max | 101,283,549 | 138.04 GB portable single-file HDF5 | Full deduplicated OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
@@ -243,6 +257,12 @@ arrays under `sources/omat24/packed`. Geometry and labels retain their source
 float64 values without quantization. Copying the single `.h5` file to another
 machine does not require the original OMat24 tree, and the original row number
 remains in `selection/source_row_index`.
+
+SE uses the same self-contained Composite schema with 559,279 deterministically
+selected OMat24 structures (exactly `1/180` of the Max selector) and all 46,414
+Standard response structures. It contains 605,693 structures and 582,152 stress
+labels in 741,200,832 bytes. SE is byte-identical to the retained local compact
+mirror; its SHA-256 is `94b9b8d5aca418dfdf7344c5abc4bdeaba9aa49c87b6a51dda043ebb85370e03`.
 
 Max contains 100,670,282 unique OMat24 configurations after removing 154,252
 duplicate configuration IDs, plus all 613,267 Large records. It uses the same
