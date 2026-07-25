@@ -1184,10 +1184,15 @@ class AtomicData(_TGData):
             dtype=torch.get_default_dtype(),
         ).reshape(int(data.num_nodes), 3)
 
-        if "field" in props:
+        has_field = "field" in props
+        if has_field:
             data.field = torch.tensor(np.asarray(props["field"], dtype=float), dtype=torch.get_default_dtype()).view(1, 3)
         else:
             data.field = torch.zeros((1, 3), dtype=torch.get_default_dtype())
+        data.field_weight = torch.tensor(
+            float(wts.get("field", 1.0 if has_field else 0.0)),
+            dtype=torch.get_default_dtype(),
+        )
 
         if "dipole" in props:
             data.dipole = torch.tensor(np.asarray(props["dipole"], dtype=float), dtype=torch.get_default_dtype()).view(1, 3)
@@ -1199,7 +1204,12 @@ class AtomicData(_TGData):
         else:
             data.polarizability = torch.zeros((1, 3, 3), dtype=torch.get_default_dtype())
 
+        has_total_charge = "total_charge" in props
         data.total_charge = torch.tensor(float(props.get("total_charge", 0.0)), dtype=torch.get_default_dtype())
+        data.total_charge_weight = torch.tensor(
+            float(wts.get("total_charge", 1.0 if has_total_charge else 0.0)),
+            dtype=torch.get_default_dtype(),
+        )
 
         # Per-property weights (0 for missing labels).
         data.energy_weight = torch.tensor(
@@ -2294,6 +2304,104 @@ def _read_hdf5_configuration_at(
     )
 
 
+def _read_hdf5_configurations_at(
+    handle: Any,
+    plan: HDF5StreamPlan,
+    indices: Sequence[int],
+    *,
+    include_labels: bool = True,
+) -> List[Configuration]:
+    """Read one batch with coalesced structure and ragged atom-array access."""
+    requested = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if requested.size == 0:
+        return []
+    unique, inverse = np.unique(requested, return_inverse=True)
+    if np.any((unique < 0) | (unique >= len(plan.group_ids))):
+        raise IndexError("Canonical HDF5 structure index is out of range")
+    starts = np.asarray(plan.atom_ptr[unique], dtype=np.int64)
+    ends = np.asarray(plan.atom_ptr[unique + 1], dtype=np.int64)
+
+    def ragged_rows(dataset: Any, selected: np.ndarray) -> Dict[int, np.ndarray]:
+        selected = np.asarray(selected, dtype=np.int64).reshape(-1)
+        output: Dict[int, np.ndarray] = {}
+        cursor = 0
+        while cursor < selected.size:
+            run_end = cursor + 1
+            while (
+                run_end < selected.size
+                and int(starts[selected[run_end]]) == int(ends[selected[run_end - 1]])
+            ):
+                run_end += 1
+            atom_start = int(starts[selected[cursor]])
+            atom_end = int(ends[selected[run_end - 1]])
+            block = np.asarray(dataset[atom_start:atom_end])
+            local = 0
+            for offset in range(cursor, run_end):
+                unique_position = int(selected[offset])
+                count = int(ends[unique_position] - starts[unique_position])
+                output[unique_position] = block[local:local + count]
+                local += count
+            cursor = run_end
+        return output
+
+    structures = handle["structures"]
+    all_unique_positions = np.arange(unique.size, dtype=np.int64)
+    numbers = ragged_rows(structures["atomic_numbers"], all_unique_positions)
+    positions = ragged_rows(structures["positions"], all_unique_positions)
+    cells = np.asarray(structures["cell"][unique.tolist()], dtype=float)
+    pbc_values = np.asarray(structures["pbc"][unique.tolist()], dtype=bool)
+    properties: List[Dict[str, Any]] = [
+        {"group_id": plan.group_ids[int(index)]} for index in unique
+    ]
+    weights: List[Dict[str, float]] = [{} for _index in unique]
+
+    if include_labels:
+        labels = handle["labels"]
+        for name in HDF5_STRUCTURE_LABELS:
+            mask = plan.label_masks.get(name)
+            if mask is None or name not in labels:
+                continue
+            active = np.flatnonzero(np.asarray(mask, dtype=bool)[unique])
+            if active.size == 0:
+                continue
+            values = np.asarray(labels[name][unique[active].tolist()])
+            for value_position, unique_position in enumerate(active):
+                value = np.asarray(values[value_position])
+                properties[int(unique_position)][name] = (
+                    float(value) if value.shape == () else value
+                )
+                weights[int(unique_position)][name] = 1.0
+        for name in HDF5_ATOM_LABELS:
+            mask = plan.label_masks.get(name)
+            if mask is None or name not in labels:
+                continue
+            active = np.flatnonzero(np.asarray(mask, dtype=bool)[unique])
+            if active.size == 0:
+                continue
+            values = ragged_rows(labels[name], active)
+            for unique_position, value in values.items():
+                properties[unique_position][name] = value
+                weights[unique_position][name] = 1.0
+        for name, values in plan.metadata_values.items():
+            for unique_position, structure_index in enumerate(unique):
+                properties[unique_position][name] = values[int(structure_index)]
+
+    configurations = [
+        Configuration(
+            atomic_numbers=np.asarray(numbers[position], dtype=int),
+            positions=np.asarray(positions[position], dtype=float),
+            properties=properties[position],
+            property_weights=weights[position],
+            cell=cells[position],
+            pbc=tuple(bool(value) for value in pbc_values[position]),
+            config_type="Default",
+            head=str(properties[position].get("method_id", "Default")),
+        )
+        for position in range(unique.size)
+    ]
+    return [configurations[int(position)] for position in inverse]
+
+
 def fit_atomic_energies_from_hdf5_plan(
     plan: HDF5StreamPlan, zs: Sequence[int]
 ) -> np.ndarray:
@@ -2736,6 +2844,231 @@ def build_hdf5_topology_cache(
     return str(cache_path)
 
 
+class _CompositeGlobalIdSequence:
+    """Expose composite cache ids without allocating one int64 array per split."""
+
+    def __init__(
+        self,
+        omat_indices: Sequence[int],
+        large_indices: Sequence[int],
+        *,
+        large_offset: int,
+    ) -> None:
+        self.omat_indices = np.asarray(omat_indices)
+        self.large_indices = np.asarray(large_indices)
+        self.large_offset = int(large_offset)
+        self.size = int(self.omat_indices.size + self.large_indices.size)
+        self.shape = (self.size,)
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, (int, np.integer)):
+            index = int(key)
+            if index < 0:
+                index += self.size
+            if not 0 <= index < self.size:
+                raise IndexError(index)
+            if index < self.omat_indices.size:
+                return int(self.omat_indices[index])
+            return self.large_offset + int(
+                self.large_indices[index - self.omat_indices.size]
+            )
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self.size)
+            if step != 1:
+                return self[np.arange(start, stop, step, dtype=np.int64)]
+            omat_end = min(stop, int(self.omat_indices.size))
+            parts: List[np.ndarray] = []
+            if start < omat_end:
+                parts.append(
+                    np.asarray(self.omat_indices[start:omat_end], dtype=np.int64)
+                )
+            large_start = max(start, int(self.omat_indices.size))
+            if large_start < stop:
+                local_start = large_start - int(self.omat_indices.size)
+                local_stop = stop - int(self.omat_indices.size)
+                parts.append(
+                    np.asarray(
+                        self.large_indices[local_start:local_stop], dtype=np.int64
+                    )
+                    + self.large_offset
+                )
+            if not parts:
+                return np.empty((0,), dtype=np.int64)
+            return parts[0] if len(parts) == 1 else np.concatenate(parts)
+        indices = np.asarray(key, dtype=np.int64)
+        flat = indices.reshape(-1).copy()
+        flat[flat < 0] += self.size
+        if np.any((flat < 0) | (flat >= self.size)):
+            raise IndexError("Composite cache id index is out of range")
+        result = np.empty(flat.shape, dtype=np.int64)
+        omat_mask = flat < self.omat_indices.size
+        if np.any(omat_mask):
+            result[omat_mask] = self.omat_indices[flat[omat_mask]]
+        if np.any(~omat_mask):
+            result[~omat_mask] = (
+                self.large_indices[flat[~omat_mask] - self.omat_indices.size]
+                + self.large_offset
+            )
+        return result.reshape(indices.shape)
+
+
+class _TopologyCacheRowMapping:
+    """Map dataset positions to cache rows only for the requested batch."""
+
+    _BLOCK_SIZE = 4096
+    _MAX_CACHED_BLOCKS = 64
+
+    def __init__(self, global_ids: np.ndarray, selected_ids: Sequence[int]) -> None:
+        self.global_ids = global_ids
+        self.selected_ids = selected_ids
+        self.size = int(len(selected_ids))
+        self.shape = (self.size,)
+        self.dtype = _compact_unsigned_dtype_for_upper_bound(
+            max(0, int(global_ids.size) - 1)
+        )
+        self._blocks: collections.OrderedDict[int, np.ndarray] = (
+            collections.OrderedDict()
+        )
+        self._full_rows: Optional[np.ndarray] = None
+        self.cache_hits = 0
+        self.cache_misses = 0
+        if self.size:
+            # Boundary checks catch a wrong cache immediately. Full coverage is
+            # checked chunk-by-chunk when rows are actually consumed.
+            self._validate_position(0)
+            self._validate_position(self.size - 1)
+
+    def __len__(self) -> int:
+        return self.size
+
+    def _validate_position(self, position: int) -> None:
+        requested = int(self.selected_ids[int(position)])
+        row = int(np.searchsorted(self.global_ids, requested))
+        if row >= int(self.global_ids.size) or int(self.global_ids[row]) != requested:
+            raise ValueError("Topology cache does not cover dataset indices")
+
+    def _resolve_block(self, block_index: int) -> np.ndarray:
+        key = int(block_index)
+        cached = self._blocks.pop(key, None)
+        if cached is not None:
+            self._blocks[key] = cached
+            self.cache_hits += 1
+            return cached
+        start = key * self._BLOCK_SIZE
+        end = min(self.size, start + self._BLOCK_SIZE)
+        requested = self.selected_ids[start:end]
+        values = np.asarray(requested, dtype=np.int64)
+        rows = np.searchsorted(self.global_ids, values)
+        rows_array = np.asarray(rows, dtype=np.int64)
+        in_range = rows_array < int(self.global_ids.size)
+        safe_rows = np.minimum(rows_array, max(0, int(self.global_ids.size) - 1))
+        covered = in_range & (np.asarray(self.global_ids[safe_rows]) == values)
+        if not bool(np.all(covered)):
+            raise ValueError("Topology cache does not cover dataset indices")
+        resolved = rows_array.astype(self.dtype, copy=False)
+        self._blocks[key] = resolved
+        self.cache_misses += 1
+        total_blocks = int(math.ceil(self.size / self._BLOCK_SIZE))
+        if (
+            total_blocks <= self._MAX_CACHED_BLOCKS
+            and len(self._blocks) == total_blocks
+        ):
+            self._full_rows = np.concatenate([
+                self._blocks[index] for index in range(total_blocks)
+            ])
+            self._blocks.clear()
+            return self._full_rows[start:end]
+        while len(self._blocks) > self._MAX_CACHED_BLOCKS:
+            self._blocks.popitem(last=False)
+        return resolved
+
+    def __getitem__(self, key: Any) -> Any:
+        if self._full_rows is not None:
+            value = self._full_rows[key]
+            return int(value) if np.isscalar(value) else value
+        scalar = isinstance(key, (int, np.integer))
+        if scalar:
+            positions = np.asarray([int(key)], dtype=np.int64)
+        elif isinstance(key, slice):
+            start, stop, step = key.indices(self.size)
+            positions = np.arange(start, stop, step, dtype=np.int64)
+        else:
+            positions = np.asarray(key, dtype=np.int64)
+        shape = positions.shape
+        flat = positions.reshape(-1).copy()
+        flat[flat < 0] += self.size
+        if np.any((flat < 0) | (flat >= self.size)):
+            raise IndexError("Topology cache row index is out of range")
+        output = np.empty(flat.shape, dtype=self.dtype)
+        if flat.size:
+            block_indices = flat // self._BLOCK_SIZE
+            for block_index in np.unique(block_indices):
+                selected = block_indices == block_index
+                block = self._resolve_block(int(block_index))
+                output[selected] = block[
+                    flat[selected] - int(block_index) * self._BLOCK_SIZE
+                ]
+        if scalar:
+            return int(output[0])
+        return output.reshape(shape)
+
+
+class _TopologyEdgeCountView:
+    """Array-like edge counts backed by cache rows and a contiguous memmap."""
+
+    def __init__(self, owner: "_TopologyCacheView") -> None:
+        self.owner = owner
+        self.size = int(len(owner.cache_rows))
+        self.shape = (self.size,)
+        self.dtype = np.dtype(np.int64)
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, key: Any) -> Any:
+        rows = self.owner._resolved_cache_rows(key)
+        values = self.owner._indexed("edge_counts", rows)
+        if np.isscalar(values):
+            return int(values)
+        return np.asarray(values, dtype=np.int64)
+
+    def __iter__(self) -> Iterable[int]:
+        chunk_size = 65536
+        for start in range(0, self.size, chunk_size):
+            for value in np.asarray(self[start:start + chunk_size]).reshape(-1):
+                yield int(value)
+
+    def sum(
+        self,
+        axis: Optional[int] = None,
+        dtype: Optional[np.dtype] = None,
+        out: Any = None,
+        keepdims: bool = False,
+        initial: Any = None,
+        where: Any = True,
+    ) -> Any:
+        if axis not in (None, 0, -1):
+            raise ValueError("edge-count view is one-dimensional")
+        if out is not None or where is not True:
+            materialized = np.asarray(list(self), dtype=dtype or np.int64)
+            return materialized.sum(
+                axis=axis, dtype=dtype, out=out, keepdims=keepdims,
+                initial=initial, where=where,
+            )
+        total = 0 if initial is None else initial
+        chunk_size = 1_000_000
+        for start in range(0, self.size, chunk_size):
+            total += np.sum(
+                self[start:start + chunk_size], dtype=dtype or np.int64
+            )
+        if keepdims:
+            return np.asarray([total], dtype=dtype or np.int64)
+        return total
+
+
 class _TopologyCacheView:
     """Read an exact topology cache for an arbitrary dataset index space.
 
@@ -2745,19 +3078,23 @@ class _TopologyCacheView:
     ordering.
     """
 
+    _SMALL_METADATA_PROMOTION_BYTES = 32 * 1024 * 1024
+
     def __init__(self, path: str, selected_ids: Sequence[int]) -> None:
         self.path = str(path)
-        requested = np.asarray(selected_ids, dtype=np.int64).reshape(-1)
-        self.cache_rows: np.ndarray
+        self.cache_rows: Any
+        self._row_mapping: _TopologyCacheRowMapping
         self.edge_ptr: Any = None
         self.shift_ptr: Any = None
         self.shift_value_ptr: Any = None
-        self.edge_counts: np.ndarray
+        self.edge_counts: _TopologyEdgeCountView
         self._arrays: Dict[str, Any] = {}
+        self._hdf5_names: set[str] = set()
         self._mmap_specs: Dict[str, Tuple[int, np.dtype, Tuple[int, ...]]] = {}
         self._mmap_arrays: Dict[str, np.memmap] = {}
         self._global_index_mmap: Optional[np.memmap] = None
         self._handle: Any = None
+        self._metadata_promoted = False
         with h5py.File(self.path, "r") as cache:
             global_dataset = cache["global_indices"]
             global_offset = global_dataset.id.get_offset()
@@ -2773,12 +3110,8 @@ class _TopologyCacheView:
                 self._global_index_mmap = global_ids
             else:
                 global_ids = np.asarray(global_dataset[:], dtype=np.int64)
-            rows = np.searchsorted(global_ids, requested)
-            if np.any(rows >= global_ids.size) or not np.array_equal(
-                global_ids[rows], requested
-            ):
-                raise ValueError("Topology cache does not cover dataset indices")
-            self.cache_rows = rows.astype(np.int64, copy=False)
+            self._row_mapping = _TopologyCacheRowMapping(global_ids, selected_ids)
+            self.cache_rows = self._row_mapping
             required = {
                 "edge_ptr", "edge_counts", "edge_index", "shift_ptr",
                 "shift_value_ptr",
@@ -2788,15 +3121,6 @@ class _TopologyCacheView:
                 raise ValueError(
                     "Topology cache is missing required fields: " + ", ".join(missing)
                 )
-            if self.cache_rows.size:
-                sorted_rows = np.sort(self.cache_rows)
-                sorted_counts = np.asarray(
-                    cache["edge_counts"][sorted_rows.tolist()], dtype=np.int64
-                )
-                restore = np.searchsorted(sorted_rows, self.cache_rows)
-                self.edge_counts = sorted_counts[restore]
-            else:
-                self.edge_counts = np.zeros((0,), dtype=np.int64)
             for name in ("edge_ptr", "shift_ptr", "shift_value_ptr", "edge_counts"):
                 self._register_dataset(cache, name)
             for name in (
@@ -2812,6 +3136,7 @@ class _TopologyCacheView:
                 "shift_nonzero_indices", "shift_nonzero_values"
             }.issubset(cache.keys()):
                 raise ValueError("Topology cache has no supported shift representation")
+        self.edge_counts = _TopologyEdgeCountView(self)
 
     def _register_dataset(self, handle: Any, name: str) -> None:
         dataset = handle[name]
@@ -2823,17 +3148,38 @@ class _TopologyCacheView:
                 tuple(int(value) for value in dataset.shape),
             )
         else:
-            self._arrays[name] = np.asarray(dataset[:])
+            # Chunked legacy caches stay HDF5-backed and are sliced on demand.
+            self._hdf5_names.add(str(name))
 
     def _ensure(self) -> None:
-        if self._handle is not None:
+        if self._mmap_arrays or self._handle is not None:
             return
-        self._handle = h5py.File(self.path, "r")
+        if self._hdf5_names:
+            self._handle = h5py.File(self.path, "r")
         for name, (offset, dtype, shape) in self._mmap_specs.items():
             self._mmap_arrays[name] = np.memmap(
                 self.path, mode="r", offset=offset, dtype=dtype,
                 shape=shape, order="C"
             )
+        if not self._metadata_promoted:
+            metadata_names = (
+                "edge_ptr", "shift_ptr", "shift_value_ptr", "edge_counts"
+            )
+            metadata_bytes = sum(
+                int(self._mmap_arrays[name].nbytes)
+                for name in metadata_names
+                if name in self._mmap_arrays
+            )
+            if metadata_bytes <= self._SMALL_METADATA_PROMOTION_BYTES:
+                for name in metadata_names:
+                    mapped = self._mmap_arrays.pop(name, None)
+                    if mapped is None:
+                        continue
+                    self._arrays[name] = np.asarray(mapped).copy()
+                    mmap = getattr(mapped, "_mmap", None)
+                    if mmap is not None:
+                        mmap.close()
+            self._metadata_promoted = True
 
     def _value(self, name: str, index: int) -> Any:
         array = self._mmap_arrays.get(name, self._arrays.get(name))
@@ -2847,21 +3193,66 @@ class _TopologyCacheView:
             return np.asarray(array[int(start):int(end)])
         return np.asarray(self._handle[name][int(start):int(end)])
 
+    def _indexed(self, name: str, rows: Any) -> Any:
+        self._ensure()
+        array = self._mmap_arrays.get(name, self._arrays.get(name))
+        if np.isscalar(rows):
+            if array is not None:
+                return array[int(rows)]
+            return self._handle[name][int(rows)]
+        indices = np.asarray(rows, dtype=np.int64)
+        if array is not None:
+            return np.asarray(array[indices])
+        flat = indices.reshape(-1)
+        unique, inverse = np.unique(flat, return_inverse=True)
+        values = np.asarray(self._handle[name][unique.tolist()])
+        return values[inverse].reshape(indices.shape + values.shape[1:])
+
+    def _has_dataset(self, name: str) -> bool:
+        return bool(
+            name in self._mmap_specs
+            or name in self._mmap_arrays
+            or name in self._arrays
+            or name in self._hdf5_names
+        )
+
+    def _resolved_cache_rows(self, key: Any) -> Any:
+        """Bypass the lazy wrapper once a small selection is fully resolved."""
+        rows_source = self.cache_rows
+        rows = rows_source[key]
+        if (
+            isinstance(rows_source, _TopologyCacheRowMapping)
+            and rows_source._full_rows is not None
+        ):
+            self.cache_rows = rows_source._full_rows
+        return rows
+
     def topology(self, item: int) -> Tuple[np.ndarray, np.ndarray]:
         self._ensure()
-        row = int(self.cache_rows[int(item)])
+        row = int(self._resolved_cache_rows(int(item)))
+        return self._topology_from_row(row)
+
+    def topologies(
+        self, items: Sequence[int]
+    ) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Resolve one batch of dataset positions with a single vector lookup."""
+        self._ensure()
+        rows = np.asarray(
+            self._resolved_cache_rows(np.asarray(items, dtype=np.int64)),
+            dtype=np.int64,
+        )
+        return [self._topology_from_row(int(row)) for row in rows]
+
+    def _topology_from_row(self, row: int) -> Tuple[np.ndarray, np.ndarray]:
         start = int(self._value("edge_ptr", row))
         end = int(self._value("edge_ptr", row + 1))
         edges = self._slice("edge_index", start, end).astype(np.int64, copy=False).T
-        if "shifts" in self._mmap_specs or "shifts" in self._arrays:
+        if self._has_dataset("shifts"):
             shifts = self._slice("shifts", start, end).astype(np.float64, copy=False)
             return edges, shifts
         left = int(self._value("shift_ptr", row))
         right = int(self._value("shift_ptr", row + 1))
-        if (
-            "shift_nonzero_local_indices" in self._mmap_specs
-            or "shift_nonzero_local_indices" in self._arrays
-        ):
+        if self._has_dataset("shift_nonzero_local_indices"):
             value_left = int(self._value("shift_value_ptr", row))
             value_right = int(self._value("shift_value_ptr", row + 1))
             local = self._slice(
@@ -3244,309 +3635,114 @@ class HDF5AtomicDataDataset(Dataset):
         self._shift_code_memmap: Optional[np.memmap] = None
         self._shift_value_memmap: Optional[np.memmap] = None
         self._topology_mmap_specs: Optional[Dict[str, Tuple[int, np.dtype, Tuple[int, ...]]]] = None
-        self._fallback_shift_indices: Optional[np.ndarray] = None
+        self._topology_view: Optional[_TopologyCacheView] = None
         self._handle_pid: Optional[int] = None
-        self.cache_rows: Optional[np.ndarray] = None
-        self.edge_ptr: Optional[np.ndarray] = None
-        self.shift_ptr: Optional[np.ndarray] = None
-        self.shift_value_ptr: Optional[np.ndarray] = None
-        self.edge_counts: Optional[np.ndarray] = None
+        self.cache_rows: Any = None
+        self.edge_ptr: Any = None
+        self.shift_ptr: Any = None
+        self.shift_value_ptr: Any = None
+        self.edge_counts: Any = None
         self.atom_counts = (
             plan.atom_ptr[self.indices + 1] - plan.atom_ptr[self.indices]
         ).astype(np.int64, copy=False)
         if self.topology_cache:
-            with h5py.File(self.topology_cache, "r") as cache:
-                cache_indices = np.asarray(cache["global_indices"][:], dtype=np.int64)
-                rows = np.searchsorted(cache_indices, self.indices)
-                if np.any(rows >= len(cache_indices)) or not np.array_equal(
-                    cache_indices[rows], self.indices
-                ):
-                    raise ValueError("Topology cache does not cover dataset indices")
-                self.cache_rows = rows.astype(np.int64, copy=False)
-                self.edge_ptr = np.asarray(cache["edge_ptr"][:], dtype=np.int64)
-                if "shift_ptr" in cache:
-                    self.shift_ptr = np.asarray(cache["shift_ptr"][:], dtype=np.int64)
-                if "shift_value_ptr" in cache:
-                    self.shift_value_ptr = np.asarray(
-                        cache["shift_value_ptr"][:], dtype=np.int64
-                    )
-                all_edge_counts = np.asarray(cache["edge_counts"][:], dtype=np.int64)
-                self.edge_counts = all_edge_counts[self.cache_rows]
-                edge_dataset = cache["edge_index"]
-                edge_offset = edge_dataset.id.get_offset()
-                mmap_specs: Dict[str, Tuple[int, np.dtype, Tuple[int, ...]]] = {}
-                if edge_dataset.chunks is None and edge_offset is not None:
-                    mmap_specs["edge_index"] = (
-                        int(edge_offset),
-                        np.dtype(edge_dataset.dtype),
-                        tuple(int(value) for value in edge_dataset.shape),
-                    )
-                if "shifts" in cache:
-                    shift_names = ("shifts",)
-                elif "shift_codes" in cache:
-                    shift_names = (
-                        "shift_nonzero_local_indices",
-                        "shift_codes",
-                        "shift_unique_values",
-                    )
-                else:
-                    shift_names = (
-                        "shift_nonzero_indices",
-                        "shift_nonzero_values",
-                    )
-                for name in shift_names:
-                    dataset = cache[name]
-                    offset = dataset.id.get_offset()
-                    if dataset.chunks is not None or offset is None:
-                        mmap_specs.clear()
-                        break
-                    mmap_specs[name] = (
-                        int(offset),
-                        np.dtype(dataset.dtype),
-                        tuple(int(value) for value in dataset.shape),
-                    )
-                if "edge_index" in mmap_specs and all(
-                    name in mmap_specs for name in shift_names
-                ):
-                    self._topology_mmap_specs = mmap_specs
-                elif "shift_nonzero_indices" in cache and self.shift_ptr is None:
-                    self._fallback_shift_indices = np.asarray(
-                        cache["shift_nonzero_indices"][:], dtype=np.int64
-                    )
+            self._attach_topology_view()
 
     def __len__(self) -> int:
         return int(self.indices.size)
+
+    def _attach_topology_view(self) -> None:
+        if not self.topology_cache:
+            return
+        self._topology_view = _TopologyCacheView(
+            self.topology_cache, self.indices
+        )
+        self.cache_rows = self._topology_view.cache_rows
+        self.edge_counts = self._topology_view.edge_counts
+        self._topology_mmap_specs = dict(self._topology_view._mmap_specs)
+
+    def _sync_topology_compatibility_attributes(self) -> None:
+        view = self._topology_view
+        if view is None:
+            return
+        self._topology_handle = view._handle
+        self._edge_memmap = view._mmap_arrays.get("edge_index")
+        self._shift_memmap = view._mmap_arrays.get("shifts")
+        self._shift_index_memmap = view._mmap_arrays.get(
+            "shift_nonzero_local_indices",
+            view._mmap_arrays.get("shift_nonzero_indices"),
+        )
+        self._shift_code_memmap = view._mmap_arrays.get("shift_codes")
+        self._shift_value_memmap = view._mmap_arrays.get(
+            "shift_unique_values",
+            view._mmap_arrays.get("shift_nonzero_values"),
+        )
 
     def _ensure_handles(self) -> None:
         pid = os.getpid()
         if self._handle_pid == pid and self._source_handle is not None:
             return
-        self.close()
+        if self._source_handle is not None:
+            try:
+                self._source_handle.close()
+            except Exception:
+                pass
         self._source_handle = h5py.File(self.plan.path, "r")
-        if self.topology_cache and self._topology_mmap_specs is not None:
-            edge_offset, edge_dtype, edge_shape = self._topology_mmap_specs["edge_index"]
-            self._edge_memmap = np.memmap(
-                self.topology_cache,
-                mode="r",
-                offset=edge_offset,
-                dtype=edge_dtype,
-                shape=edge_shape,
-                order="C",
-            )
-            if "shifts" in self._topology_mmap_specs:
-                shift_offset, shift_dtype, shift_shape = self._topology_mmap_specs["shifts"]
-                self._shift_memmap = np.memmap(
-                    self.topology_cache,
-                    mode="r",
-                    offset=shift_offset,
-                    dtype=shift_dtype,
-                    shape=shift_shape,
-                    order="C",
+        if self.topology_cache and self._topology_view is None:
+            self._attach_topology_view()
+        if self._topology_view is not None:
+            # Tests and older integrations can force the HDF5 fallback by
+            # clearing this compatibility attribute before the first read.
+            if self._topology_mmap_specs is None:
+                self._topology_view._hdf5_names.update(
+                    self._topology_view._mmap_specs
                 )
-            elif "shift_codes" in self._topology_mmap_specs:
-                index_offset, index_dtype, index_shape = self._topology_mmap_specs[
-                    "shift_nonzero_local_indices"
-                ]
-                code_offset, code_dtype, code_shape = self._topology_mmap_specs[
-                    "shift_codes"
-                ]
-                value_offset, value_dtype, value_shape = self._topology_mmap_specs[
-                    "shift_unique_values"
-                ]
-                self._shift_index_memmap = np.memmap(
-                    self.topology_cache,
-                    mode="r",
-                    offset=index_offset,
-                    dtype=index_dtype,
-                    shape=index_shape,
-                    order="C",
-                )
-                self._shift_code_memmap = np.memmap(
-                    self.topology_cache,
-                    mode="r",
-                    offset=code_offset,
-                    dtype=code_dtype,
-                    shape=code_shape,
-                    order="C",
-                )
-                self._shift_value_memmap = np.memmap(
-                    self.topology_cache,
-                    mode="r",
-                    offset=value_offset,
-                    dtype=value_dtype,
-                    shape=value_shape,
-                    order="C",
-                )
-            else:
-                index_offset, index_dtype, index_shape = self._topology_mmap_specs[
-                    "shift_nonzero_indices"
-                ]
-                value_offset, value_dtype, value_shape = self._topology_mmap_specs[
-                    "shift_nonzero_values"
-                ]
-                self._shift_index_memmap = np.memmap(
-                    self.topology_cache,
-                    mode="r",
-                    offset=index_offset,
-                    dtype=index_dtype,
-                    shape=index_shape,
-                    order="C",
-                )
-                self._shift_value_memmap = np.memmap(
-                    self.topology_cache,
-                    mode="r",
-                    offset=value_offset,
-                    dtype=value_dtype,
-                    shape=value_shape,
-                    order="C",
-                )
-            self._topology_handle = None
-        else:
-            self._topology_handle = (
-                h5py.File(self.topology_cache, "r") if self.topology_cache else None
-            )
+                self._topology_view._mmap_specs.clear()
+            self._topology_view._ensure()
+            self._sync_topology_compatibility_attributes()
         self._handle_pid = pid
 
     def __getitem__(self, item: int) -> AtomicData:
+        return self.__getitems__([int(item)])[0]
+
+    def __getitems__(self, items: Sequence[int]) -> List[AtomicData]:
         self._ensure_handles()
-        index = int(self.indices[int(item)])
-        cfg = _read_hdf5_configuration_at(
-            self._source_handle, self.plan, index, include_labels=True
+        positions = [int(item) for item in items]
+        configurations = _read_hdf5_configurations_at(
+            self._source_handle,
+            self.plan,
+            [int(self.indices[position]) for position in positions],
+            include_labels=True,
         )
-        topology = None
-        if (
-            self._edge_memmap is not None
-            and self._shift_index_memmap is not None
-            and self._shift_code_memmap is not None
-            and self._shift_value_memmap is not None
-        ):
-            row = int(self.cache_rows[int(item)])
-            start, end = int(self.edge_ptr[row]), int(self.edge_ptr[row + 1])
-            left = int(self.shift_ptr[row])
-            right = int(self.shift_ptr[row + 1])
-            value_left = int(self.shift_value_ptr[row])
-            value_right = int(self.shift_value_ptr[row + 1])
-            shifts = np.zeros((end - start, 3), dtype=np.float64)
-            if right > left:
-                local_indices = np.asarray(
-                    self._shift_index_memmap[left:right], dtype=np.int64
-                )
-                codes = np.asarray(
-                    self._shift_code_memmap[left:right], dtype=np.int64
-                )
-                dictionary = np.asarray(
-                    self._shift_value_memmap[value_left:value_right],
-                    dtype=np.float64,
-                )
-                shifts[local_indices] = dictionary[codes]
-            topology = (
-                np.asarray(self._edge_memmap[start:end], dtype=np.int64).T,
-                shifts,
-            )
-        elif (
-            self._edge_memmap is not None
-            and self._shift_index_memmap is not None
-            and self._shift_value_memmap is not None
-        ):
-            row = int(self.cache_rows[int(item)])
-            start, end = int(self.edge_ptr[row]), int(self.edge_ptr[row + 1])
-            if self.shift_ptr is not None:
-                left = int(self.shift_ptr[row])
-                right = int(self.shift_ptr[row + 1])
-            else:
-                left = int(np.searchsorted(self._shift_index_memmap, start, side="left"))
-                right = int(np.searchsorted(self._shift_index_memmap, end, side="left"))
-            shifts = np.zeros((end - start, 3), dtype=np.float64)
-            if right > left:
-                local_indices = np.asarray(
-                    self._shift_index_memmap[left:right], dtype=np.int64
-                ) - start
-                shifts[local_indices] = np.asarray(
-                    self._shift_value_memmap[left:right], dtype=np.float64
-                )
-            topology = (
-                np.asarray(self._edge_memmap[start:end], dtype=np.int64).T,
-                shifts,
-            )
-        elif self._edge_memmap is not None and self._shift_memmap is not None:
-            row = int(self.cache_rows[int(item)])
-            start, end = int(self.edge_ptr[row]), int(self.edge_ptr[row + 1])
-            topology = (
-                np.asarray(self._edge_memmap[start:end], dtype=np.int64).T,
-                np.asarray(self._shift_memmap[start:end], dtype=float),
-            )
-        elif self._topology_handle is not None:
-            row = int(self.cache_rows[int(item)])
-            start, end = int(self.edge_ptr[row]), int(self.edge_ptr[row + 1])
-            edges = np.asarray(
-                self._topology_handle["edge_index"][start:end], dtype=np.int64
-            ).T
-            if "shifts" in self._topology_handle:
-                shifts = np.asarray(
-                    self._topology_handle["shifts"][start:end], dtype=float
-                )
-            elif "shift_codes" in self._topology_handle:
-                left = int(self.shift_ptr[row])
-                right = int(self.shift_ptr[row + 1])
-                value_left = int(self.shift_value_ptr[row])
-                value_right = int(self.shift_value_ptr[row + 1])
-                shifts = np.zeros((end - start, 3), dtype=np.float64)
-                if right > left:
-                    local_indices = np.asarray(
-                        self._topology_handle["shift_nonzero_local_indices"][left:right],
-                        dtype=np.int64,
-                    )
-                    codes = np.asarray(
-                        self._topology_handle["shift_codes"][left:right],
-                        dtype=np.int64,
-                    )
-                    dictionary = np.asarray(
-                        self._topology_handle["shift_unique_values"][
-                            value_left:value_right
-                        ],
-                        dtype=np.float64,
-                    )
-                    shifts[local_indices] = dictionary[codes]
-            else:
-                indices = self._fallback_shift_indices
-                if self.shift_ptr is not None:
-                    left = int(self.shift_ptr[row])
-                    right = int(self.shift_ptr[row + 1])
-                    if indices is None:
-                        indices = np.asarray(
-                            self._topology_handle["shift_nonzero_indices"][left:right],
-                            dtype=np.int64,
-                        )
-                        index_slice = indices
-                    else:
-                        index_slice = indices[left:right]
-                else:
-                    left = int(np.searchsorted(indices, start, side="left"))
-                    right = int(np.searchsorted(indices, end, side="left"))
-                    index_slice = indices[left:right]
-                shifts = np.zeros((end - start, 3), dtype=np.float64)
-                if right > left:
-                    shifts[index_slice - start] = np.asarray(
-                        self._topology_handle["shift_nonzero_values"][left:right],
-                        dtype=np.float64,
-                    )
-            topology = (edges, shifts)
-        return AtomicData.from_config(
-            cfg,
-            z_table=self.z_table,
-            cutoff=self.cutoff,
-            topology=topology,
+        topologies = (
+            self._topology_view.topologies(positions)
+            if self._topology_view is not None
+            else [None] * len(positions)
         )
+        self._sync_topology_compatibility_attributes()
+        return [
+            AtomicData.from_config(
+                configuration,
+                z_table=self.z_table,
+                cutoff=self.cutoff,
+                topology=topology,
+            )
+            for configuration, topology in zip(configurations, topologies)
+        ]
 
     def close(self) -> None:
-        for name in ("_source_handle", "_topology_handle"):
-            handle = getattr(self, name, None)
-            if handle is not None:
-                try:
-                    handle.close()
-                except Exception:
-                    pass
-                setattr(self, name, None)
+        source_handle = getattr(self, "_source_handle", None)
+        if source_handle is not None:
+            try:
+                source_handle.close()
+            except Exception:
+                pass
+        self._source_handle = None
+        topology_view = getattr(self, "_topology_view", None)
+        if topology_view is not None:
+            topology_view.close()
+        self._topology_view = None
+        self._topology_handle = None
         for name in (
             "_edge_memmap",
             "_shift_memmap",
@@ -3554,26 +3750,23 @@ class HDF5AtomicDataDataset(Dataset):
             "_shift_code_memmap",
             "_shift_value_memmap",
         ):
-            array = getattr(self, name, None)
-            if array is not None:
-                memory_map = getattr(array, "_mmap", None)
-                if memory_map is not None:
-                    try:
-                        memory_map.close()
-                    except Exception:
-                        pass
-                setattr(self, name, None)
+            setattr(self, name, None)
+        self.cache_rows = None
+        self.edge_counts = None
         self._handle_pid = None
 
     def __getstate__(self) -> Dict[str, Any]:
         state = dict(self.__dict__)
         state["_source_handle"] = None
         state["_topology_handle"] = None
+        state["_topology_view"] = None
         state["_edge_memmap"] = None
         state["_shift_memmap"] = None
         state["_shift_index_memmap"] = None
         state["_shift_code_memmap"] = None
         state["_shift_value_memmap"] = None
+        state["cache_rows"] = None
+        state["edge_counts"] = None
         state["_handle_pid"] = None
         return state
 
@@ -3837,6 +4030,149 @@ def prepare_composite_stream_plan(
     )
 
 
+class _CompositeAtomCountView:
+    """Expose selected atom counts without copying all OMat24 selectors."""
+
+    def __init__(
+        self,
+        plan: CompositeStreamPlan,
+        omat_indices: np.ndarray,
+        large_indices: np.ndarray,
+    ) -> None:
+        self._omat_source = plan.omat_atom_counts
+        self._omat_indices = omat_indices
+        self._large_counts = (
+            plan.large_plan.atom_ptr[large_indices + 1]
+            - plan.large_plan.atom_ptr[large_indices]
+        ).astype(np.int64, copy=False)
+        self._omat_size = int(omat_indices.size)
+        self.size = self._omat_size + int(large_indices.size)
+        self.shape = (self.size,)
+        self.dtype = np.dtype(np.int64)
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, (int, np.integer)):
+            index = int(key)
+            if index < 0:
+                index += self.size
+            if not 0 <= index < self.size:
+                raise IndexError(index)
+            if index < self._omat_size:
+                return int(self._omat_source[int(self._omat_indices[index])])
+            return int(self._large_counts[index - self._omat_size])
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self.size)
+            if step != 1:
+                return self[np.arange(start, stop, step, dtype=np.int64)]
+            parts: List[np.ndarray] = []
+            omat_end = min(stop, self._omat_size)
+            if start < omat_end:
+                parts.append(
+                    np.asarray(
+                        self._omat_source[self._omat_indices[start:omat_end]],
+                        dtype=np.int64,
+                    )
+                )
+            large_start = max(start, self._omat_size)
+            if large_start < stop:
+                parts.append(
+                    np.asarray(
+                        self._large_counts[
+                            large_start - self._omat_size:stop - self._omat_size
+                        ],
+                        dtype=np.int64,
+                    )
+                )
+            if not parts:
+                return np.empty((0,), dtype=np.int64)
+            return parts[0] if len(parts) == 1 else np.concatenate(parts)
+        indices = np.asarray(key, dtype=np.int64)
+        flat = indices.reshape(-1).copy()
+        flat[flat < 0] += self.size
+        if np.any((flat < 0) | (flat >= self.size)):
+            raise IndexError("Composite atom-count index is out of range")
+        result = np.empty(flat.shape, dtype=np.int64)
+        omat_mask = flat < self._omat_size
+        if np.any(omat_mask):
+            result[omat_mask] = self._omat_source[
+                self._omat_indices[flat[omat_mask]]
+            ]
+        if np.any(~omat_mask):
+            result[~omat_mask] = self._large_counts[
+                flat[~omat_mask] - self._omat_size
+            ]
+        return result.reshape(indices.shape)
+
+    def sum(
+        self,
+        axis: Optional[int] = None,
+        dtype: Optional[np.dtype] = None,
+        out: Any = None,
+        keepdims: bool = False,
+        initial: Any = None,
+        where: Any = True,
+    ) -> Any:
+        if axis not in (None, 0, -1):
+            raise ValueError("atom-count view is one-dimensional")
+        if out is not None or where is not True:
+            chunks = [
+                self[start:start + 1_000_000]
+                for start in range(0, self.size, 1_000_000)
+            ]
+            values = (
+                np.concatenate(chunks)
+                if chunks else np.empty((0,), dtype=np.int64)
+            )
+            return values.sum(
+                axis=axis, dtype=dtype, out=out, keepdims=keepdims,
+                initial=initial, where=where,
+            )
+        total = 0 if initial is None else initial
+        for start in range(0, self.size, 1_000_000):
+            total += np.sum(
+                self[start:start + 1_000_000], dtype=dtype or np.int64
+            )
+        if keepdims:
+            return np.asarray([total], dtype=dtype or np.int64)
+        return total
+
+
+class _CompositeRoleSequence:
+    """Lazy curriculum labels retained for API compatibility."""
+
+    def __init__(self, foundation_count: int, response_count: int) -> None:
+        self.foundation_count = int(foundation_count)
+        self.response_count = int(response_count)
+        self.size = self.foundation_count + self.response_count
+        self.shape = (self.size,)
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, (int, np.integer)):
+            index = int(key)
+            if index < 0:
+                index += self.size
+            if not 0 <= index < self.size:
+                raise IndexError(index)
+            return "foundation" if index < self.foundation_count else "response"
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self.size)
+            indices = np.arange(start, stop, step, dtype=np.int64)
+        else:
+            indices = np.asarray(key, dtype=np.int64)
+            indices = np.where(indices < 0, indices + self.size, indices)
+            if np.any((indices < 0) | (indices >= self.size)):
+                raise IndexError("Composite curriculum-role index is out of range")
+        values = np.full(np.asarray(indices).shape, "response", dtype=object)
+        values[np.asarray(indices) < self.foundation_count] = "foundation"
+        return values
+
+
 class CompositeAtomicDataDataset(Dataset):
     """Random-access streamed graphs from OMat24 Parquet and Neo Large HDF5."""
 
@@ -3862,21 +4198,17 @@ class CompositeAtomicDataDataset(Dataset):
         self._handle_pid: Optional[int] = None
         self.topology_cache = str(topology_cache or "")
         self._topology_view: Optional[_TopologyCacheView] = None
-        self.curriculum_roles = np.concatenate([
-            np.full(self.omat_indices.size, "foundation", dtype=object),
-            np.full(self.large_indices.size, "response", dtype=object),
-        ])
-        self.atom_counts = np.concatenate([
-            plan.omat_atom_counts[self.omat_indices].astype(np.int64, copy=False),
-            (plan.large_plan.atom_ptr[self.large_indices + 1]
-             - plan.large_plan.atom_ptr[self.large_indices]).astype(np.int64, copy=False),
-        ])
-        self._global_ids = np.concatenate([
-            self.omat_indices.astype(np.int64, copy=False),
-            (
-                int(plan.source_orders.size) + self.large_indices
-            ).astype(np.int64, copy=False),
-        ])
+        self.curriculum_roles = _CompositeRoleSequence(
+            int(self.omat_indices.size), int(self.large_indices.size)
+        )
+        self.atom_counts = _CompositeAtomCountView(
+            plan, self.omat_indices, self.large_indices
+        )
+        self._global_ids = _CompositeGlobalIdSequence(
+            self.omat_indices,
+            self.large_indices,
+            large_offset=int(plan.source_orders.size),
+        )
         self.edge_counts = None
         if self.topology_cache:
             self.attach_topology_cache(self.topology_cache)
@@ -3888,24 +4220,30 @@ class CompositeAtomicDataDataset(Dataset):
         pid = os.getpid()
         if self._handle_pid == pid and self._large_handle is not None:
             return
-        topology_cache = self.topology_cache
-        self.close()
+        self._close_source_handles()
         self._large_handle = h5py.File(self.plan.large_plan.path, "r")
-        if topology_cache:
-            self.attach_topology_cache(topology_cache)
+        if self.topology_cache and self._topology_view is None:
+            self.attach_topology_cache(self.topology_cache)
         self._handle_pid = pid
 
     def attach_topology_cache(self, path: str) -> None:
         """Attach a cache whose global id space covers this dataset exactly."""
+        requested_path = str(path or "")
+        if (
+            self._topology_view is not None
+            and requested_path
+            and self.topology_cache == requested_path
+        ):
+            return
         if self._topology_view is not None:
             self._topology_view.close()
-        self.topology_cache = str(path or "")
+        self.topology_cache = requested_path
         self._topology_view = (
             _TopologyCacheView(self.topology_cache, self._global_ids)
             if self.topology_cache else None
         )
         self.edge_counts = (
-            self._topology_view.edge_counts.copy()
+            self._topology_view.edge_counts
             if self._topology_view is not None else None
         )
 
@@ -4246,22 +4584,23 @@ class CompositeAtomicDataDataset(Dataset):
         packed_configs = self._packed_configurations_at([
             int(self.omat_indices[position]) for position in packed_positions
         ])
+        topologies = (
+            self._topology_view.topologies(positions)
+            if self._topology_view is not None
+            else [None] * len(positions)
+        )
         output: List[AtomicData] = []
-        for position in positions:
+        for position, topology in zip(positions, topologies):
             if position < self.omat_indices.size and self.plan.omat_packed:
                 cfg = packed_configs[int(self.omat_indices[position])]
             else:
                 cfg = self._configuration_at(position)
-            topology = (
-                self._topology_view.topology(position)
-                if self._topology_view is not None else None
-            )
             output.append(AtomicData.from_config(
                 cfg, z_table=self.z_table, cutoff=self.cutoff, topology=topology
             ))
         return output
 
-    def close(self) -> None:
+    def _close_source_handles(self) -> None:
         large_handle = getattr(self, "_large_handle", None)
         if large_handle is not None:
             try:
@@ -4273,11 +4612,15 @@ class CompositeAtomicDataDataset(Dataset):
         getattr(self, "_parquet_handles", {}).clear()
         getattr(self, "_embedded_streams", {}).clear()
         getattr(self, "_parquet_streams", {}).clear()
+        self._handle_pid = None
+
+    def close(self) -> None:
+        self._close_source_handles()
         topology_view = getattr(self, "_topology_view", None)
         if topology_view is not None:
             topology_view.close()
             self._topology_view = None
-        self._handle_pid = None
+        self.edge_counts = None
 
     def __getstate__(self) -> Dict[str, Any]:
         state = dict(self.__dict__)
@@ -4286,6 +4629,7 @@ class CompositeAtomicDataDataset(Dataset):
         state["_parquet_streams"] = {}
         state["_large_handle"] = None
         state["_topology_view"] = None
+        state["edge_counts"] = None
         state["_handle_pid"] = None
         return state
 
@@ -8450,6 +8794,11 @@ class DualLayerFieldModel(torch.nn.Module):
                 device=batch.positions.device,
             )
             atomic_dipoles = torch.zeros_like(batch.positions)
+            atomic_polarizability = torch.zeros(
+                (batch.positions.shape[0], 3, 3),
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
+            )
             mu_permanent = torch.zeros_like(mu)
             field = _batch_field(batch, num_graphs) * float(self.cfg.field_scale)
             alpha_factor = (
@@ -8460,7 +8809,13 @@ class DualLayerFieldModel(torch.nn.Module):
             )
 
             if use_response_terms:
-                q, atomic_dipoles, alpha = self.response(batch)
+                response_components = self.response.forward_components(batch)
+                q = response_components["raw_charges"]
+                atomic_dipoles = response_components["atomic_dipoles"]
+                atomic_polarizability = response_components[
+                    "atomic_polarizability"
+                ]
+                alpha = response_components["polarizability"]
                 total_charge = _batch_total_charge(
                     batch, num_graphs, batch.positions.dtype
                 )
@@ -8570,6 +8925,7 @@ class DualLayerFieldModel(torch.nn.Module):
                 "polarizability": alpha,
                 "charges": q,
                 "atomic_dipoles": atomic_dipoles,
+                "atomic_polarizability": atomic_polarizability,
                 "bec": bec,
                 "piezoelectric": piezoelectric,
             }
@@ -9963,6 +10319,7 @@ VALIDATION_MAE_SCALES: Dict[str, float] = {
     "dipole": 1.0,
     "polarizability": 1.0,
     "charges": 0.1,
+    "total_charge": 0.1,
     "atomic_dipoles": 0.1,
     "atomic_polarizability": 0.1,
     "c6": 10.0,
@@ -9976,6 +10333,305 @@ VALIDATION_MAE_SCALES: Dict[str, float] = {
     "DMI_effective": 0.01,
     "coupling_consistency": 0.01,
 }
+
+CORE_VALIDATION_TARGETS: Tuple[str, ...] = ("energy", "forces", "stress")
+RESPONSE_VALIDATION_TARGETS: Tuple[str, ...] = (
+    "total_charge", "dipole", "polarizability", "charges", "atomic_dipoles",
+    "atomic_polarizability", "c6", "bec", "piezoelectric",
+    "magnetoelastic_stress", "magnetic_moments", "effective_field",
+    "J_effective", "Di", "Di_effective", "DMI_effective",
+)
+VALIDATION_METRIC_UNITS: Dict[str, str] = {
+    **{name: str(unit) for name, unit in HDF5_UNITS.items()},
+    "energy": "eV/atom",
+    "forces": "eV/angstrom",
+    "stress": "eV/angstrom^3",
+    "bec_sum_rule": "e",
+    "coupling_consistency": "dimensionless",
+}
+VALIDATION_METRIC_LABELS: Dict[str, str] = {
+    "energy": "E-MAE",
+    "forces": "F-MAE",
+    "stress": "Stress-MAE",
+    "total_charge": "Charge-conservation MAE",
+}
+# Charge conservation is enforced explicitly by the response model, so its
+# residual is useful as a diagnostic but is not an independent learned target.
+# Keep computing and serializing it while excluding it from model selection and
+# user-facing MAE/regression plots. Removing a name here restores normal use.
+DIAGNOSTIC_ONLY_MAE_TARGETS: frozenset[str] = frozenset({"total_charge"})
+MAE_PLOT_COLORS: Tuple[str, ...] = (
+    "#3167e3", "#e4872b", "#159570", "#7a5af8", "#d14f69",
+    "#70859f", "#b7791f", "#00838f", "#9c4dcc", "#4f772d",
+    "#c2416c", "#526d82", "#ad5d17", "#177e89", "#6b5b95",
+    "#2f855a", "#b83280", "#5c6ac4", "#9f580a", "#287271",
+)
+MAE_STAGE_LINESTYLES: Tuple[str, ...] = ("-", "--", "-.", ":")
+
+
+class _RegressionPairReservoir:
+    """Bound actual/predicted scatter storage without biasing metric values."""
+
+    def __init__(self, max_points: int, seed: int) -> None:
+        self.max_points = max(1, int(max_points))
+        self._rng = np.random.default_rng(int(seed))
+        self.actual = np.empty((0,), dtype=np.float64)
+        self.predicted = np.empty((0,), dtype=np.float64)
+        self._priority = np.empty((0,), dtype=np.float64)
+
+    def add(self, actual: Any, predicted: Any) -> None:
+        actual_values = np.asarray(actual, dtype=np.float64).reshape(-1)
+        predicted_values = np.asarray(predicted, dtype=np.float64).reshape(-1)
+        if actual_values.size != predicted_values.size:
+            raise ValueError("Regression actual/predicted arrays have different sizes")
+        finite = np.isfinite(actual_values) & np.isfinite(predicted_values)
+        if not bool(np.any(finite)):
+            return
+        actual_values = actual_values[finite]
+        predicted_values = predicted_values[finite]
+        priorities = self._rng.random(actual_values.size)
+        combined_actual = np.concatenate((self.actual, actual_values))
+        combined_predicted = np.concatenate((self.predicted, predicted_values))
+        combined_priority = np.concatenate((self._priority, priorities))
+        if combined_priority.size > self.max_points:
+            keep = np.argpartition(
+                combined_priority, -self.max_points
+            )[-self.max_points:]
+            keep = keep[np.argsort(combined_priority[keep], kind="stable")]
+            combined_actual = combined_actual[keep]
+            combined_predicted = combined_predicted[keep]
+            combined_priority = combined_priority[keep]
+        self.actual = combined_actual
+        self.predicted = combined_predicted
+        self._priority = combined_priority
+
+
+def _event_core_mae(event: Dict[str, Any]) -> Dict[str, float]:
+    values = dict(event.get("core_mae", {}))
+    fallback = {
+        "energy": event.get("energy_mae"),
+        "forces": event.get("force_mae"),
+        "stress": event.get("stress_mae"),
+    }
+    for name, value in fallback.items():
+        if name not in values and value is not None:
+            values[name] = value
+    return {
+        str(name): float(value)
+        for name, value in values.items()
+        if value is not None and math.isfinite(float(value))
+    }
+
+
+def _event_response_mae(event: Dict[str, Any]) -> Dict[str, float]:
+    raw = event.get("response_mae")
+    values = dict(raw) if isinstance(raw, dict) else {
+        name: value
+        for name, value in dict(event.get("multitask_mae", {})).items()
+        if name in RESPONSE_VALIDATION_TARGETS
+    }
+    return {
+        str(name): float(value)
+        for name, value in values.items()
+        if value is not None and math.isfinite(float(value))
+    }
+
+
+def _event_all_mae(event: Dict[str, Any]) -> Dict[str, float]:
+    """Return every validation MAE carried by one progress event."""
+    values = _event_core_mae(event)
+    values.update(_event_response_mae(event))
+    return values
+
+
+def _ordered_mae_metric_names(names: Iterable[str]) -> List[str]:
+    """Keep physical metric order stable across epochs, stages, and UIs."""
+    available = {str(name) for name in names}
+    preferred = CORE_VALIDATION_TARGETS + RESPONSE_VALIDATION_TARGETS
+    ordered = [name for name in preferred if name in available]
+    ordered.extend(sorted(available.difference(ordered)))
+    return ordered
+
+
+def _ordered_plottable_mae_metric_names(names: Iterable[str]) -> List[str]:
+    """Return validation metrics intended for user-facing plots."""
+    return [
+        name for name in _ordered_mae_metric_names(names)
+        if name not in DIAGNOSTIC_ONLY_MAE_TARGETS
+    ]
+
+
+def _mae_metric_legend_label(name: str, unit: Optional[str] = None) -> str:
+    label = VALIDATION_METRIC_LABELS.get(
+        str(name), f"{str(name).replace('_', ' ')}-MAE"
+    )
+    resolved_unit = str(
+        unit or VALIDATION_METRIC_UNITS.get(str(name), "")
+    ).strip()
+    return f"{label} [{resolved_unit}]" if resolved_unit else label
+
+
+def _set_combined_mae_axis_scale(axis: Any, values: Iterable[float]) -> str:
+    """Select a readable scale without changing any reported MAE value."""
+    finite = np.asarray(
+        [float(value) for value in values if math.isfinite(float(value))],
+        dtype=float,
+    )
+    if finite.size == 0:
+        return "linear"
+    positive = finite[finite > 0.0]
+    if positive.size == 0:
+        return "linear"
+    dynamic_range = float(np.max(positive) / max(np.min(positive), 1e-300))
+    if dynamic_range < 20.0:
+        return "linear"
+    if bool(np.any(finite <= 0.0)):
+        axis.set_yscale(
+            "symlog", linthresh=max(float(np.min(positive)) * 0.1, 1e-12)
+        )
+        return "symlog"
+    axis.set_yscale("log")
+    return "log"
+
+
+def _automatic_panel_grid(
+    panel_count: int, *, max_columns: int = 4
+) -> Tuple[int, int]:
+    """Choose a compact grid while keeping the overall figure landscape-like."""
+    count = max(0, int(panel_count))
+    if count == 0:
+        return 0, 0
+    candidates: List[Tuple[float, int, int]] = []
+    for columns in range(1, min(max(1, int(max_columns)), count) + 1):
+        rows = int(math.ceil(count / columns))
+        blanks = rows * columns - count
+        aspect = columns / max(1.0, float(rows))
+        score = 0.5 * blanks + abs(math.log(max(aspect, 1e-12) / 1.5))
+        candidates.append((score, -columns, rows))
+    _score, negative_columns, rows = min(candidates)
+    return rows, -negative_columns
+
+
+def _add_combined_mae_legends(
+    axis: Any,
+    metric_handles: Dict[str, Any],
+    stage_labels: Sequence[str] = (),
+) -> int:
+    """Add a unit-aware metric key plus a compact stage linestyle key."""
+    if not metric_handles:
+        return 0
+    metric_columns = min(4, max(1, len(metric_handles)))
+    axis.figure.legend(
+        list(metric_handles.values()),
+        [_mae_metric_legend_label(name) for name in metric_handles],
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        ncol=metric_columns,
+        fontsize=8,
+        frameon=False,
+        title="Validation metrics",
+        title_fontsize=8,
+    )
+    unique_stages = list(dict.fromkeys(str(label) for label in stage_labels))
+    if len(unique_stages) > 1:
+        from matplotlib.lines import Line2D
+
+        stage_handles = [
+            Line2D(
+                [0], [0], color="#596273", linewidth=1.8,
+                linestyle=MAE_STAGE_LINESTYLES[index % len(MAE_STAGE_LINESTYLES)],
+            )
+            for index, _label in enumerate(unique_stages)
+        ]
+        axis.legend(
+            stage_handles,
+            unique_stages,
+            loc="upper right",
+            fontsize=8,
+            frameon=True,
+            framealpha=0.88,
+            title="Stage",
+            title_fontsize=8,
+        )
+    return int(math.ceil(len(metric_handles) / metric_columns))
+
+
+def _metric_event_summary(event: Dict[str, Any]) -> str:
+    units = dict(event.get("metric_units", {}))
+    core = _event_core_mae(event)
+    response = _event_response_mae(event)
+    visible_response = {
+        name: value for name, value in response.items()
+        if name not in DIAGNOSTIC_ONLY_MAE_TARGETS
+    }
+    sections: List[str] = []
+    if core:
+        sections.append("Base: " + ", ".join(
+            f"{VALIDATION_METRIC_LABELS.get(name, name)} {value:.4g} "
+            f"{units.get(name, VALIDATION_METRIC_UNITS.get(name, ''))}"
+            for name, value in core.items()
+        ))
+    if visible_response:
+        sections.append("Response: " + ", ".join(
+            f"{name} {value:.4g} "
+            f"{units.get(name, VALIDATION_METRIC_UNITS.get(name, ''))}"
+            for name, value in sorted(visible_response.items())
+        ))
+    return " | ".join(sections)
+
+
+def _hdf5_available_validation_labels(
+    plan: HDF5StreamPlan, indices: Sequence[int]
+) -> set[str]:
+    """Return labels with at least one active record in a selected split."""
+    selected = np.asarray(indices, dtype=np.int64)
+    if selected.size == 0:
+        return set()
+    return {
+        str(name)
+        for name, mask in plan.label_masks.items()
+        if np.any(np.asarray(mask, dtype=np.bool_)[selected])
+    }
+
+
+def _supported_response_validation_targets(model_cfg: ModelConfig) -> set[str]:
+    """Return response observables produced by the selected physical model."""
+    supported = {
+        "total_charge", "dipole", "polarizability", "charges", "atomic_dipoles",
+        "atomic_polarizability", "bec", "piezoelectric",
+    }
+    if bool(getattr(model_cfg, "enable_d4", False)):
+        supported.add("c6")
+    if bool(getattr(model_cfg, "enable_spin", False)):
+        supported.update({
+            "magnetoelastic_stress", "magnetic_moments", "effective_field",
+            "J_effective", "Di", "Di_effective",
+        })
+        if bool(getattr(model_cfg, "enable_dmi", False)):
+            supported.add("DMI_effective")
+    return supported
+
+
+def _stage_default_validation_targets(
+    mode: str,
+    model_cfg: ModelConfig,
+    available_labels: Iterable[str],
+) -> Tuple[str, ...]:
+    """Build a stable, stage-aware metric contract from available labels."""
+    selected_mode = str(mode or "joint").strip().lower()
+    available = {str(name) for name in available_labels}
+    requested: set[str] = set()
+    if selected_mode in {"base", "joint"}:
+        requested.update(CORE_VALIDATION_TARGETS)
+    if selected_mode in {"response", "joint"}:
+        requested.update(_supported_response_validation_targets(model_cfg))
+    if "magnetoelastic_stress" in requested and "reference_spins" not in available:
+        requested.discard("magnetoelastic_stress")
+    return tuple(
+        name
+        for name in CORE_VALIDATION_TARGETS + RESPONSE_VALIDATION_TARGETS
+        if name in requested and name in available
+    )
 
 
 def _expanded_property_weight(
@@ -10402,6 +11058,24 @@ def _additional_physics_loss(
         if coefficient > 0.0:
             total = total + coefficient * _weighted_mse(prediction, target, weight)
         metrics[target_name] = _masked_mae_statistics(prediction, target, weight)
+
+    if "total_charge" in requested_metrics:
+        if "charges" not in out:
+            raise ValueError("Model does not provide atomic charges for total-charge validation")
+        graph_count = _batch_num_graphs(batch)
+        predicted_charge = scatter_sum(
+            out["charges"], batch.batch, dim_size=graph_count
+        ).reshape(-1)
+        target_charge = _batch_total_charge(
+            batch, graph_count, predicted_charge.dtype
+        ).to(device=predicted_charge.device)
+        charge_weight = _expanded_property_weight(
+            batch, "total_charge", predicted_charge, atomwise=False
+        )
+        if float(charge_weight.sum().detach().cpu()) > 0.0:
+            metrics["total_charge"] = _masked_mae_statistics(
+                predicted_charge, target_charge, charge_weight
+            )
 
     if float(cfg.w_di) > 0.0 or bool({"Di", "Di_effective"} & requested_metrics):
         use_effective = (
@@ -13582,6 +14256,96 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         )
         log(f"[{_now()}] Grouped split: {json.dumps(split_info, sort_keys=True)}")
         zs = sorted({int(z) for c in all_cfgs for z in c.atomic_numbers})
+    if composite_plan is not None:
+        available_validation_labels = _hdf5_available_validation_labels(
+            composite_plan.large_plan, composite_plan.val_large_indices
+        )
+        if composite_plan.val_omat_indices.size:
+            available_validation_labels.update(CORE_VALIDATION_TARGETS)
+    elif stream_plan is not None:
+        available_validation_labels = _hdf5_available_validation_labels(
+            stream_plan, stream_plan.val_indices
+        )
+    else:
+        available_validation_labels = {
+            str(name)
+            for configuration in val_cfgs
+            for name in configuration.properties
+            if float(configuration.property_weights.get(name, 1.0)) > 0.0
+        }
+    stage_validation_targets = _stage_default_validation_targets(
+        cfg.mode, cfg.model, available_validation_labels
+    )
+    _validation_targets.update(stage_validation_targets)
+    diagnostic_only_targets = sorted(
+        _validation_targets & set(DIAGNOSTIC_ONLY_MAE_TARGETS)
+    )
+    scored_validation_targets = sorted(
+        _validation_targets - set(DIAGNOSTIC_ONLY_MAE_TARGETS)
+    )
+    log(
+        f"[{_now()}] Validation metric contract [{cfg.mode}]: "
+        + (
+            ", ".join(sorted(_validation_targets))
+            if _validation_targets else "no labeled targets"
+        )
+    )
+    if diagnostic_only_targets:
+        log(
+            f"[{_now()}] Diagnostic-only validation metrics (not scored or plotted): "
+            + ", ".join(diagnostic_only_targets)
+        )
+    conditioning_inputs = sorted(
+        available_validation_labels
+        & {"field", "spins", "reference_spins", "strain"}
+    )
+    supported_response = _supported_response_validation_targets(cfg.model)
+    omitted_response = sorted(
+        (
+            available_validation_labels
+            & set(RESPONSE_VALIDATION_TARGETS)
+            - set(_validation_targets)
+        )
+        if str(cfg.mode).strip().lower() in {"response", "joint"}
+        else set()
+    )
+    if conditioning_inputs:
+        log(
+            f"[{_now()}] Validation conditioning inputs (no inverse MAE head): "
+            + ", ".join(conditioning_inputs)
+        )
+    if omitted_response:
+        omission_reasons = []
+        for name in omitted_response:
+            if name == "c6" and not bool(cfg.model.enable_d4):
+                reason = "enable_d4=False"
+            elif name in {
+                "magnetoelastic_stress", "magnetic_moments", "effective_field",
+                "J_effective", "Di", "Di_effective", "DMI_effective",
+            } and not bool(cfg.model.enable_spin):
+                reason = "enable_spin=False"
+            elif name == "DMI_effective" and not bool(cfg.model.enable_dmi):
+                reason = "enable_dmi=False"
+            elif name not in supported_response:
+                reason = "selected architecture has no output head"
+            else:
+                reason = "required paired conditioning label is absent"
+            omission_reasons.append(f"{name} ({reason})")
+        log(
+            f"[{_now()}] Validation metrics hidden for this stage: "
+            + ", ".join(omission_reasons)
+        )
+    if progress is not None:
+        progress({
+            "type": "metric_contract",
+            "training_mode": str(cfg.mode),
+            "available_labels": sorted(available_validation_labels),
+            "validation_targets": sorted(_validation_targets),
+            "scored_validation_targets": scored_validation_targets,
+            "diagnostic_only_targets": diagnostic_only_targets,
+            "conditioning_inputs": conditioning_inputs,
+            "hidden_response_targets": omitted_response,
+        })
     if stop_flag is not None and stop_flag():
         return _cancelled_result("dataset indexing")
     z_table = AtomicNumberTable(zs)
@@ -13732,23 +14496,81 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             )
             if topology_cache is None:
                 return _cancelled_result("composite topology-cache construction")
+            log(
+                f"[{_now()}] Attaching disk topology cache lazily: "
+                f"train={len(train_data)} validation={len(val_data)}."
+            )
+            if progress is not None:
+                progress({
+                    "type": "prep",
+                    "task": "Attach disk topology cache",
+                    "overall_frac": 0.20,
+                    "current": 0,
+                    "total": 2,
+                    "stage": "train_index",
+                })
             train_data.attach_topology_cache(topology_cache)
+            if progress is not None:
+                progress({
+                    "type": "prep",
+                    "task": "Attach disk topology cache",
+                    "overall_frac": 0.20,
+                    "current": 1,
+                    "total": 2,
+                    "stage": "validation_index",
+                })
             val_data.attach_topology_cache(topology_cache)
+            if progress is not None:
+                progress({
+                    "type": "prep",
+                    "task": "Attach disk topology cache",
+                    "overall_frac": 0.20,
+                    "current": 2,
+                    "total": 2,
+                    "stage": "done",
+                })
         else:
             log(
                 f"[{_now()}] Composite HDF5 uses on-demand neighbor construction; "
                 "enable cache_neighbor_graphs to reuse exact topology across epochs."
             )
-        train_atoms = int(np.sum(train_data.atom_counts, dtype=np.int64))
+        neighbor_sampled = len(train_data) > 1_000_000
+        if neighbor_sampled:
+            sample_size = min(16384, len(train_data))
+            sample_indices = np.linspace(
+                0, len(train_data) - 1, num=sample_size, dtype=np.int64
+            )
+            sampled_atoms = int(np.sum(
+                train_data.atom_counts[sample_indices], dtype=np.int64
+            ))
+            sampled_edges = (
+                int(np.sum(
+                    train_data.edge_counts[sample_indices], dtype=np.int64
+                ))
+                if train_data.edge_counts is not None else 0
+            )
+            train_atoms = sampled_atoms
+        else:
+            train_atoms = int(np.sum(train_data.atom_counts, dtype=np.int64))
         if train_data.edge_counts is not None:
-            train_edges = int(np.sum(train_data.edge_counts, dtype=np.int64))
+            train_edges = (
+                sampled_edges
+                if neighbor_sampled
+                else int(np.sum(train_data.edge_counts, dtype=np.int64))
+            )
             avg_n = float(train_edges) / float(max(1, train_atoms))
         else:
             avg_n = float("nan")
         log(
             f"[{_now()}] Composite dataset streaming: train={len(train_data)} "
             f"val={len(val_data)} mode={cfg.mode} "
-            + (f"avg_neighbors/atom={avg_n:.2f}; " if math.isfinite(avg_n) else "")
+            + (
+                f"avg_neighbors/atom~{avg_n:.2f} (sampled); "
+                if math.isfinite(avg_n) and neighbor_sampled
+                else f"avg_neighbors/atom={avg_n:.2f}; "
+                if math.isfinite(avg_n)
+                else ""
+            )
             + (
                 "packed OMat24 arrays are read in contiguous batch spans; "
                 if composite_plan.omat_packed
@@ -13769,6 +14591,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             )
             if topology_cache is None:
                 return _cancelled_result("disk topology-cache construction")
+            log(
+                f"[{_now()}] Attaching disk topology cache lazily: "
+                f"train={len(stream_plan.train_indices)} "
+                f"validation={len(stream_plan.val_indices)}."
+            )
         else:
             log(
                 f"[{_now()}] HDF5 streaming uses on-demand neighbor construction; "
@@ -13788,9 +14615,20 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             cutoff=float(model.cfg.r_max),
             topology_cache=topology_cache,
         )
-        train_atoms = int(np.sum(train_data.atom_counts, dtype=np.int64))
+        neighbor_sample_size = min(16384, len(train_data))
+        neighbor_sample_indices = np.linspace(
+            0,
+            max(0, len(train_data) - 1),
+            num=neighbor_sample_size,
+            dtype=np.int64,
+        ) if neighbor_sample_size else np.empty((0,), dtype=np.int64)
+        train_atoms = int(np.sum(
+            train_data.atom_counts[neighbor_sample_indices], dtype=np.int64
+        ))
         if train_data.edge_counts is not None:
-            train_edges = int(np.sum(train_data.edge_counts, dtype=np.int64))
+            train_edges = int(np.sum(
+                train_data.edge_counts[neighbor_sample_indices], dtype=np.int64
+            ))
             avg_n = float(train_edges) / float(max(1, train_atoms))
         else:
             avg_n = float("nan")
@@ -13798,7 +14636,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             f"[{_now()}] Dataset streaming: train={len(train_data)} "
             f"val={len(val_data)} strategy={split_info['strategy']} "
             + (
-                f"avg_neighbors/atom={avg_n:.2f}; "
+                f"avg_neighbors/atom~{avg_n:.2f} (sampled); "
                 if math.isfinite(avg_n) else ""
             )
             + "RAM retains only indices/masks; HDF5 graphs load per batch."
@@ -13949,7 +14787,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         return _collate_valid_atomic_data(lst, invalid_callback=rejected)
 
     class _FixedGraphBatchSampler:
-        """Reuse memory-bounded MPS batch shapes while randomizing batch order."""
+        """Plan exact MPS-safe batches in bounded windows on every dataset."""
+
+        _PLAN_WINDOW = 8192
+        _EDGE_SAMPLE_LIMIT = 8192
 
         def __init__(
             self,
@@ -13959,42 +14800,93 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             max_edges: Optional[int] = None,
             shuffle: bool = True,
         ) -> None:
-            edge_counts = getattr(ds, "edge_counts", None)
-            item_edge_loads = (
-                [int(value) for value in edge_counts]
-                if edge_counts is not None
-                else [int(ds[index].edge_index.shape[1]) for index in range(len(ds))]
-            )
-            batches, edge_loads = _plan_structure_batches(
-                item_edge_loads, batch_size, max_load=max_edges
-            )
-            self.batches = batches
-            self.edge_loads = edge_loads
-            self.structure_loads = [len(indices) for indices in batches]
+            self.ds = ds
+            self.count = int(len(ds))
+            self.edge_counts = getattr(ds, "edge_counts", None)
+            self.structure_loads: List[int] = []
+            self.edge_loads: List[int] = []
             self.requested_batch_size = int(batch_size)
             self.edge_budget = int(max_edges) if max_edges is not None else None
-            self.oversized_structures = sum(
-                int(load > max_edges) for load in edge_loads
-            ) if max_edges is not None else 0
+            self.oversized_structures = 0
             self.seed = int(seed)
             self.shuffle = bool(shuffle)
             self.epoch = 0
+            self.lazy_plan = True
+            self.edge_sample_size = 0
+            self.sampled_mean_edges = float("nan")
+            structure_steps = int(math.ceil(
+                self.count / max(1, self.requested_batch_size)
+            )) if self.count else 0
+            edge_steps = 0
+            if (
+                self.count
+                and self.edge_counts is not None
+                and self.edge_budget is not None
+            ):
+                sample_size = min(self.count, self._EDGE_SAMPLE_LIMIT)
+                sample_indices = np.linspace(
+                    0, self.count - 1, num=sample_size, dtype=np.int64
+                )
+                sampled = np.asarray(
+                    self.edge_counts[sample_indices], dtype=np.int64
+                )
+                self.edge_sample_size = int(sampled.size)
+                self.sampled_mean_edges = (
+                    float(np.mean(sampled)) if sampled.size else 0.0
+                )
+                edge_steps = int(math.ceil(
+                    self.sampled_mean_edges * self.count
+                    / max(1, int(self.edge_budget))
+                ))
+            self.estimated_steps = max(structure_steps, edge_steps)
 
         def __iter__(self) -> Iterable[List[int]]:
+            rng = np.random.default_rng(self.seed + self.epoch)
+            window_count = int(math.ceil(self.count / self._PLAN_WINDOW))
+            window_order = np.arange(window_count, dtype=np.int64)
             if self.shuffle:
-                order = np.random.default_rng(self.seed + self.epoch).permutation(
-                    len(self.batches)
-                )
-                self.epoch += 1
-            else:
-                order = np.arange(len(self.batches), dtype=np.int64)
-            return iter([self.batches[int(index)] for index in order])
+                rng.shuffle(window_order)
+            self.epoch += 1
+
+            def generate() -> Iterable[List[int]]:
+                for raw_window in window_order:
+                    start = int(raw_window) * self._PLAN_WINDOW
+                    end = min(self.count, start + self._PLAN_WINDOW)
+                    indices = np.arange(start, end, dtype=np.int64)
+                    if self.edge_counts is None or self.edge_budget is None:
+                        if self.shuffle:
+                            rng.shuffle(indices)
+                        for left in range(0, int(indices.size), self.requested_batch_size):
+                            yield indices[
+                                left:left + self.requested_batch_size
+                            ].tolist()
+                        continue
+                    loads = np.asarray(self.edge_counts[indices], dtype=np.int64)
+                    local_batches, _local_loads = _plan_structure_batches(
+                        loads,
+                        self.requested_batch_size,
+                        max_load=self.edge_budget,
+                    )
+                    batch_order = (
+                        rng.permutation(len(local_batches))
+                        if self.shuffle
+                        else range(len(local_batches))
+                    )
+                    for batch_index in batch_order:
+                        local = local_batches[int(batch_index)]
+                        yield indices[np.asarray(local, dtype=np.int64)].tolist()
+
+            return iter(generate())
 
         def __len__(self) -> int:
-            return len(self.batches)
+            return max(1, int(self.estimated_steps)) if self.count else 0
 
     class _CompositeCurriculumBatchSampler:
         """Shard-local OMat batches with rotating role-balanced Joint windows."""
+
+        _EAGER_PLAN_LIMIT = 250_000
+        _EDGE_SAMPLE_LIMIT = 8192
+        _EDGE_READ_CHUNK = 8192
 
         def __init__(
             self,
@@ -14021,8 +14913,12 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             self.large_local = np.arange(
                 self.omat_count, self.omat_count + self.large_count, dtype=np.int64
             )
+            self.lazy_plan = True
+            self.estimated_steps = 0
+            self.edge_sample_size = 0
+            self.sampled_mean_edges = float("nan")
             self.omat_by_source: Dict[int, np.ndarray] = {}
-            if self.omat_count:
+            if self.omat_count and not ds.plan.omat_packed and not self.lazy_plan:
                 orders = ds.plan.source_orders[ds.omat_indices]
                 rows = ds.plan.row_indices[ds.omat_indices]
                 for source_order in np.unique(orders):
@@ -14040,15 +14936,29 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     self.omat_count,
                     max(1, int(round(ratio * self.large_count))),
                 )
-            preview = self._role_batches(np.arange(preview_count, dtype=np.int64))
-            preview.extend(self._role_batches(self.large_local))
-            self._update_batch_stats(preview)
+            if self.lazy_plan:
+                self.estimated_steps = (
+                    self._estimate_role_steps(preview_count, local_offset=0)
+                    + self._estimate_role_steps(
+                        self.large_count, local_offset=self.omat_count
+                    )
+                )
+            else:
+                preview = self._role_batches(
+                    np.arange(preview_count, dtype=np.int64)
+                )
+                preview.extend(self._role_batches(self.large_local))
+                self._update_batch_stats(preview)
 
-        def _omat_epoch_indices(self, rng: np.random.Generator) -> np.ndarray:
+        def _omat_epoch_indices(self, rng: np.random.Generator) -> Sequence[int]:
             if self.omat_count == 0:
                 return np.zeros((0,), dtype=np.int64)
             if self.ds.plan.mode != "joint" or self.large_count == 0:
-                selected = np.arange(self.omat_count, dtype=np.uint32)
+                selected: Sequence[int] = (
+                    range(self.omat_count)
+                    if self.lazy_plan and not self.omat_by_source
+                    else np.arange(self.omat_count, dtype=np.uint32)
+                )
             else:
                 ratio = float(getattr(cfg, "composite_joint_foundation_ratio", 4.0))
                 if not math.isfinite(ratio) or ratio <= 0.0:
@@ -14076,7 +14986,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     blocks.append(kept)
             return np.concatenate(blocks) if blocks else np.zeros((0,), dtype=np.int64)
 
-        def _role_batches(self, indices: np.ndarray) -> List[List[int]]:
+        def _role_batches(self, indices: Sequence[int]) -> List[List[int]]:
             values = np.asarray(indices, dtype=np.int64).reshape(-1)
             if values.size == 0:
                 return []
@@ -14107,6 +15017,89 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 batches.append(current)
             return batches
 
+        def _estimate_role_steps(self, count: int, *, local_offset: int) -> int:
+            total = int(count)
+            if total <= 0:
+                return 0
+            structure_steps = int(math.ceil(total / self.batch_size))
+            if self.edge_counts is None or self.edge_budget is None:
+                return structure_steps
+            sample_size = min(self._EDGE_SAMPLE_LIMIT, total)
+            sample_local = np.linspace(
+                0, total - 1, num=sample_size, dtype=np.int64
+            )
+            sampled = np.asarray(
+                self.edge_counts[sample_local + int(local_offset)], dtype=np.int64
+            )
+            self.edge_sample_size += int(sampled.size)
+            mean_edges = float(np.mean(sampled)) if sampled.size else 0.0
+            if math.isfinite(self.sampled_mean_edges):
+                self.sampled_mean_edges = 0.5 * (
+                    self.sampled_mean_edges + mean_edges
+                )
+            else:
+                self.sampled_mean_edges = mean_edges
+            edge_steps = int(math.ceil(
+                mean_edges * total / max(1, int(self.edge_budget))
+            ))
+            return max(structure_steps, edge_steps, 1)
+
+        def _iter_role_batches(
+            self, indices: Sequence[int]
+        ) -> Iterable[List[int]]:
+            total = int(len(indices))
+            if total <= 0:
+                return
+            if self.edge_counts is None or self.edge_budget is None:
+                for start in range(0, total, self.batch_size):
+                    values = indices[start:start + self.batch_size]
+                    if isinstance(values, np.ndarray):
+                        yield values.astype(np.int64, copy=False).tolist()
+                    else:
+                        yield [int(value) for value in values]
+                return
+            current: List[int] = []
+            current_load = 0
+            for start in range(0, total, self._EDGE_READ_CHUNK):
+                end = min(total, start + self._EDGE_READ_CHUNK)
+                values = np.asarray(indices[start:end], dtype=np.int64)
+                loads = np.asarray(self.edge_counts[values], dtype=np.int64)
+                for raw_value, raw_load in zip(values, loads):
+                    value = int(raw_value)
+                    load = int(raw_load)
+                    if current and (
+                        len(current) >= self.batch_size
+                        or current_load + load > int(self.edge_budget)
+                    ):
+                        yield current
+                        current = []
+                        current_load = 0
+                    current.append(value)
+                    current_load += load
+            if current:
+                yield current
+
+        @staticmethod
+        def _interleave_batches(
+            omat_batches: Iterable[List[int]],
+            large_batches: Iterable[List[int]],
+            omat_step: int,
+        ) -> Iterable[List[int]]:
+            omat_iterator = iter(omat_batches)
+            large_iterator = iter(large_batches)
+            omat_done = False
+            for response_batch in large_iterator:
+                if not omat_done:
+                    for _ in range(max(1, int(omat_step))):
+                        try:
+                            yield next(omat_iterator)
+                        except StopIteration:
+                            omat_done = True
+                            break
+                yield response_batch
+            if not omat_done:
+                yield from omat_iterator
+
         def _update_batch_stats(self, batches: Sequence[Sequence[int]]) -> None:
             self.structure_loads = [len(batch) for batch in batches]
             if self.edge_counts is not None:
@@ -14131,6 +15124,21 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             large = self.large_local.copy()
             if self.shuffle:
                 rng.shuffle(large)
+            if self.lazy_plan:
+                omat_batches_iter = self._iter_role_batches(omat)
+                large_batches_iter = self._iter_role_batches(large)
+                omat_estimate = self._estimate_role_steps(len(omat), local_offset=0)
+                large_estimate = self._estimate_role_steps(
+                    len(large), local_offset=self.omat_count
+                )
+                omat_step = max(
+                    1, int(math.ceil(omat_estimate / max(1, large_estimate)))
+                )
+                self.estimated_steps = omat_estimate + large_estimate
+                self.epoch += 1
+                return iter(self._interleave_batches(
+                    omat_batches_iter, large_batches_iter, omat_step
+                ))
             omat_batches = self._role_batches(omat)
             large_batches = self._role_batches(large)
             if omat_batches and large_batches:
@@ -14149,6 +15157,8 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             return iter(merged)
 
         def __len__(self) -> int:
+            if self.lazy_plan:
+                return max(1, int(self.estimated_steps))
             if self.ds.plan.mode == "joint" and self.large_count:
                 ratio = max(1e-12, float(getattr(cfg, "composite_joint_foundation_ratio", 4.0)))
                 omat_count = min(self.omat_count, max(1, int(round(ratio * self.large_count))))
@@ -14187,6 +15197,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     or cfg.w_bec > 0.0
                     or cfg.w_piezoelectric > 0.0
                     or cfg.w_magnetoelastic > 0.0
+                    or bool({
+                        "forces", "stress", "bec", "piezoelectric",
+                        "magnetoelastic_stress",
+                    } & _validation_targets)
                 ) else 30000
             ) if device.type == "mps" else None
             kwargs["batch_sampler"] = _CompositeCurriculumBatchSampler(
@@ -14207,6 +15221,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     or cfg.w_bec > 0.0
                     or cfg.w_piezoelectric > 0.0
                     or cfg.w_magnetoelastic > 0.0
+                    or bool({
+                        "forces", "stress", "bec", "piezoelectric",
+                        "magnetoelastic_stress",
+                    } & _validation_targets)
                 ) else 30000
             )
             kwargs["batch_sampler"] = _FixedGraphBatchSampler(
@@ -14824,8 +15842,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     # stages each get their own folder (e.g. train/model_base/, train/model_resp/).
     _train_dir = _out_p_base.parent / "train" / _out_p_base.stem
     _plots_dir = _train_dir / "plots"
+    _epoch_train_loss_hist: List[float] = []
+    _epoch_val_loss_hist: List[float] = []
     _epoch_emae_hist: List[float] = []
     _epoch_fmae_hist: List[float] = []
+    _epoch_smae_hist: List[float] = []
     _epoch_force_stats: List[Dict[str, float]] = []
     _epoch_multitask_hist: Dict[str, Dict[str, List[float]]] = {}
     _epoch_residual_hist: Dict[str, List[float]] = {}
@@ -14904,7 +15925,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         """Draw one actual-vs-predicted regression scatter panel."""
         if actual is None or pred is None or actual.size == 0 or pred.size == 0:
             ax.text(0.5, 0.5, "No validation data", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(title)
+            ax.set_title(title, fontsize=9)
             ax.set_xlabel(xlabel)
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.2)
@@ -14916,7 +15937,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         ax.set_ylim(lo, hi)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
-        ax.set_title(title)
+        ax.set_title(title, fontsize=9)
         ax.grid(True, alpha=0.25)
         try:
             ax.set_aspect("equal", adjustable="box")
@@ -14939,6 +15960,21 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         v_loader = _make_loader([], shuffle=False)
     def _log_mps_batch_plan(name: str, selected_loader: Any, count: int) -> None:
         sampler = getattr(selected_loader, "batch_sampler", None)
+        if bool(getattr(sampler, "lazy_plan", False)):
+            edge_budget = getattr(sampler, "edge_budget", None)
+            mean_edges = float(getattr(sampler, "sampled_mean_edges", float("nan")))
+            log(
+                f"[{_now()}] Batch plan [mps/{name}]: lazy exact streaming; "
+                f"requested_structures={int(getattr(sampler, 'requested_batch_size', cfg.batch_size))} "
+                f"estimated_steps={len(selected_loader)}"
+                + (
+                    f" edge_budget={int(edge_budget)} sampled_mean_edges={mean_edges:.0f}"
+                    if edge_budget is not None and math.isfinite(mean_edges)
+                    else ""
+                )
+                + "; batches are emitted incrementally and every structure is retained."
+            )
+            return
         edge_loads = getattr(sampler, "edge_loads", None)
         structure_loads = getattr(sampler, "structure_loads", None)
         if not edge_loads or not structure_loads:
@@ -15009,6 +16045,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
         model.train()
         train_loss = 0.0
+        train_batches_used = 0
         train_fmae_sum = 0.0;  train_fmae_n = 0
         train_smae_sum = 0.0;  train_smae_n = 0
         train_emae_sum = 0.0;  train_emae_n = 0
@@ -15157,6 +16194,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                         )
 
             if accepted_results:
+                train_batches_used += 1
                 train_loss += float(np.mean(
                     [float(result["loss"]) for result in accepted_results]
                 ))
@@ -15210,12 +16248,62 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         val_emae_sum = 0.0;  val_emae_n = 0
         val_smae_sum = 0.0;  val_smae_n = 0
         val_step = 0
-        val_e_actual_buf: List[np.ndarray] = []
-        val_e_pred_buf:   List[np.ndarray] = []
-        val_f_actual_buf: List[np.ndarray] = []
-        val_f_pred_buf:   List[np.ndarray] = []
-        val_fn_actual_buf: List[np.ndarray] = []
-        val_fn_pred_buf:   List[np.ndarray] = []
+        val_regression_pairs: Dict[str, _RegressionPairReservoir] = {}
+
+        def _collect_regression_pairs(
+            name: str,
+            prediction: torch.Tensor,
+            target: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> None:
+            if not _HAS_MPL:
+                return
+            predicted = prediction.detach()
+            actual = target.detach().to(
+                dtype=predicted.dtype, device=predicted.device
+            ).reshape_as(predicted)
+            if predicted.ndim == 0:
+                predicted = predicted.reshape(1)
+                actual = actual.reshape(1)
+            selected_weight = torch.as_tensor(
+                weight, dtype=predicted.dtype, device=predicted.device
+            ).reshape(-1)
+            if selected_weight.numel() == 1 and predicted.shape[0] > 1:
+                selected_weight = selected_weight.expand(predicted.shape[0])
+            if selected_weight.numel() != predicted.shape[0]:
+                raise ValueError(
+                    f"Regression weight for {name!r} has "
+                    f"{selected_weight.numel()} entries for {predicted.shape[0]} rows"
+                )
+            selected = torch.isfinite(selected_weight) & (selected_weight > 0.0)
+            if not bool(torch.any(selected).detach().cpu()):
+                return
+            reservoir = val_regression_pairs.get(name)
+            if reservoir is None:
+                name_seed = int.from_bytes(
+                    hashlib.sha256(str(name).encode("utf-8")).digest()[:4],
+                    "little",
+                )
+                reservoir = _RegressionPairReservoir(
+                    5000,
+                    int(cfg.seed) + int(epoch) * 1009 + name_seed,
+                )
+                val_regression_pairs[name] = reservoir
+            selected_actual = actual[selected].reshape(-1)
+            selected_predicted = predicted[selected].reshape(-1)
+            if selected_actual.numel() > 2048:
+                sample_positions = torch.linspace(
+                    0,
+                    selected_actual.numel() - 1,
+                    steps=2048,
+                    device=selected_actual.device,
+                ).to(dtype=torch.long)
+                selected_actual = selected_actual[sample_positions]
+                selected_predicted = selected_predicted[sample_positions]
+            reservoir.add(
+                selected_actual.cpu().numpy(),
+                selected_predicted.cpu().numpy(),
+            )
         val_f_pred_sum = 0.0;      val_f_pred_sq_sum = 0.0;      val_f_pred_maxabs = 0.0;      val_f_pred_n = 0
         val_f_actual_sum = 0.0;    val_f_actual_sq_sum = 0.0;    val_f_actual_maxabs = 0.0;    val_f_actual_n = 0
         val_fn_pred_sum = 0.0;     val_fn_pred_sq_sum = 0.0;     val_fn_pred_max = 0.0;        val_fn_pred_n = 0
@@ -15375,12 +16463,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     )
                     val_emae_sum += _sum
                     val_emae_n += _count
-                    if _HAS_MPL:
-                        # Store E/atom so the scatter plot is comparable across system sizes.
-                        _npa_np = _npa_val.detach().cpu().numpy().ravel()
-                        _mask_e = w_e.detach().cpu().numpy().ravel() > 0.0
-                        val_e_actual_buf.append(y_e.detach().cpu().numpy().ravel()[_mask_e] / _npa_np[_mask_e])
-                        val_e_pred_buf.append(out["energy"].detach().cpu().numpy().ravel()[_mask_e] / _npa_np[_mask_e])
+                    _collect_regression_pairs(
+                        "energy", out["energy"] / _npa_val,
+                        y_e / _npa_val, w_e,
+                    )
                 if need_forces:
                     y_f = batch.forces.to(out["forces"].dtype)
                     w_f = _expanded_property_weight(batch, "forces", out["forces"], atomwise=True)
@@ -15422,11 +16508,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                         ((_fn_pred - _fn_true).abs() * _labeled_weights).sum().detach()
                     )
                     val_fnorm_mae_n += int(_fn_pred.numel())
-                    if _HAS_MPL:
-                        val_f_actual_buf.append(_f_true_labeled.cpu().numpy().ravel())
-                        val_f_pred_buf.append(_f_pred_labeled.cpu().numpy().ravel())
-                        val_fn_actual_buf.append(_fn_true.cpu().numpy().ravel())
-                        val_fn_pred_buf.append(_fn_pred.cpu().numpy().ravel())
+                    _collect_regression_pairs("forces", _f_pred, _f_true, w_f)
+                    _collect_regression_pairs(
+                        "_force_norm", _fn_pred, _fn_true, _labeled_weights
+                    )
                 if need_stress:
                     y_s = torch.as_tensor(
                         batch.stress,
@@ -15447,6 +16532,12 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     )
                     val_smae_sum += _sum
                     val_smae_n += _count
+                    _collect_regression_pairs(
+                        "stress",
+                        _symmetric_tensor_components(out["stress"]),
+                        _symmetric_tensor_components(y_s),
+                        w_s,
+                    )
                 if need_mu:
                     y_mu = batch.dipole.squeeze(1) if batch.dipole.ndim == 3 else batch.dipole
                     w_mu = _expanded_property_weight(batch, "dipole", out["dipole"], atomwise=False)
@@ -15460,6 +16551,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     _acc = val_extra_metrics.setdefault("dipole", [0.0, 0.0])
                     _acc[0] += _sum
                     _acc[1] += _count
+                    _collect_regression_pairs(
+                        "dipole", out["dipole"],
+                        y_mu.to(out["dipole"].dtype), w_mu,
+                    )
                 if need_alpha:
                     y_a = batch.polarizability.squeeze(1) if batch.polarizability.ndim == 4 else batch.polarizability
                     w_a = _expanded_property_weight(
@@ -15475,6 +16570,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     _acc = val_extra_metrics.setdefault("polarizability", [0.0, 0.0])
                     _acc[0] += _sum
                     _acc[1] += _count
+                    _collect_regression_pairs(
+                        "polarizability", out["polarizability"],
+                        y_a.to(out["polarizability"].dtype), w_a,
+                    )
                 additional_loss, additional_metrics = _additional_physics_loss(
                     out, batch, cfg, metric_targets=_validation_targets
                 )
@@ -15483,6 +16582,54 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     accumulator = val_extra_metrics.setdefault(name, [0.0, 0.0])
                     accumulator[0] += value_sum
                     accumulator[1] += value_count
+                if _HAS_MPL:
+                    atomwise_regression_targets = {
+                        "charges", "atomic_dipoles", "atomic_polarizability",
+                        "c6", "bec", "magnetic_moments", "effective_field", "Di",
+                    }
+                    for metric_name in additional_metrics:
+                        if metric_name == "total_charge":
+                            predicted_charge = scatter_sum(
+                                out["charges"], batch.batch,
+                                dim_size=_batch_num_graphs(batch),
+                            ).reshape(-1)
+                            target_charge = _batch_total_charge(
+                                batch, _batch_num_graphs(batch),
+                                predicted_charge.dtype,
+                            ).to(device=predicted_charge.device)
+                            charge_weight = _expanded_property_weight(
+                                batch, "total_charge", predicted_charge,
+                                atomwise=False,
+                            )
+                            _collect_regression_pairs(
+                                "total_charge", predicted_charge,
+                                target_charge, charge_weight,
+                            )
+                            continue
+                        if (
+                            metric_name in {"bec_sum_rule", "coupling_consistency"}
+                            or metric_name not in out
+                            or not hasattr(batch, metric_name)
+                        ):
+                            continue
+                        prediction = out[metric_name]
+                        target = torch.as_tensor(
+                            getattr(batch, metric_name),
+                            dtype=prediction.dtype,
+                            device=prediction.device,
+                        ).reshape_as(prediction)
+                        metric_weight = _expanded_property_weight(
+                            batch,
+                            metric_name,
+                            prediction,
+                            atomwise=metric_name in atomwise_regression_targets,
+                        )
+                        if metric_name == "magnetoelastic_stress":
+                            prediction = _symmetric_tensor_components(prediction)
+                            target = _symmetric_tensor_components(target)
+                        _collect_regression_pairs(
+                            metric_name, prediction, target, metric_weight
+                        )
                 for residual_name in (
                     "qeq_residual", "qeq_stability_shift", "deq_residual",
                     "deq_stability_shift",
@@ -15524,7 +16671,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         if val_smae_n > 0:
             validation_terms.append(_final_val_smae / VALIDATION_MAE_SCALES["stress"])
         for metric_name, (metric_sum, metric_count) in val_extra_metrics.items():
-            if metric_count > 0:
+            if (
+                metric_count > 0
+                and metric_name not in DIAGNOSTIC_ONLY_MAE_TARGETS
+            ):
                 scale = VALIDATION_MAE_SCALES.get(metric_name, 1.0)
                 validation_terms.append((metric_sum / metric_count) / scale)
         _epoch_validation_score = (
@@ -15559,7 +16709,8 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             _epochs_without_improvement = 0
         else:
             _epochs_without_improvement += 1
-        _ep_str = (f"Epoch {epoch}: Train={train_loss/max(1,len(loader)):.4f} "
+        _final_train_loss = train_loss / max(1, train_batches_used)
+        _ep_str = (f"Epoch {epoch}: Train={_final_train_loss:.4f} "
                    f"Val={_final_val_loss:.4f}")
         if val_emae_n > 0 or val_fmae_n > 0:
             _ep_str += "  |"
@@ -15570,22 +16721,33 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             _ep_str += (f"  F-MAE  tr={train_fmae_sum/max(1,train_fmae_n):.4f}"
                         f"  val={_final_val_fmae:.4f}  eV/Å")
         if val_smae_n > 0:
+            train_stress_text = (
+                f"{train_smae_sum / train_smae_n:.4f}"
+                if train_smae_n > 0 else "n/a"
+            )
             _ep_str += (
-                f"  stress-MAE tr={train_smae_sum/max(1,train_smae_n):.4f}"
+                f"  stress-MAE tr={train_stress_text}"
                 f" val={_final_val_smae:.4f} eV/Å^3"
             )
         for metric_name in sorted(val_extra_metrics):
             val_sum, val_count = val_extra_metrics[metric_name]
             train_sum, train_count = train_extra_metrics.get(metric_name, [0.0, 0.0])
             if val_count > 0:
-                _ep_str += (
-                    f"  {metric_name}-MAE tr={train_sum/max(1.0, train_count):.4g}"
-                    f" val={val_sum/max(1.0, val_count):.4g}"
+                train_metric_text = (
+                    f"{train_sum / train_count:.4g}"
+                    if train_count > 0 else "n/a"
                 )
+                if metric_name not in DIAGNOSTIC_ONLY_MAE_TARGETS:
+                    _ep_str += (
+                        f"  {metric_name}-MAE tr={train_metric_text}"
+                        f" val={val_sum/max(1.0, val_count):.4g}"
+                    )
                 history = _epoch_multitask_hist.setdefault(
                     metric_name, {"train": [], "val": []}
                 )
-                history["train"].append(train_sum / max(1.0, train_count))
+                history["train"].append(
+                    train_sum / train_count if train_count > 0 else float("nan")
+                )
                 history["val"].append(val_sum / max(1.0, val_count))
         for residual_name, value in val_residual_max.items():
             _epoch_residual_hist.setdefault(residual_name, []).append(value)
@@ -15631,124 +16793,157 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             model.save(_epoch_ckpt)
 
         # ── MAE history accumulation ──────────────────────────────────────────
+        _epoch_train_loss_hist.append(float(_final_train_loss))
+        _epoch_val_loss_hist.append(float(_final_val_loss))
         _epoch_emae_hist.append(
             _final_val_emae if val_emae_n > 0 else float("nan")
         )
         _epoch_fmae_hist.append(
             _final_val_fmae if val_fmae_n > 0 else float("nan")
         )
+        _epoch_smae_hist.append(
+            _final_val_smae if val_smae_n > 0 else float("nan")
+        )
         if cfg.save_epoch_artifacts:
+            response_history = {
+                name: history
+                for name, history in _epoch_multitask_hist.items()
+                if name in RESPONSE_VALIDATION_TARGETS
+            }
             metrics_payload = {
+                "training_mode": str(cfg.mode),
+                "diagnostic_only_metrics": sorted(
+                    set(response_history) & set(DIAGNOSTIC_ONLY_MAE_TARGETS)
+                ),
+                "train_loss": _epoch_train_loss_hist,
+                "val_loss": _epoch_val_loss_hist,
                 "energy_mae": _epoch_emae_hist,
                 "force_mae": _epoch_fmae_hist,
+                "stress_mae": _epoch_smae_hist,
+                "core_mae": {
+                    "energy": _epoch_emae_hist,
+                    "forces": _epoch_fmae_hist,
+                    "stress": _epoch_smae_hist,
+                },
+                "response_mae": response_history,
                 "multitask_mae": _epoch_multitask_hist,
                 "physics_residual_max": _epoch_residual_hist,
+                "metric_units": dict(VALIDATION_METRIC_UNITS),
             }
             (_train_dir / "multitask_metrics_history.json").write_text(
                 json.dumps(metrics_payload, indent=2, sort_keys=True), encoding="utf-8"
             )
 
         # ── Scatter plots + MAE history chart ─────────────────────────────────
+        regression_names_for_artifact: List[str] = []
+        hidden_regression_names_for_artifact: List[str] = []
         if cfg.save_epoch_artifacts and _HAS_MPL:
             _ep_x = list(range(1, epoch + 1))
-            _energy_color = "#2563eb"
-            _force_color = "#d97706"
+            force_norm_pairs = val_regression_pairs.get("_force_norm")
+            _fn_act_all = (
+                force_norm_pairs.actual if force_norm_pairs is not None else None
+            )
+            _fn_prd_all = (
+                force_norm_pairs.predicted if force_norm_pairs is not None else None
+            )
+            all_regression_names = _ordered_mae_metric_names(
+                name for name in val_regression_pairs if not name.startswith("_")
+            )
+            regression_names = _ordered_plottable_mae_metric_names(
+                all_regression_names
+            )
+            regression_names_for_artifact = list(regression_names)
+            hidden_regression_names_for_artifact = [
+                name for name in all_regression_names
+                if name in DIAGNOSTIC_ONLY_MAE_TARGETS
+            ]
+            regression_mae: Dict[str, float] = {
+                **({"energy": _final_val_emae} if val_emae_n > 0 else {}),
+                **({"forces": _final_val_fmae} if val_fmae_n > 0 else {}),
+                **({"stress": _final_val_smae} if val_smae_n > 0 else {}),
+                **{
+                    name: total / count
+                    for name, (total, count) in val_extra_metrics.items()
+                    if count > 0
+                },
+            }
 
-            _e_act_all = np.concatenate(val_e_actual_buf) if val_e_actual_buf else None
-            _e_prd_all = np.concatenate(val_e_pred_buf) if val_e_pred_buf else None
-            _f_act_all = np.concatenate(val_f_actual_buf) if val_f_actual_buf else None
-            _f_prd_all = np.concatenate(val_f_pred_buf) if val_f_pred_buf else None
-            _fn_act_all = np.concatenate(val_fn_actual_buf) if val_fn_actual_buf else None
-            _fn_prd_all = np.concatenate(val_fn_pred_buf) if val_fn_pred_buf else None
+            def _render_dynamic_regression(*, clipped: bool) -> None:
+                if not regression_names:
+                    return
+                panel_count = len(regression_names)
+                rows, columns = _automatic_panel_grid(panel_count)
+                figure, axes = plt.subplots(
+                    rows,
+                    columns,
+                    squeeze=False,
+                    figsize=(4.5 * columns, 4.15 * rows),
+                )
+                flat_axes = np.asarray(axes, dtype=object).reshape(-1)
+                for metric_index, metric_name in enumerate(regression_names):
+                    metric_axis = flat_axes[metric_index]
+                    pairs = val_regression_pairs[metric_name]
+                    actual = pairs.actual
+                    predicted = pairs.predicted
+                    limits = None
+                    hidden = 0
+                    if clipped:
+                        actual, predicted, hidden, limits = _clipped_pairs(
+                            actual, predicted
+                        )
+                    unit = VALIDATION_METRIC_UNITS.get(metric_name, "native unit")
+                    metric_label = VALIDATION_METRIC_LABELS.get(
+                        metric_name,
+                        f"{metric_name.replace('_', ' ')}-MAE",
+                    )
+                    mae_value = regression_mae.get(metric_name, float("nan"))
+                    title = (
+                        f"{metric_label}={mae_value:.4g} {unit}"
+                        if math.isfinite(mae_value)
+                        else metric_label
+                    )
+                    if clipped and hidden:
+                        title += f" | {hidden} clipped"
+                    display_name = metric_name.replace("_", " ")
+                    _plot_regression_panel(
+                        metric_axis,
+                        actual=actual,
+                        pred=predicted,
+                        color=MAE_PLOT_COLORS[
+                            metric_index % len(MAE_PLOT_COLORS)
+                        ],
+                        xlabel=f"Actual {display_name} [{unit}]",
+                        ylabel=f"Predicted {display_name} [{unit}]",
+                        title=title,
+                        limits=limits,
+                        point_size=6.0,
+                        point_alpha=0.36,
+                    )
+                for unused_axis in flat_axes[panel_count:]:
+                    unused_axis.set_visible(False)
+                range_name = (
+                    f"Clipped p{int(_scatter_clip_lo)}-p{int(_scatter_clip_hi)}"
+                    if clipped else "Full Range"
+                )
+                figure.suptitle(
+                    f"{str(cfg.mode).title()} Validation Regression - "
+                    f"Epoch {epoch} - {range_name}",
+                    fontsize=12,
+                )
+                figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+                variant = "clipped" if clipped else "full"
+                figure.savefig(
+                    str(
+                        _plots_dir
+                        / f"regression_{variant}_epoch_{epoch:04d}.png"
+                    ),
+                    dpi=110,
+                    bbox_inches="tight",
+                )
+                plt.close(figure)
 
-            # Full-range parity chart: energy on the left, forces on the right.
-            _fig, (_ax_e_full, _ax_f_full) = plt.subplots(1, 2, figsize=(11.5, 5.2))
-            if _e_act_all is not None and _e_prd_all is not None:
-                _e_act_full, _e_prd_full = _subsample_pairs(_e_act_all, _e_prd_all, max_points=5000, seed=epoch * 17 + 1)
-            else:
-                _e_act_full = _e_prd_full = None
-            if _f_act_all is not None and _f_prd_all is not None:
-                _f_act_full, _f_prd_full = _subsample_pairs(_f_act_all, _f_prd_all, max_points=5000, seed=epoch * 17 + 2)
-            else:
-                _f_act_full = _f_prd_full = None
-            _plot_regression_panel(
-                _ax_e_full,
-                actual=_e_act_full,
-                pred=_e_prd_full,
-                color=_energy_color,
-                xlabel="Actual E/atom (eV)",
-                ylabel="Predicted E/atom (eV)",
-                title=f"Energy/atom  full range  E-MAE={_final_val_emae:.4f} eV/atom",
-                point_size=10.0,
-                point_alpha=0.50,
-            )
-            _plot_regression_panel(
-                _ax_f_full,
-                actual=_f_act_full,
-                pred=_f_prd_full,
-                color=_force_color,
-                xlabel="Actual F (eV/Å)",
-                ylabel="Predicted F (eV/Å)",
-                title=f"Forces  full range  F-MAE={_final_val_fmae:.4f} eV/Å",
-                point_size=5.0,
-                point_alpha=0.30,
-            )
-            _fig.suptitle(f"Validation Regression  Epoch {epoch}  (Full Range)", fontsize=12)
-            _fig.tight_layout()
-            _fig.savefig(str(_plots_dir / f"regression_full_epoch_{epoch:04d}.png"),
-                         dpi=110, bbox_inches="tight")
-            plt.close(_fig)
-
-            # Clipped parity chart: energy on the left, forces on the right.
-            _fig, (_ax_e_clip, _ax_f_clip) = plt.subplots(1, 2, figsize=(11.5, 5.2))
-            if _e_act_all is not None and _e_prd_all is not None:
-                _e_act_clip, _e_prd_clip, _e_hidden, _e_lim = _clipped_pairs(_e_act_all, _e_prd_all)
-                _e_act_clip, _e_prd_clip = _subsample_pairs(_e_act_clip, _e_prd_clip, max_points=5000, seed=epoch * 17 + 3)
-                _e_note = f" [{_e_hidden} hidden outside p{int(_scatter_clip_lo)}-p{int(_scatter_clip_hi)}]" if _e_hidden > 0 else ""
-            else:
-                _e_act_clip = _e_prd_clip = None
-                _e_lim = None
-                _e_note = ""
-            if _f_act_all is not None and _f_prd_all is not None:
-                _f_act_clip, _f_prd_clip, _f_hidden, _f_lim = _clipped_pairs(_f_act_all, _f_prd_all)
-                _f_act_clip, _f_prd_clip = _subsample_pairs(_f_act_clip, _f_prd_clip, max_points=5000, seed=epoch * 17 + 4)
-                _f_note = f" [{_f_hidden} hidden outside p{int(_scatter_clip_lo)}-p{int(_scatter_clip_hi)}]" if _f_hidden > 0 else ""
-            else:
-                _f_act_clip = _f_prd_clip = None
-                _f_lim = None
-                _f_note = ""
-            _plot_regression_panel(
-                _ax_e_clip,
-                actual=_e_act_clip,
-                pred=_e_prd_clip,
-                color=_energy_color,
-                xlabel="Actual E/atom (eV)",
-                ylabel="Predicted E/atom (eV)",
-                title=f"Energy/atom  clipped{_e_note}",
-                limits=_e_lim,
-                point_size=10.0,
-                point_alpha=0.55,
-            )
-            _plot_regression_panel(
-                _ax_f_clip,
-                actual=_f_act_clip,
-                pred=_f_prd_clip,
-                color=_force_color,
-                xlabel="Actual F (eV/Å)",
-                ylabel="Predicted F (eV/Å)",
-                title=f"Forces  clipped{_f_note}",
-                limits=_f_lim,
-                point_size=5.0,
-                point_alpha=0.35,
-            )
-            _fig.suptitle(
-                f"Validation Regression  Epoch {epoch}  (Clipped to p{int(_scatter_clip_lo)}-p{int(_scatter_clip_hi)})",
-                fontsize=12,
-            )
-            _fig.tight_layout()
-            _fig.savefig(str(_plots_dir / f"regression_clipped_epoch_{epoch:04d}.png"),
-                         dpi=110, bbox_inches="tight")
-            plt.close(_fig)
+            _render_dynamic_regression(clipped=False)
+            _render_dynamic_regression(clipped=True)
 
             # Force-norm parity chart: a more stable view than raw signed components.
             _force_norm_color = "#059669"
@@ -15794,59 +16989,91 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                          dpi=110, bbox_inches="tight")
             plt.close(_fig)
 
-            # Cumulative MAE history line chart with separate y-axes for E and F.
-            _fig, _ax_e = plt.subplots(figsize=(7.6, 4.2))
-            _ax_f = _ax_e.twinx()
-            _lines = []
-            _labels = []
-            if any(e < float("inf") for e in _epoch_emae_hist):
-                _line_e, = _ax_e.plot(
-                    _ep_x, _epoch_emae_hist, label="E-MAE (eV)",
-                    marker=".", linewidth=1.6, color=_energy_color,
+            combined_histories: Dict[str, Sequence[float]] = {
+                "energy": _epoch_emae_hist,
+                "forces": _epoch_fmae_hist,
+                "stress": _epoch_smae_hist,
+            }
+            combined_histories.update({
+                name: history["val"] for name, history in response_history.items()
+            })
+            metric_names = _ordered_plottable_mae_metric_names(
+                combined_histories
+            )
+            _fig, (loss_axis, axis) = plt.subplots(
+                1, 2, figsize=(15.0, 5.8),
+                gridspec_kw={"width_ratios": (0.85, 1.35)},
+            )
+            loss_epochs = np.arange(
+                1, len(_epoch_train_loss_hist) + 1, dtype=np.int64
+            )
+            loss_axis.plot(
+                loss_epochs, _epoch_train_loss_hist,
+                marker="o", markersize=3, linewidth=1.6, linestyle="--",
+                color="#667085", label="Train loss",
+            )
+            loss_axis.plot(
+                loss_epochs, _epoch_val_loss_hist,
+                marker="o", markersize=3, linewidth=1.8,
+                color="#7a5af8", label="Validation loss",
+            )
+            _set_combined_mae_axis_scale(
+                loss_axis, _epoch_train_loss_hist + _epoch_val_loss_hist
+            )
+            loss_axis.set_title("Objective History")
+            loss_axis.set_xlabel("Epoch")
+            loss_axis.set_ylabel("Loss")
+            loss_axis.grid(True, alpha=0.3, which="both")
+            loss_axis.legend(frameon=False, fontsize=8)
+            all_mae_values: List[float] = []
+            metric_handles: Dict[str, Any] = {}
+            for metric_index, metric_name in enumerate(metric_names):
+                values = np.asarray(combined_histories[metric_name], dtype=float)
+                finite = np.isfinite(values)
+                if not bool(np.any(finite)):
+                    continue
+                x_values = np.arange(1, values.size + 1, dtype=np.int64)[finite]
+                y_values = values[finite]
+                all_mae_values.extend(float(value) for value in y_values)
+                line = axis.plot(
+                    x_values,
+                    y_values,
+                    marker="o",
+                    markersize=3,
+                    linewidth=1.7,
+                    color=MAE_PLOT_COLORS[metric_index % len(MAE_PLOT_COLORS)],
+                    label=_mae_metric_legend_label(metric_name),
+                )[0]
+                metric_handles[metric_name] = line
+            _set_combined_mae_axis_scale(axis, all_mae_values)
+            axis.set_title("Validation MAE History")
+            axis.set_xlabel("Epoch")
+            axis.set_ylabel("MAE (native units; units in legend)")
+            axis.grid(True, alpha=0.3, which="both")
+            if axis.lines:
+                legend_rows = _add_combined_mae_legends(axis, metric_handles)
+                _fig.subplots_adjust(bottom=min(0.46, 0.18 + 0.045 * legend_rows))
+            else:
+                axis.text(
+                    0.5, 0.5, "No labeled validation data",
+                    ha="center", va="center", transform=axis.transAxes,
                 )
-                _lines.append(_line_e)
-                _labels.append(_line_e.get_label())
-            if any(e < float("inf") for e in _epoch_fmae_hist):
-                _line_f, = _ax_f.plot(
-                    _ep_x, _epoch_fmae_hist, label="F-MAE (eV/Å)",
-                    marker=".", linewidth=1.6, color=_force_color,
-                )
-                _lines.append(_line_f)
-                _labels.append(_line_f.get_label())
-            _ax_e.set_xlabel("Epoch")
-            _ax_e.set_ylabel("Energy/atom MAE (eV/atom)", color=_energy_color)
-            _ax_f.set_ylabel("Force MAE (eV/Å)", color=_force_color)
-            _ax_e.tick_params(axis="y", colors=_energy_color)
-            _ax_f.tick_params(axis="y", colors=_force_color)
-            _ax_e.set_title("Validation MAE History")
-            _ax_e.grid(True, alpha=0.3)
-            if _lines:
-                _ax_e.legend(_lines, _labels, loc="upper right")
-            _fig.tight_layout()
-            _fig.savefig(str(_plots_dir / "mae_history.png"), dpi=100, bbox_inches="tight")
-            plt.close(_fig)
-
-            if _epoch_multitask_hist:
-                metric_names = sorted(_epoch_multitask_hist)
-                columns = 2
-                rows = int(math.ceil(len(metric_names) / columns))
-                _fig, axes = plt.subplots(rows, columns, figsize=(12.0, max(3.4, 3.2 * rows)))
-                axes_array = np.asarray(axes, dtype=object).reshape(-1)
-                for axis, metric_name in zip(axes_array, metric_names):
-                    history = _epoch_multitask_hist[metric_name]
-                    x_values = np.arange(1, len(history["val"]) + 1)
-                    axis.plot(x_values, history["train"], label="train", linewidth=1.5)
-                    axis.plot(x_values, history["val"], label="validation", linewidth=1.5)
-                    axis.set_title(f"{metric_name} MAE")
-                    axis.set_xlabel("Epoch")
-                    axis.set_ylabel("MAE")
-                    axis.grid(True, alpha=0.3)
-                    axis.legend()
-                for axis in axes_array[len(metric_names):]:
-                    axis.set_visible(False)
                 _fig.tight_layout()
-                _fig.savefig(str(_plots_dir / "multitask_mae_history.png"), dpi=110, bbox_inches="tight")
-                plt.close(_fig)
+            _fig.savefig(
+                str(_plots_dir / "mae_history.png"), dpi=110,
+                bbox_inches="tight",
+            )
+            if response_history:
+                # Compatibility aliases now contain the same all-MAE chart.
+                _fig.savefig(
+                    str(_plots_dir / "response_mae_history.png"), dpi=110,
+                    bbox_inches="tight",
+                )
+                _fig.savefig(
+                    str(_plots_dir / "multitask_mae_history.png"), dpi=110,
+                    bbox_inches="tight",
+                )
+            plt.close(_fig)
 
             if _epoch_residual_hist:
                 _fig, axis = plt.subplots(figsize=(8.2, 4.8))
@@ -15875,6 +17102,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     cfg.save_epoch_artifacts
                     and bool(getattr(cfg, "save_epoch_plots", True))
                     and _HAS_MPL
+                ),
+                "regression_metrics": list(regression_names_for_artifact),
+                "hidden_regression_metrics": list(
+                    hidden_regression_names_for_artifact
                 ),
             })
             progress({"type": "epoch", "epoch": int(epoch), "epochs": int(cfg.epochs)})
@@ -15916,21 +17147,61 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 encoding="utf-8",
             )
         if progress is not None:
+            validation_multitask_mae = {
+                name: float(total / count)
+                for name, (total, count) in val_extra_metrics.items()
+                if count > 0
+            }
+            training_multitask_mae = {
+                name: float(total / count)
+                for name, (total, count) in train_extra_metrics.items()
+                if count > 0
+            }
+            core_mae = {
+                **({"energy": float(_final_val_emae)} if val_emae_n > 0 else {}),
+                **({"forces": float(_final_val_fmae)} if val_fmae_n > 0 else {}),
+                **({"stress": float(_final_val_smae)} if val_smae_n > 0 else {}),
+            }
+            train_core_mae = {
+                **({"energy": train_emae_sum / train_emae_n} if train_emae_n > 0 else {}),
+                **({"forces": train_fmae_sum / train_fmae_n} if train_fmae_n > 0 else {}),
+                **({"stress": train_smae_sum / train_smae_n} if train_smae_n > 0 else {}),
+            }
+            response_mae = {
+                name: value
+                for name, value in validation_multitask_mae.items()
+                if name in RESPONSE_VALIDATION_TARGETS
+            }
+            train_response_mae = {
+                name: value
+                for name, value in training_multitask_mae.items()
+                if name in RESPONSE_VALIDATION_TARGETS
+            }
             progress({
                 "type": "metrics",
+                "training_mode": str(cfg.mode),
                 "epoch": int(epoch),
                 "epochs": int(cfg.epochs),
-                "train_loss": float(train_loss / max(1, len(loader))),
+                "train_loss": float(_final_train_loss),
                 "val_loss": float(_final_val_loss),
                 "validation_score": float(_epoch_validation_score),
                 "energy_mae": float(_final_val_emae) if val_emae_n > 0 else None,
                 "force_mae": float(_final_val_fmae) if val_fmae_n > 0 else None,
                 "stress_mae": float(_final_val_smae) if val_smae_n > 0 else None,
-                "multitask_mae": {
-                    name: float(total / count)
-                    for name, (total, count) in val_extra_metrics.items()
-                    if count > 0
+                "core_mae": core_mae,
+                "train_core_mae": train_core_mae,
+                "response_mae": response_mae,
+                "train_response_mae": train_response_mae,
+                "multitask_mae": validation_multitask_mae,
+                "train_multitask_mae": training_multitask_mae,
+                "metric_units": {
+                    name: VALIDATION_METRIC_UNITS.get(name, "unknown")
+                    for name in set(core_mae) | set(response_mae)
                 },
+                "diagnostic_only_metrics": sorted(
+                    set(validation_multitask_mae)
+                    & set(DIAGNOSTIC_ONLY_MAE_TARGETS)
+                ),
                 "validation_counts": {
                     **({"energy": int(val_emae_n)} if val_emae_n > 0 else {}),
                     **({"forces": int(val_fmae_n)} if val_fmae_n > 0 else {}),
@@ -18651,7 +19922,7 @@ class App(tk.Tk):
         live_view = ttk.Combobox(
             live_toolbar,
             textvariable=self.var_live_plot,
-            values=["Regression", "MAE History", "Multi-Task", "Physics Residuals"],
+            values=["Regression", "MAE History", "Physics Residuals"],
             state="readonly",
             width=20,
         )
@@ -18667,7 +19938,7 @@ class App(tk.Tk):
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
             from matplotlib.figure import Figure
 
-            self._live_figure = Figure(figsize=(8.8, 5.8), dpi=100, facecolor="#ffffff")
+            self._live_figure = Figure(figsize=(11.0, 5.8), dpi=100, facecolor="#ffffff")
             self._live_canvas = FigureCanvasTkAgg(self._live_figure, master=live_tab)
             canvas_widget = self._live_canvas.get_tk_widget()
             canvas_widget.configure(background="#ffffff", highlightthickness=0)
@@ -18736,6 +20007,8 @@ class App(tk.Tk):
         figure = self._live_figure
         figure.clear()
         view = str(self.var_live_plot.get() or "Regression")
+        if view == "Multi-Task":
+            view = "MAE History"
         history = list(self._live_metric_history)
 
         if not history:
@@ -18754,13 +20027,6 @@ class App(tk.Tk):
             self._live_canvas.draw_idle()
             return
 
-        colors = {
-            "energy": "#3167e3",
-            "forces": "#e4872b",
-            "train": "#667085",
-            "score": "#7a5af8",
-            "residual": "#159570",
-        }
         if view == "Regression":
             image_path = self._latest_regression_image()
             if image_path is not None:
@@ -18776,55 +20042,101 @@ class App(tk.Tk):
             else:
                 view = "MAE History"
 
+        combined_mae_legend_rows = 0
         if view == "MAE History":
-            left = figure.add_subplot(121)
-            right = figure.add_subplot(122)
-            for key, label, color in (
-                ("train_loss", "Train loss", colors["train"]),
-                ("val_loss", "Validation loss", colors["score"]),
-            ):
-                x, y = self._finite_history_values(history, key)
-                if y:
-                    left.plot(x, y, marker="o", markersize=3, linewidth=1.8, label=label, color=color)
-            self._style_live_axis(left, "Objective history", "Loss")
-            if left.lines:
-                left.legend(frameon=False, fontsize=8)
-            for key, label, color in (
-                ("energy_mae", "Energy MAE", colors["energy"]),
-                ("force_mae", "Force MAE", colors["forces"]),
-                ("stress_mae", "Stress MAE", colors["residual"]),
-                ("validation_score", "Normalized score", colors["score"]),
-            ):
-                x, y = self._finite_history_values(history, key)
-                if y:
-                    right.plot(x, y, marker="o", markersize=3, linewidth=1.8, label=label, color=color)
-            self._style_live_axis(right, "Validation quality", "MAE / score")
-            if right.lines:
-                right.legend(frameon=False, fontsize=8)
-
-        elif view == "Multi-Task":
-            metric_names = sorted({
-                name for item in history for name in item.get("multitask_mae", {})
-            })
-            axis = figure.add_subplot(111)
-            palette = ["#3167e3", "#e4872b", "#159570", "#7a5af8", "#d14f69", "#70859f"]
-            for index, name in enumerate(metric_names):
-                x: List[int] = []
-                y: List[float] = []
-                for item in history:
-                    value = item.get("multitask_mae", {}).get(name)
-                    if value is not None and math.isfinite(float(value)):
-                        x.append(int(item["epoch"]))
-                        y.append(float(value))
-                if y:
-                    axis.plot(x, y, marker="o", markersize=3, linewidth=1.6,
-                              label=name, color=palette[index % len(palette)])
-            self._style_live_axis(axis, "Active multi-task validation MAE", "MAE")
-            if axis.lines:
-                axis.legend(frameon=False, fontsize=8, ncol=min(3, max(1, len(metric_names))))
+            loss_axis, axis = figure.subplots(
+                1, 2, gridspec_kw={"width_ratios": (0.85, 1.35)}
+            )
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            group_labels: Dict[str, str] = {}
+            for item in history:
+                stage_id = str(
+                    item.get("stage_id")
+                    or item.get("training_mode")
+                    or "current"
+                )
+                grouped.setdefault(stage_id, []).append(item)
+                group_labels.setdefault(
+                    stage_id,
+                    str(item.get("stage_label") or stage_id.replace("_", " ").title()),
+                )
+            loss_colors = (
+                "#4A7FC1", "#D48851", "#4A9478", "#8F7AC8", "#C35F79",
+                "#76869B",
+            )
+            all_loss_values: List[float] = []
+            for stage_index, (stage_id, stage_history) in enumerate(grouped.items()):
+                stage_label = group_labels[stage_id]
+                color = loss_colors[stage_index % len(loss_colors)]
+                for key, split_label, linestyle, alpha in (
+                    ("train_loss", "train", "--", 0.72),
+                    ("val_loss", "validation", "-", 1.0),
+                ):
+                    x, y = self._finite_history_values(stage_history, key)
+                    if not y:
+                        continue
+                    all_loss_values.extend(y)
+                    loss_axis.plot(
+                        x, y, marker="o", markersize=3,
+                        linewidth=1.6 if split_label == "train" else 1.8,
+                        linestyle=linestyle, color=color, alpha=alpha,
+                        label=f"{stage_label} {split_label}",
+                    )
+            _set_combined_mae_axis_scale(loss_axis, all_loss_values)
+            self._style_live_axis(loss_axis, "Objective by training stage", "Loss")
+            if loss_axis.lines:
+                loss_axis.legend(frameon=False, fontsize=7)
             else:
-                axis.text(0.5, 0.5, "No auxiliary targets are active", ha="center", va="center",
-                          color="#667085", transform=axis.transAxes)
+                loss_axis.text(
+                    0.5, 0.5, "No objective history",
+                    ha="center", va="center", color="#667085",
+                    transform=loss_axis.transAxes,
+                )
+            metric_names = _ordered_plottable_mae_metric_names({
+                name for item in history for name in _event_all_mae(item)
+            })
+            metric_handles: Dict[str, Any] = {}
+            all_mae_values: List[float] = []
+            stage_labels: List[str] = []
+            for stage_index, (stage_id, stage_history) in enumerate(grouped.items()):
+                stage_label = group_labels[stage_id]
+                stage_labels.append(stage_label)
+                linestyle = MAE_STAGE_LINESTYLES[
+                    stage_index % len(MAE_STAGE_LINESTYLES)
+                ]
+                for metric_index, name in enumerate(metric_names):
+                    x: List[int] = []
+                    y: List[float] = []
+                    for item in stage_history:
+                        value = _event_all_mae(item).get(name)
+                        if value is not None and math.isfinite(float(value)):
+                            x.append(int(item.get("epoch", len(x) + 1)))
+                            y.append(float(value))
+                    if not y:
+                        continue
+                    all_mae_values.extend(y)
+                    line = axis.plot(
+                        x, y, marker="o", markersize=3, linewidth=1.7,
+                        linestyle=linestyle,
+                        color=MAE_PLOT_COLORS[metric_index % len(MAE_PLOT_COLORS)],
+                    )[0]
+                    metric_handles.setdefault(name, line)
+            _set_combined_mae_axis_scale(axis, all_mae_values)
+            self._style_live_axis(
+                axis,
+                "Validation MAE by training stage",
+                "MAE (native units; units in legend)",
+            )
+            if metric_handles:
+                combined_mae_legend_rows = _add_combined_mae_legends(
+                    axis, metric_handles, stage_labels
+                )
+            else:
+                axis.text(
+                    0.5, 0.5, "No labeled validation data",
+                    ha="center", va="center", color="#667085",
+                    transform=axis.transAxes,
+                )
 
         elif view == "Physics Residuals":
             names = sorted({
@@ -18850,7 +20162,11 @@ class App(tk.Tk):
                 axis.text(0.5, 0.5, "No iterative physics solver is active", ha="center", va="center",
                           color="#667085", transform=axis.transAxes)
 
-        figure.tight_layout(pad=1.5)
+        if combined_mae_legend_rows:
+            bottom = min(0.46, 0.17 + 0.045 * combined_mae_legend_rows)
+            figure.tight_layout(pad=1.5, rect=(0.0, bottom, 1.0, 1.0))
+        else:
+            figure.tight_layout(pad=1.5)
         self._live_canvas.draw_idle()
 
     def _latest_regression_image(self) -> Optional[Path]:
@@ -21702,7 +23018,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         toolbar.addWidget(QtWidgets.QLabel("View"))
         live_view = self._make_combo(
             "live_plot",
-            ("Regression", "MAE History", "Multi-Task", "Physics Residuals", "Memory"),
+            ("Regression", "MAE History", "Physics Residuals", "Memory"),
         )
         live_view.setMaximumWidth(210)
         toolbar.addWidget(live_view)
@@ -21731,7 +23047,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
             from matplotlib.figure import Figure
 
-            self.figure = Figure(figsize=(8.5, 5.4), dpi=100, facecolor="#FFFDFE")
+            self.figure = Figure(figsize=(11.0, 5.6), dpi=100, facecolor="#FFFDFE")
             self.canvas = FigureCanvasQTAgg(self.figure)
             self.canvas.setMinimumHeight(360)
             analysis_layout.addWidget(self.canvas, 1)
@@ -21888,6 +23204,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             control.setText(str(value))
         elif isinstance(control, QtWidgets.QComboBox):
             text = str(value)
+            if key == "live_plot" and text == "Multi-Task":
+                text = "MAE History"
             index = control.findText(text)
             if index >= 0:
                 control.setCurrentIndex(index)
@@ -21905,13 +23223,13 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         elif isinstance(control, ToggleTile):
             switch_blocker = QtCore.QSignalBlocker(control.switch)
             control.setChecked(self.backend._coerce_config_bool(value))
-        del blocker
+        blocker.unblock()
         if switch_blocker is not None:
-            del switch_blocker
+            switch_blocker.unblock()
         if key == "stream_hdf5" and hasattr(self, "streaming_mode_button"):
             mode_blocker = QtCore.QSignalBlocker(self.streaming_mode_button)
             self.streaming_mode_button.setChecked(bool(value))
-            del mode_blocker
+            mode_blocker.unblock()
             self._update_streaming_mode_button()
 
     def _set_selected_training_mode(self, mode: str) -> None:
@@ -21950,7 +23268,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             return
         blocker = QtCore.QSignalBlocker(self.streaming_mode_button)
         self.streaming_mode_button.setChecked(bool(checked))
-        del blocker
+        blocker.unblock()
         self._update_streaming_mode_button()
 
     def _enforce_spin_cutoff_bound(self) -> bool:
@@ -22663,7 +23981,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             blocker = QtCore.QSignalBlocker(selector)
             selector.clear()
             selector.addItem("All Stages", "")
-            del blocker
+            blocker.unblock()
         self._artifact_dir = self._artifact_dir_for_checkpoint(checkpoint)
         self.progress_bar.setValue(0)
         self.header_status.setText(state)
@@ -22714,7 +24032,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 total = int(event.get("stage_total", len(self._stage_order)))
                 blocker = QtCore.QSignalBlocker(selector)
                 selector.addItem(f"{index}/{total} {label}", stage_id)
-                del blocker
+                blocker.unblock()
         info = self._stage_info.setdefault(stage_id, {})
         info.update(
             {
@@ -23054,7 +24372,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             item.setForeground(QtGui.QColor(PALETTE["danger"]))
             self.search_table.setItem(0, 0, item)
             self.search_table.setSpan(0, 0, 1, 8)
-            del blocker
+            blocker.unblock()
             return
         self.search_table.clearSpans()
         for row, parameter in enumerate(params):
@@ -23085,7 +24403,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     table_item.setToolTip(tooltip)
             if parameter in selected_rows:
                 self.search_table.selectRow(row)
-        del blocker
+        blocker.unblock()
 
     @staticmethod
     def _format_search_domain(spec: tuple) -> str:
@@ -23729,9 +25047,25 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 for stage_id in self._stage_order
             ]
             stage_text += " - " + " | ".join(labels)
+        latest_metric_summaries: List[str] = []
+        for stage_id, stage_history in stage_groups:
+            if not stage_history:
+                continue
+            label = str(
+                self._stage_info.get(stage_id, {}).get(
+                    "stage_label", stage_id or "Current run"
+                )
+            )
+            metric_summary = _metric_event_summary(stage_history[-1])
+            if metric_summary:
+                latest_metric_summaries.append(f"{label}: {metric_summary}")
+        if latest_metric_summaries:
+            stage_text += "\n" + "\n".join(latest_metric_summaries)
         if hasattr(self, "analysis_stage_summary"):
             self.analysis_stage_summary.setText(stage_text)
         view = str(self.value("live_plot")) if "live_plot" in self.controls else "Regression"
+        if view == "Multi-Task":
+            view = "MAE History"
         if not history:
             axis = figure.add_subplot(111)
             axis.set_axis_off()
@@ -23799,78 +25133,99 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     ha="center", va="center", fontsize=9, color="#797386",
                     transform=axis.transAxes,
                 )
+        combined_mae_legend_rows = 0
         if view == "MAE History":
-            left = figure.add_subplot(121)
-            right = figure.add_subplot(122)
-            colors = ("#4A7FC1", "#D48851", "#4A9478", "#8F7AC8", "#C35F79", "#76869B")
-            for index, (stage_id, stage_history) in enumerate(stage_groups):
-                info = self._stage_info.get(stage_id, {})
-                label = str(info.get("stage_label", stage_id or "Current run"))
-                color = colors[index % len(colors)]
-                x, y = self._finite_history(stage_history, "train_loss")
-                if y:
-                    left.plot(x, y, marker="o", markersize=3, linewidth=1.6,
-                              linestyle="--", label=f"{label} train", color=color, alpha=0.7)
-                x, y = self._finite_history(stage_history, "val_loss")
-                if y:
-                    left.plot(x, y, marker="o", markersize=3, linewidth=2.0,
-                              label=f"{label} val", color=color)
-            self._style_axis(left, "Objective by stage", "Loss")
-            if left.lines:
-                left.legend(frameon=False, fontsize=8)
-            metric_styles = (
-                ("energy_mae", "E-MAE", "-"),
-                ("force_mae", "F-MAE", "--"),
-                ("stress_mae", "Stress-MAE", "-."),
-                ("validation_score", "Score", ":"),
+            loss_axis, axis = figure.subplots(
+                1, 2, gridspec_kw={"width_ratios": (0.85, 1.35)}
             )
-            for index, (stage_id, stage_history) in enumerate(stage_groups):
-                info = self._stage_info.get(stage_id, {})
-                label = str(info.get("stage_label", stage_id or "Current run"))
-                color = colors[index % len(colors)]
-                for key, metric_label, line_style in metric_styles:
-                    x, y = self._finite_history(stage_history, key)
-                    if y:
-                        right.plot(
-                            x, y, marker="o", markersize=3, linewidth=1.8,
-                            linestyle=line_style,
-                            label=f"{label} {metric_label}", color=color,
-                        )
-            self._style_axis(right, "Validation metrics by stage", "MAE / score")
-            if right.lines:
-                right.legend(frameon=False, fontsize=8)
-        elif view == "Multi-Task":
-            axis = figure.add_subplot(111)
-            colors = ("#4A7FC1", "#D48851", "#4A9478", "#8F7AC8", "#C35F79", "#76869B")
-            line_index = 0
-            for stage_id, stage_history in stage_groups:
+            loss_colors = (
+                "#4A7FC1", "#D48851", "#4A9478", "#8F7AC8", "#C35F79",
+                "#76869B",
+            )
+            all_loss_values: List[float] = []
+            for stage_index, (stage_id, stage_history) in enumerate(stage_groups):
                 stage_label = str(
                     self._stage_info.get(stage_id, {}).get(
                         "stage_label", stage_id or "Current run"
                     )
                 )
-                names = sorted({
-                    name for item in stage_history
-                    for name in item.get("multitask_mae", {})
-                })
-                for name in names:
-                    x, y = [], []
+                color = loss_colors[stage_index % len(loss_colors)]
+                for key, split_label, linestyle, alpha in (
+                    ("train_loss", "train", "--", 0.72),
+                    ("val_loss", "validation", "-", 1.0),
+                ):
+                    x, y = self._finite_history(stage_history, key)
+                    if not y:
+                        continue
+                    all_loss_values.extend(y)
+                    loss_axis.plot(
+                        x, y, marker="o", markersize=3,
+                        linewidth=1.6 if split_label == "train" else 1.8,
+                        linestyle=linestyle, color=color, alpha=alpha,
+                        label=f"{stage_label} {split_label}",
+                    )
+            _set_combined_mae_axis_scale(loss_axis, all_loss_values)
+            self._style_axis(loss_axis, "Objective by training stage", "Loss")
+            if loss_axis.lines:
+                loss_axis.legend(frameon=False, fontsize=7)
+            else:
+                loss_axis.text(
+                    0.5, 0.5, "No objective history",
+                    ha="center", va="center", color="#797386",
+                    transform=loss_axis.transAxes,
+                )
+            metric_names = _ordered_plottable_mae_metric_names({
+                name
+                for _stage_id, stage_history in stage_groups
+                for item in stage_history
+                for name in _event_all_mae(item)
+            })
+            metric_handles: Dict[str, Any] = {}
+            all_mae_values: List[float] = []
+            stage_labels: List[str] = []
+            for stage_index, (stage_id, stage_history) in enumerate(stage_groups):
+                stage_label = str(
+                    self._stage_info.get(stage_id, {}).get(
+                        "stage_label", stage_id or "Current run"
+                    )
+                )
+                stage_labels.append(stage_label)
+                linestyle = MAE_STAGE_LINESTYLES[
+                    stage_index % len(MAE_STAGE_LINESTYLES)
+                ]
+                for metric_index, name in enumerate(metric_names):
+                    x: List[int] = []
+                    y: List[float] = []
                     for item in stage_history:
-                        value = item.get("multitask_mae", {}).get(name)
+                        value = _event_all_mae(item).get(name)
                         if value is not None and math.isfinite(float(value)):
                             x.append(int(item.get("epoch", len(x) + 1)))
                             y.append(float(value))
-                    if y:
-                        axis.plot(x, y, marker="o", markersize=3, linewidth=1.6,
-                                  label=f"{stage_label}: {name}",
-                                  color=colors[line_index % len(colors)])
-                        line_index += 1
-            self._style_axis(axis, "Multi-task MAE by stage", "MAE")
-            if axis.lines:
-                axis.legend(frameon=False, fontsize=8, ncol=min(3, max(1, line_index)))
+                    if not y:
+                        continue
+                    all_mae_values.extend(y)
+                    line = axis.plot(
+                        x, y, marker="o", markersize=3, linewidth=1.7,
+                        linestyle=linestyle,
+                        color=MAE_PLOT_COLORS[metric_index % len(MAE_PLOT_COLORS)],
+                    )[0]
+                    metric_handles.setdefault(name, line)
+            _set_combined_mae_axis_scale(axis, all_mae_values)
+            self._style_axis(
+                axis,
+                "Validation MAE by training stage",
+                "MAE (native units; units in legend)",
+            )
+            if metric_handles:
+                combined_mae_legend_rows = _add_combined_mae_legends(
+                    axis, metric_handles, stage_labels
+                )
             else:
-                axis.text(0.5, 0.5, "No auxiliary targets are active", ha="center", va="center",
-                          color="#797386", transform=axis.transAxes)
+                axis.text(
+                    0.5, 0.5, "No labeled validation data",
+                    ha="center", va="center", color="#797386",
+                    transform=axis.transAxes,
+                )
         elif view == "Physics Residuals":
             axis = figure.add_subplot(111)
             colors = ("#4A9478", "#4A7FC1", "#D48851", "#8F7AC8", "#C35F79")
@@ -23931,7 +25286,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     0.5, 0.5, "Memory telemetry starts after the first epoch",
                     ha="center", va="center", color="#797386", transform=axis.transAxes,
                 )
-        figure.tight_layout(pad=1.5)
+        if combined_mae_legend_rows:
+            bottom = min(0.46, 0.17 + 0.045 * combined_mae_legend_rows)
+            figure.tight_layout(pad=1.5, rect=(0.0, bottom, 1.0, 1.0))
+        else:
+            figure.tight_layout(pad=1.5)
         self.canvas.draw_idle()
 
     @staticmethod
