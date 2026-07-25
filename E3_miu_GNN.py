@@ -64,6 +64,7 @@ import queue
 import re
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import traceback
@@ -5577,6 +5578,63 @@ def _plan_structure_batches(
     return batches, batch_loads
 
 
+def _count_windowed_structure_batches(
+    item_loads: Sequence[int],
+    batch_size: int,
+    *,
+    max_load: Optional[int],
+    window_size: int = 8192,
+) -> int:
+    """Count the exact batches emitted by windowed best-fit planning."""
+    count = int(len(item_loads))
+    if count <= 0:
+        return 0
+    limit = max(1, int(batch_size))
+    if max_load is None:
+        return int(math.ceil(count / limit))
+    steps = 0
+    chunk = max(1, int(window_size))
+    for start in range(0, count, chunk):
+        loads = np.asarray(
+            item_loads[start:min(count, start + chunk)], dtype=np.int64
+        ).reshape(-1)
+        batches, _batch_loads = _plan_structure_batches(
+            loads, limit, max_load=int(max_load)
+        )
+        steps += len(batches)
+    return int(steps)
+
+
+def _count_ordered_structure_batch_chunks(
+    load_chunks: Iterable[Sequence[int]],
+    batch_size: int,
+    *,
+    max_load: Optional[int],
+) -> int:
+    """Count sequential greedy batches while retaining state across chunks."""
+    limit = max(1, int(batch_size))
+    budget = int(max_load) if max_load is not None else None
+    steps = 0
+    current_size = 0
+    current_load = 0
+    for raw_chunk in load_chunks:
+        loads = np.asarray(raw_chunk, dtype=np.int64).reshape(-1)
+        for raw_load in loads:
+            load = max(0, int(raw_load))
+            if current_size and (
+                current_size >= limit
+                or (budget is not None and current_load + load > budget)
+            ):
+                steps += 1
+                current_size = 0
+                current_load = 0
+            current_size += 1
+            current_load += load
+    if current_size:
+        steps += 1
+    return int(steps)
+
+
 def batch_plan_summary(
     item_loads: Sequence[int],
     batch_size: int,
@@ -10406,6 +10464,172 @@ class _RegressionPairReservoir:
         self._priority = combined_priority
 
 
+REGRESSION_PLOT_DATA_SCHEMA = "e3mu-regression-plot-v1"
+
+
+def _write_regression_plot_data(
+    path: Path,
+    *,
+    epoch: int,
+    training_mode: str,
+    metric_names: Sequence[str],
+    pairs: Dict[str, _RegressionPairReservoir],
+    mae_values: Dict[str, float],
+) -> None:
+    """Persist bounded scatter samples for GUI filtering and epoch replay."""
+    selected = [str(name) for name in metric_names if str(name) in pairs]
+    payload: Dict[str, Any] = {
+        "schema": np.asarray(REGRESSION_PLOT_DATA_SCHEMA),
+        "epoch": np.asarray(int(epoch), dtype=np.int64),
+        "training_mode": np.asarray(str(training_mode)),
+        "metric_names": np.asarray(selected, dtype=np.str_),
+        "metric_units": np.asarray(
+            [VALIDATION_METRIC_UNITS.get(name, "native unit") for name in selected],
+            dtype=np.str_,
+        ),
+        "mae_values": np.asarray(
+            [float(mae_values.get(name, float("nan"))) for name in selected],
+            dtype=np.float64,
+        ),
+    }
+    for index, name in enumerate(selected):
+        reservoir = pairs[name]
+        payload[f"actual_{index:03d}"] = np.asarray(
+            reservoir.actual, dtype=np.float32
+        )
+        payload[f"predicted_{index:03d}"] = np.asarray(
+            reservoir.predicted, dtype=np.float32
+        )
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        with temporary.open("wb") as handle:
+            np.savez_compressed(handle, **payload)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _load_regression_plot_data(path: Path) -> Dict[str, Any]:
+    """Load one trusted, non-pickle regression replay artifact."""
+    with np.load(Path(path), allow_pickle=False) as payload:
+        schema = str(np.asarray(payload["schema"]).reshape(()).item())
+        if schema != REGRESSION_PLOT_DATA_SCHEMA:
+            raise ValueError(
+                f"Unsupported regression plot schema {schema!r} in {path}"
+            )
+        names = [str(value) for value in np.asarray(payload["metric_names"]).tolist()]
+        units = [str(value) for value in np.asarray(payload["metric_units"]).tolist()]
+        mae_values = np.asarray(payload["mae_values"], dtype=np.float64).reshape(-1)
+        if len(names) != len(units) or len(names) != int(mae_values.size):
+            raise ValueError(f"Inconsistent regression metadata in {path}")
+        metrics: Dict[str, Dict[str, Any]] = {}
+        for index, (name, unit, mae) in enumerate(zip(names, units, mae_values)):
+            actual = np.asarray(
+                payload[f"actual_{index:03d}"], dtype=np.float64
+            ).reshape(-1)
+            predicted = np.asarray(
+                payload[f"predicted_{index:03d}"], dtype=np.float64
+            ).reshape(-1)
+            if actual.size != predicted.size:
+                raise ValueError(
+                    f"Regression arrays for {name!r} have different sizes in {path}"
+                )
+            finite = np.isfinite(actual) & np.isfinite(predicted)
+            metrics[name] = {
+                "actual": actual[finite],
+                "predicted": predicted[finite],
+                "mae": float(mae),
+                "unit": unit,
+            }
+        return {
+            "schema": schema,
+            "epoch": int(np.asarray(payload["epoch"]).reshape(()).item()),
+            "training_mode": str(
+                np.asarray(payload["training_mode"]).reshape(()).item()
+            ),
+            "metric_names": names,
+            "metrics": metrics,
+        }
+
+
+def _draw_regression_replay_panel(
+    axis: Any,
+    *,
+    metric_name: str,
+    metric: Dict[str, Any],
+    stage_label: str,
+    color: str,
+) -> None:
+    """Draw one replayable actual-vs-predicted panel on an existing axis."""
+    actual = np.asarray(metric.get("actual", ()), dtype=np.float64).reshape(-1)
+    predicted = np.asarray(
+        metric.get("predicted", ()), dtype=np.float64
+    ).reshape(-1)
+    unit = str(metric.get("unit") or VALIDATION_METRIC_UNITS.get(
+        metric_name, "native unit"
+    ))
+    mae = float(metric.get("mae", float("nan")))
+    label = VALIDATION_METRIC_LABELS.get(
+        metric_name, f"{metric_name.replace('_', ' ')}-MAE"
+    )
+    if actual.size and predicted.size:
+        lo = float(min(np.min(actual), np.min(predicted)))
+        hi = float(max(np.max(actual), np.max(predicted)))
+        if not math.isfinite(lo) or not math.isfinite(hi):
+            lo, hi = -1.0, 1.0
+        elif hi <= lo:
+            padding = max(1e-6, abs(lo) * 0.05 + 1e-6)
+            lo, hi = lo - padding, hi + padding
+        else:
+            padding = 0.03 * (hi - lo)
+            lo, hi = lo - padding, hi + padding
+        axis.scatter(
+            actual, predicted, s=7.0, alpha=0.36,
+            color=color, edgecolors="none",
+        )
+        axis.plot([lo, hi], [lo, hi], "--", color="#26222B", linewidth=1.0)
+        axis.set_xlim(lo, hi)
+        axis.set_ylim(lo, hi)
+    else:
+        axis.text(
+            0.5, 0.5, "No validation pairs",
+            ha="center", va="center", transform=axis.transAxes,
+        )
+    display_unit = unit.replace("angstrom", "Å")
+    mae_text = (
+        f"{mae:.4g} {display_unit}" if math.isfinite(mae) else "n/a"
+    )
+    metric_title = label if len(label) <= 3 else (
+        label[:-4] if label.endswith("-MAE") else label
+    )
+    title_lines = [textwrap.fill(stage_label, width=27)]
+    metric_line = f"{metric_title}-MAE = {mae_text}"
+    if len(metric_line) <= 30:
+        title_lines.append(metric_line)
+    else:
+        title_lines.extend((
+            textwrap.fill(metric_title, width=23),
+            f"MAE = {mae_text}",
+        ))
+    axis.set_title(
+        "\n".join(title_lines),
+        loc="left", fontsize=8, fontweight="bold", pad=4,
+    )
+    # The metric is already named in the two-line title. Keeping the axis labels
+    # compact leaves enough room for a stable three-column GUI layout.
+    axis.set_xlabel(f"Actual [{display_unit}]", fontsize=8)
+    axis.set_ylabel(f"Predicted [{display_unit}]", fontsize=8)
+    axis.tick_params(labelsize=7)
+    axis.grid(True, color="#E9E3ED", linewidth=0.7, alpha=0.85)
+    try:
+        axis.set_aspect("equal", adjustable="box")
+    except Exception:
+        pass
+
+
 def _event_core_mae(event: Dict[str, Any]) -> Dict[str, float]:
     values = dict(event.get("core_mae", {}))
     fallback = {
@@ -10516,23 +10740,71 @@ def _add_combined_mae_legends(
     axis: Any,
     metric_handles: Dict[str, Any],
     stage_labels: Sequence[str] = (),
-) -> int:
-    """Add a unit-aware metric key plus a compact stage linestyle key."""
+) -> float:
+    """Add responsive figure-level legends and return required bottom margin."""
     if not metric_handles:
-        return 0
-    metric_columns = min(4, max(1, len(metric_handles)))
-    axis.figure.legend(
+        return 0.0
+    figure = axis.figure
+    metric_labels = [
+        _mae_metric_legend_label(name) for name in metric_handles
+    ]
+    figure_width_px = max(320.0, float(figure.get_figwidth() * figure.dpi))
+    figure_height_px = max(240.0, float(figure.get_figheight() * figure.dpi))
+
+    def responsive_columns(labels: Sequence[str], maximum: int) -> int:
+        if not labels:
+            return 1
+        longest = max(len(str(label)) for label in labels)
+        # Matplotlib's 8 pt legend font averages roughly 5.5 px per character;
+        # reserve additional space for the line handle and column padding.
+        column_width_px = min(390.0, max(145.0, 5.5 * longest + 52.0))
+        return max(
+            1,
+            min(int(maximum), len(labels), int(figure_width_px // column_width_px)),
+        )
+
+    def add_measured_legend(
+        handles: Sequence[Any],
+        labels: Sequence[str],
+        *,
+        columns: int,
+        bottom_fraction: float,
+        title: str,
+    ) -> Tuple[Any, Any, int]:
+        selected_columns = max(1, int(columns))
+        while True:
+            legend = figure.legend(
+                list(handles),
+                list(labels),
+                loc="lower center",
+                bbox_to_anchor=(0.5, float(bottom_fraction)),
+                ncol=selected_columns,
+                fontsize=8,
+                frameon=False,
+                title=title,
+                title_fontsize=8,
+            )
+            figure.canvas.draw()
+            bounds = legend.get_window_extent(
+                renderer=figure.canvas.get_renderer()
+            )
+            if (
+                selected_columns <= 1
+                or (bounds.x0 >= 4.0 and bounds.x1 <= figure_width_px - 4.0)
+            ):
+                return legend, bounds, selected_columns
+            legend.remove()
+            selected_columns -= 1
+
+    metric_legend, metric_bounds, _metric_columns = add_measured_legend(
         list(metric_handles.values()),
-        [_mae_metric_legend_label(name) for name in metric_handles],
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.01),
-        ncol=metric_columns,
-        fontsize=8,
-        frameon=False,
+        metric_labels,
+        columns=responsive_columns(metric_labels, 4),
+        bottom_fraction=0.012,
         title="Validation metrics",
-        title_fontsize=8,
     )
     unique_stages = list(dict.fromkeys(str(label) for label in stage_labels))
+    top_px = float(metric_bounds.y1)
     if len(unique_stages) > 1:
         from matplotlib.lines import Line2D
 
@@ -10543,17 +10815,20 @@ def _add_combined_mae_legends(
             )
             for index, _label in enumerate(unique_stages)
         ]
-        axis.legend(
+        stage_legend, stage_bounds, _stage_columns = add_measured_legend(
             stage_handles,
             unique_stages,
-            loc="upper right",
-            fontsize=8,
-            frameon=True,
-            framealpha=0.88,
-            title="Stage",
-            title_fontsize=8,
+            columns=responsive_columns(unique_stages, 4),
+            bottom_fraction=(float(metric_bounds.y1) + 7.0) / figure_height_px,
+            title="Training stage (line style)",
         )
-    return int(math.ceil(len(metric_handles) / metric_columns))
+        top_px = max(top_px, float(stage_bounds.y1))
+    # Keep the legend artists in the exported bounding box. The returned margin
+    # places every axis above their measured top edge plus a small visual gap.
+    metric_legend.set_in_layout(True)
+    if len(unique_stages) > 1:
+        stage_legend.set_in_layout(True)
+    return min(0.68, max(0.14, (top_px + 9.0) / figure_height_px))
 
 
 def _metric_event_summary(event: Dict[str, Any]) -> str:
@@ -14814,10 +15089,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             self.lazy_plan = True
             self.edge_sample_size = 0
             self.sampled_mean_edges = float("nan")
-            structure_steps = int(math.ceil(
-                self.count / max(1, self.requested_batch_size)
-            )) if self.count else 0
-            edge_steps = 0
+            self.exact_steps = 0
             if (
                 self.count
                 and self.edge_counts is not None
@@ -14834,11 +15106,15 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 self.sampled_mean_edges = (
                     float(np.mean(sampled)) if sampled.size else 0.0
                 )
-                edge_steps = int(math.ceil(
-                    self.sampled_mean_edges * self.count
-                    / max(1, int(self.edge_budget))
-                ))
-            self.estimated_steps = max(structure_steps, edge_steps)
+            self.exact_steps = _count_windowed_structure_batches(
+                self.edge_counts if self.edge_counts is not None else range(self.count),
+                self.requested_batch_size,
+                max_load=(
+                    self.edge_budget if self.edge_counts is not None else None
+                ),
+                window_size=self._PLAN_WINDOW,
+            )
+            self.estimated_steps = int(self.exact_steps)
 
         def __iter__(self) -> Iterable[List[int]]:
             rng = np.random.default_rng(self.seed + self.epoch)
@@ -14879,7 +15155,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             return iter(generate())
 
         def __len__(self) -> int:
-            return max(1, int(self.estimated_steps)) if self.count else 0
+            return max(1, int(self.exact_steps)) if self.count else 0
 
     class _CompositeCurriculumBatchSampler:
         """Shard-local OMat batches with rotating role-balanced Joint windows."""
@@ -14915,6 +15191,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             )
             self.lazy_plan = True
             self.estimated_steps = 0
+            self.exact_steps = 0
             self.edge_sample_size = 0
             self.sampled_mean_edges = float("nan")
             self.omat_by_source: Dict[int, np.ndarray] = {}
@@ -14937,12 +15214,13 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     max(1, int(round(ratio * self.large_count))),
                 )
             if self.lazy_plan:
-                self.estimated_steps = (
-                    self._estimate_role_steps(preview_count, local_offset=0)
-                    + self._estimate_role_steps(
+                self.exact_steps = (
+                    self._count_role_steps(preview_count, local_offset=0)
+                    + self._count_role_steps(
                         self.large_count, local_offset=self.omat_count
                     )
                 )
+                self.estimated_steps = int(self.exact_steps)
             else:
                 preview = self._role_batches(
                     np.arange(preview_count, dtype=np.int64)
@@ -15044,6 +15322,24 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             ))
             return max(structure_steps, edge_steps, 1)
 
+        def _count_role_steps(self, count: int, *, local_offset: int) -> int:
+            total = int(count)
+            if total <= 0:
+                return 0
+            if self.edge_counts is None or self.edge_budget is None:
+                return int(math.ceil(total / self.batch_size))
+            return _count_ordered_structure_batch_chunks(
+                (
+                    self.edge_counts[
+                        int(local_offset) + start:
+                        int(local_offset) + min(total, start + self._EDGE_READ_CHUNK)
+                    ]
+                    for start in range(0, total, self._EDGE_READ_CHUNK)
+                ),
+                self.batch_size,
+                max_load=self.edge_budget,
+            )
+
         def _iter_role_batches(
             self, indices: Sequence[int]
         ) -> Iterable[List[int]]:
@@ -15127,14 +15423,15 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             if self.lazy_plan:
                 omat_batches_iter = self._iter_role_batches(omat)
                 large_batches_iter = self._iter_role_batches(large)
-                omat_estimate = self._estimate_role_steps(len(omat), local_offset=0)
-                large_estimate = self._estimate_role_steps(
+                omat_steps = self._count_role_steps(len(omat), local_offset=0)
+                large_steps = self._count_role_steps(
                     len(large), local_offset=self.omat_count
                 )
                 omat_step = max(
-                    1, int(math.ceil(omat_estimate / max(1, large_estimate)))
+                    1, int(math.ceil(omat_steps / max(1, large_steps)))
                 )
-                self.estimated_steps = omat_estimate + large_estimate
+                self.exact_steps = omat_steps + large_steps
+                self.estimated_steps = int(self.exact_steps)
                 self.epoch += 1
                 return iter(self._interleave_batches(
                     omat_batches_iter, large_batches_iter, omat_step
@@ -15158,7 +15455,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
         def __len__(self) -> int:
             if self.lazy_plan:
-                return max(1, int(self.estimated_steps))
+                return max(1, int(self.exact_steps))
             if self.ds.plan.mode == "joint" and self.large_count:
                 ratio = max(1e-12, float(getattr(cfg, "composite_joint_foundation_ratio", 4.0)))
                 omat_count = min(self.omat_count, max(1, int(round(ratio * self.large_count))))
@@ -16837,6 +17134,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         # ── Scatter plots + MAE history chart ─────────────────────────────────
         regression_names_for_artifact: List[str] = []
         hidden_regression_names_for_artifact: List[str] = []
+        regression_data_path_for_artifact = ""
         if cfg.save_epoch_artifacts and _HAS_MPL:
             _ep_x = list(range(1, epoch + 1))
             force_norm_pairs = val_regression_pairs.get("_force_norm")
@@ -16867,6 +17165,18 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     if count > 0
                 },
             }
+            regression_data_path = (
+                _plots_dir / f"regression_data_epoch_{epoch:04d}.npz"
+            )
+            _write_regression_plot_data(
+                regression_data_path,
+                epoch=epoch,
+                training_mode=str(cfg.mode),
+                metric_names=regression_names,
+                pairs=val_regression_pairs,
+                mae_values=regression_mae,
+            )
+            regression_data_path_for_artifact = str(regression_data_path)
 
             def _render_dynamic_regression(*, clipped: bool) -> None:
                 if not regression_names:
@@ -17017,9 +17327,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 marker="o", markersize=3, linewidth=1.8,
                 color="#7a5af8", label="Validation loss",
             )
-            _set_combined_mae_axis_scale(
-                loss_axis, _epoch_train_loss_hist + _epoch_val_loss_hist
-            )
+            loss_axis.set_yscale("linear")
             loss_axis.set_title("Objective History")
             loss_axis.set_xlabel("Epoch")
             loss_axis.set_ylabel("Loss")
@@ -17051,8 +17359,8 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             axis.set_ylabel("MAE (native units; units in legend)")
             axis.grid(True, alpha=0.3, which="both")
             if axis.lines:
-                legend_rows = _add_combined_mae_legends(axis, metric_handles)
-                _fig.subplots_adjust(bottom=min(0.46, 0.18 + 0.045 * legend_rows))
+                legend_bottom = _add_combined_mae_legends(axis, metric_handles)
+                _fig.tight_layout(rect=(0.0, legend_bottom, 1.0, 1.0))
             else:
                 axis.text(
                     0.5, 0.5, "No labeled validation data",
@@ -17107,6 +17415,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 "hidden_regression_metrics": list(
                     hidden_regression_names_for_artifact
                 ),
+                "regression_data_path": regression_data_path_for_artifact,
             })
             progress({"type": "epoch", "epoch": int(epoch), "epochs": int(cfg.epochs)})
         if _sched is not None:
@@ -20042,7 +20351,7 @@ class App(tk.Tk):
             else:
                 view = "MAE History"
 
-        combined_mae_legend_rows = 0
+        combined_mae_legend_bottom = 0.0
         if view == "MAE History":
             loss_axis, axis = figure.subplots(
                 1, 2, gridspec_kw={"width_ratios": (0.85, 1.35)}
@@ -20060,17 +20369,15 @@ class App(tk.Tk):
                     stage_id,
                     str(item.get("stage_label") or stage_id.replace("_", " ").title()),
                 )
-            loss_colors = (
-                "#4A7FC1", "#D48851", "#4A9478", "#8F7AC8", "#C35F79",
-                "#76869B",
-            )
             all_loss_values: List[float] = []
             for stage_index, (stage_id, stage_history) in enumerate(grouped.items()):
                 stage_label = group_labels[stage_id]
-                color = loss_colors[stage_index % len(loss_colors)]
-                for key, split_label, linestyle, alpha in (
-                    ("train_loss", "train", "--", 0.72),
-                    ("val_loss", "validation", "-", 1.0),
+                stage_linestyle = MAE_STAGE_LINESTYLES[
+                    stage_index % len(MAE_STAGE_LINESTYLES)
+                ]
+                for key, split_label, color, alpha in (
+                    ("train_loss", "Train", "#667085", 0.76),
+                    ("val_loss", "Validation", "#7a5af8", 1.0),
                 ):
                     x, y = self._finite_history_values(stage_history, key)
                     if not y:
@@ -20078,11 +20385,11 @@ class App(tk.Tk):
                     all_loss_values.extend(y)
                     loss_axis.plot(
                         x, y, marker="o", markersize=3,
-                        linewidth=1.6 if split_label == "train" else 1.8,
-                        linestyle=linestyle, color=color, alpha=alpha,
-                        label=f"{stage_label} {split_label}",
+                        linewidth=1.6 if split_label == "Train" else 1.8,
+                        linestyle=stage_linestyle, color=color, alpha=alpha,
+                        label=split_label if stage_index == 0 else "_nolegend_",
                     )
-            _set_combined_mae_axis_scale(loss_axis, all_loss_values)
+            loss_axis.set_yscale("linear")
             self._style_live_axis(loss_axis, "Objective by training stage", "Loss")
             if loss_axis.lines:
                 loss_axis.legend(frameon=False, fontsize=7)
@@ -20128,7 +20435,7 @@ class App(tk.Tk):
                 "MAE (native units; units in legend)",
             )
             if metric_handles:
-                combined_mae_legend_rows = _add_combined_mae_legends(
+                combined_mae_legend_bottom = _add_combined_mae_legends(
                     axis, metric_handles, stage_labels
                 )
             else:
@@ -20162,9 +20469,11 @@ class App(tk.Tk):
                 axis.text(0.5, 0.5, "No iterative physics solver is active", ha="center", va="center",
                           color="#667085", transform=axis.transAxes)
 
-        if combined_mae_legend_rows:
-            bottom = min(0.46, 0.17 + 0.045 * combined_mae_legend_rows)
-            figure.tight_layout(pad=1.5, rect=(0.0, bottom, 1.0, 1.0))
+        if combined_mae_legend_bottom:
+            figure.tight_layout(
+                pad=1.1,
+                rect=(0.0, combined_mae_legend_bottom, 1.0, 1.0),
+            )
         else:
             figure.tight_layout(pad=1.5)
         self._live_canvas.draw_idle()
@@ -22336,6 +22645,15 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._stage_info: Dict[str, Dict[str, Any]] = {}
         self._stage_order: List[str] = []
         self._active_stage_id = ""
+        self._analysis_metric_preferences: Dict[str, bool] = {}
+        self._analysis_metric_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
+        self._analysis_metric_menu_names: Tuple[str, ...] = ()
+        self._analysis_metric_menu_syncing = False
+        self._last_live_export_signature: Optional[Tuple[Any, ...]] = None
+        self._analysis_resize_timer = QtCore.QTimer(self)
+        self._analysis_resize_timer.setSingleShot(True)
+        self._analysis_resize_timer.setInterval(90)
+        self._analysis_resize_timer.timeout.connect(self._render_live_dashboard)
         self._default_path = Path.home() / ".dual_layer_field_gui.defaults.json"
         self._factory_values = dict(GUI_DEFAULTS)
         self._config_passthrough: Dict[str, Any] = {}
@@ -22374,20 +22692,56 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             QMainWindow, QWidget#root {{ background: {PALETTE['background']}; }}
             QWidget {{ color: {PALETTE['ink']}; font-size: 12px; }}
             QLabel {{ background: transparent; }}
-            QLineEdit, QComboBox {{
+            QLineEdit, QComboBox, QSpinBox, QToolButton#analysisMetricButton {{
                 min-height: 36px; padding: 0 11px; background: #FFFDFE;
                 border: 1px solid #CFC5D7; border-radius: 11px;
                 selection-background-color: #B8A8E2;
             }}
-            QLineEdit:focus, QComboBox:focus {{ border: 1.5px solid {PALETTE['purple']}; background: #FFFFFF; }}
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus,
+            QToolButton#analysisMetricButton:focus,
+            QToolButton#analysisMetricButton:pressed {{
+                border: 1.5px solid {PALETTE['purple']}; background: #FFFFFF;
+            }}
             QLineEdit[invalidInput="true"] {{
                 color: #8C3048; background: #FCE9EE; border: 1.5px solid {PALETTE['danger']};
             }}
-            QLineEdit:disabled, QComboBox:disabled {{ color: #847D8B; background: #F1EDF3; border-color: #DDD6E2; }}
+            QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled,
+            QToolButton#analysisMetricButton:disabled {{
+                color: #847D8B; background: #F1EDF3; border-color: #DDD6E2;
+            }}
             QComboBox::drop-down {{ border: 0; width: 25px; }}
             QComboBox QAbstractItemView {{
                 background: #FFFFFF; border: 1px solid #E2DCE7; border-radius: 9px;
                 padding: 5px; selection-background-color: #EAE3F6;
+            }}
+            QToolButton#analysisMetricButton {{
+                font-weight: 500; text-align: left; padding-right: 25px;
+            }}
+            QToolButton#analysisMetricButton::menu-indicator {{
+                subcontrol-origin: padding; subcontrol-position: center right;
+                right: 8px;
+            }}
+            QSpinBox {{ padding-right: 24px; }}
+            QSpinBox::up-button, QSpinBox::down-button {{
+                subcontrol-origin: border; width: 22px; border: 0;
+                background: transparent;
+            }}
+            QSpinBox::up-button {{
+                subcontrol-position: top right; border-top-right-radius: 10px;
+            }}
+            QSpinBox::down-button {{
+                subcontrol-position: bottom right; border-bottom-right-radius: 10px;
+            }}
+            QMenu#analysisMetricMenu {{
+                background: #FFFFFF; border: 1px solid #E2DCE7;
+                border-radius: 9px; padding: 6px;
+            }}
+            QMenu#analysisMetricMenu::item {{
+                min-height: 28px; padding: 3px 10px; border-radius: 6px;
+            }}
+            QMenu#analysisMetricMenu::item:selected {{ background: #EAE3F6; }}
+            QMenu#analysisMetricMenu QCheckBox {{
+                min-height: 28px; padding: 2px 10px; spacing: 8px;
             }}
             QPushButton {{
                 min-height: 36px; padding: 0 16px; border: 1px solid #BEB0CC; border-radius: 12px;
@@ -23020,21 +23374,55 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             "live_plot",
             ("Regression", "MAE History", "Physics Residuals", "Memory"),
         )
-        live_view.setMaximumWidth(210)
+        live_view.setMaximumWidth(165)
+        live_view.setFixedHeight(38)
         toolbar.addWidget(live_view)
         toolbar.addWidget(QtWidgets.QLabel("Stage"))
         self.analysis_stage_selector = QtWidgets.QComboBox()
         self.analysis_stage_selector.addItem("All Stages", "")
-        self.analysis_stage_selector.setMinimumWidth(150)
-        self.analysis_stage_selector.setMaximumWidth(220)
+        self.analysis_stage_selector.setMinimumWidth(120)
+        self.analysis_stage_selector.setMaximumWidth(180)
+        self.analysis_stage_selector.setFixedHeight(38)
         self.analysis_stage_selector.currentIndexChanged.connect(
-            lambda _index: self._render_live_dashboard()
+            self._analysis_stage_changed
         )
         toolbar.addWidget(self.analysis_stage_selector)
+        toolbar.addWidget(QtWidgets.QLabel("Metrics"))
+        self.analysis_metric_button = QtWidgets.QToolButton()
+        self.analysis_metric_button.setObjectName("analysisMetricButton")
+        self.analysis_metric_button.setIcon(
+            self.style().standardIcon(
+                QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView
+            )
+        )
+        self.analysis_metric_button.setIconSize(QtCore.QSize(15, 15))
+        self.analysis_metric_button.setToolButtonStyle(
+            QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self.analysis_metric_button.setPopupMode(
+            QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self.analysis_metric_button.setMinimumWidth(118)
+        self.analysis_metric_button.setMaximumWidth(180)
+        self.analysis_metric_button.setFixedHeight(38)
+        self.analysis_metric_menu = QtWidgets.QMenu(self.analysis_metric_button)
+        self.analysis_metric_menu.setObjectName("analysisMetricMenu")
+        self.analysis_metric_menu.setMinimumWidth(270)
+        self.analysis_metric_button.setMenu(self.analysis_metric_menu)
+        toolbar.addWidget(self.analysis_metric_button)
+        toolbar.addWidget(QtWidgets.QLabel("Epoch"))
+        self.analysis_epoch_selector = QtWidgets.QComboBox()
+        self.analysis_epoch_selector.setObjectName("analysisEpochSelector")
+        self.analysis_epoch_selector.addItem("Latest", 0)
+        self.analysis_epoch_selector.setMaxVisibleItems(16)
+        self.analysis_epoch_selector.setMinimumWidth(100)
+        self.analysis_epoch_selector.setMaximumWidth(112)
+        self.analysis_epoch_selector.setFixedHeight(38)
+        self.analysis_epoch_selector.currentIndexChanged.connect(
+            lambda _index: self._render_live_dashboard()
+        )
+        toolbar.addWidget(self.analysis_epoch_selector)
         toolbar.addStretch(1)
-        hint = QtWidgets.QLabel("Updates after every validation epoch")
-        hint.setStyleSheet("color:#8A8391;")
-        toolbar.addWidget(hint)
         analysis_layout.addLayout(toolbar)
         self.analysis_stage_summary = QtWidgets.QLabel("Stage: current run")
         self.analysis_stage_summary.setWordWrap(True)
@@ -23049,8 +23437,17 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
             self.figure = Figure(figsize=(11.0, 5.6), dpi=100, facecolor="#FFFDFE")
             self.canvas = FigureCanvasQTAgg(self.figure)
-            self.canvas.setMinimumHeight(360)
-            analysis_layout.addWidget(self.canvas, 1)
+            self.canvas.setMinimumHeight(300)
+            self.analysis_canvas_scroll = QtWidgets.QScrollArea()
+            self.analysis_canvas_scroll.setWidgetResizable(True)
+            self.analysis_canvas_scroll.setFrameShape(
+                QtWidgets.QFrame.Shape.NoFrame
+            )
+            self.analysis_canvas_scroll.setHorizontalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self.analysis_canvas_scroll.setWidget(self.canvas)
+            analysis_layout.addWidget(self.analysis_canvas_scroll, 1)
         except Exception as exc:
             self.figure = None
             self.canvas = None
@@ -23231,6 +23628,10 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             self.streaming_mode_button.setChecked(bool(value))
             mode_blocker.unblock()
             self._update_streaming_mode_button()
+        if key == "live_plot" and getattr(self, "canvas", None) is not None:
+            self._sync_analysis_metric_menu(force=True)
+            self._sync_analysis_epoch_selector(reset_to_latest=False)
+            self._render_live_dashboard()
 
     def _set_selected_training_mode(self, mode: str) -> None:
         selected = str(mode).strip().lower()
@@ -23397,6 +23798,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                         )
                 self._refresh_tooltips()
             if key == "live_plot":
+                self._sync_analysis_metric_menu(force=True)
+                self._sync_analysis_epoch_selector(reset_to_latest=False)
                 self._render_live_dashboard()
         except (TypeError, ValueError, OverflowError, ArithmeticError) as exc:
             # TextChanged emits expected intermediate values such as "" and
@@ -23976,6 +24379,10 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._stage_info.clear()
         self._stage_order.clear()
         self._active_stage_id = ""
+        self._analysis_metric_preferences.clear()
+        self._analysis_metric_menu_names = ()
+        self._analysis_metric_checkboxes.clear()
+        self._last_live_export_signature = None
         selector = getattr(self, "analysis_stage_selector", None)
         if selector is not None:
             blocker = QtCore.QSignalBlocker(selector)
@@ -23991,6 +24398,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self.score_value.setText("Score --")
         if hasattr(self, "analysis_stage_summary"):
             self.analysis_stage_summary.setText("Stage: current run")
+        self._sync_analysis_metric_menu(force=True)
+        self._sync_analysis_epoch_selector(reset_to_latest=True)
         self._render_live_dashboard()
 
     @staticmethod
@@ -24052,6 +24461,154 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         if selector is None:
             return ""
         return str(selector.currentData() or "")
+
+    def _analysis_histories_for_selection(self) -> List[List[Dict[str, Any]]]:
+        selected_stage = self._selected_analysis_stage()
+        if selected_stage:
+            history = self._stage_histories.get(selected_stage, [])
+            return [list(history)] if history else []
+        histories = [
+            list(self._stage_histories.get(stage_id, []))
+            for stage_id in self._stage_order
+            if self._stage_histories.get(stage_id)
+        ]
+        return histories or ([list(self._metric_history)] if self._metric_history else [])
+
+    def _available_analysis_metrics(self) -> List[str]:
+        return _ordered_plottable_mae_metric_names({
+            name
+            for history in self._analysis_histories_for_selection()
+            for event in history
+            for name in _event_all_mae(event)
+        })
+
+    def _update_analysis_metric_button(self) -> None:
+        button = getattr(self, "analysis_metric_button", None)
+        if button is None:
+            return
+        names = self._analysis_metric_menu_names
+        selected = sum(
+            bool(self._analysis_metric_preferences.get(name, True))
+            for name in names
+        )
+        if not names:
+            button.setText("No metrics")
+            button.setEnabled(False)
+        elif selected == len(names):
+            button.setText(f"All ({len(names)})")
+            button.setEnabled(True)
+        else:
+            button.setText(f"{selected} / {len(names)}")
+            button.setEnabled(True)
+
+    def _sync_analysis_metric_menu(self, *, force: bool = False) -> None:
+        menu = getattr(self, "analysis_metric_menu", None)
+        if menu is None:
+            return
+        names = tuple(self._available_analysis_metrics())
+        for name in names:
+            self._analysis_metric_preferences.setdefault(name, True)
+        if not force and names == self._analysis_metric_menu_names:
+            self._update_analysis_metric_button()
+            return
+        self._analysis_metric_menu_syncing = True
+        try:
+            menu.clear()
+            self._analysis_metric_checkboxes.clear()
+            self._analysis_metric_menu_names = names
+            select_all = menu.addAction("Select all")
+            select_all.triggered.connect(
+                lambda: self._set_all_analysis_metrics(True)
+            )
+            clear_all = menu.addAction("Clear selection")
+            clear_all.triggered.connect(
+                lambda: self._set_all_analysis_metrics(False)
+            )
+            menu.addSeparator()
+            for name in names:
+                checkbox = QtWidgets.QCheckBox(
+                    _mae_metric_legend_label(name), menu
+                )
+                checkbox.setChecked(
+                    bool(self._analysis_metric_preferences.get(name, True))
+                )
+                checkbox.toggled.connect(
+                    lambda checked, metric=name: self._analysis_metric_toggled(
+                        metric, checked
+                    )
+                )
+                widget_action = QtWidgets.QWidgetAction(menu)
+                widget_action.setDefaultWidget(checkbox)
+                menu.addAction(widget_action)
+                self._analysis_metric_checkboxes[name] = checkbox
+        finally:
+            self._analysis_metric_menu_syncing = False
+        self._update_analysis_metric_button()
+
+    def _set_all_analysis_metrics(self, checked: bool) -> None:
+        self._analysis_metric_menu_syncing = True
+        try:
+            for name in self._analysis_metric_menu_names:
+                self._analysis_metric_preferences[name] = bool(checked)
+                checkbox = self._analysis_metric_checkboxes.get(name)
+                if checkbox is not None:
+                    checkbox.setChecked(bool(checked))
+        finally:
+            self._analysis_metric_menu_syncing = False
+        self._update_analysis_metric_button()
+        self._render_live_dashboard()
+
+    def _analysis_metric_toggled(self, name: str, checked: bool) -> None:
+        self._analysis_metric_preferences[str(name)] = bool(checked)
+        if self._analysis_metric_menu_syncing:
+            return
+        self._update_analysis_metric_button()
+        self._render_live_dashboard()
+
+    def _selected_analysis_metrics(
+        self, available: Optional[Sequence[str]] = None
+    ) -> List[str]:
+        names = list(available) if available is not None else list(
+            self._analysis_metric_menu_names
+        )
+        return [
+            name for name in names
+            if bool(self._analysis_metric_preferences.get(name, True))
+        ]
+
+    def _sync_analysis_epoch_selector(self, *, reset_to_latest: bool = False) -> None:
+        selector = getattr(self, "analysis_epoch_selector", None)
+        if selector is None:
+            return
+        selected_stage = self._selected_analysis_stage()
+        is_regression = str(self.value("live_plot")) == "Regression"
+        maximum = 0
+        if selected_stage:
+            history = self._stage_histories.get(selected_stage, [])
+            maximum = max(
+                [int(item.get("epoch", 0)) for item in history]
+                + [int(self._stage_latest_artifact_epoch.get(selected_stage, 0))]
+            )
+        previous = int(selector.currentData() or 0)
+        desired = 0 if reset_to_latest or previous > maximum else previous
+        blocker = QtCore.QSignalBlocker(selector)
+        selector.clear()
+        selector.addItem("Latest", 0)
+        for epoch in range(1, max(0, maximum) + 1):
+            selector.addItem(f"Epoch {epoch}", epoch)
+        selected_index = selector.findData(desired)
+        selector.setCurrentIndex(max(0, selected_index))
+        selector.setEnabled(bool(selected_stage and is_regression and maximum > 0))
+        blocker.unblock()
+
+    def _selected_regression_epoch(self) -> int:
+        selector = getattr(self, "analysis_epoch_selector", None)
+        return int(selector.currentData() or 0) if selector is not None else 0
+
+    def _analysis_stage_changed(self, _index: int) -> None:
+        self._sync_analysis_metric_menu(force=True)
+        self._sync_analysis_epoch_selector(reset_to_latest=True)
+        self._render_live_dashboard()
 
     def _launch_worker(self, target: Any, state: str) -> None:
         if self._training_running:
@@ -24743,6 +25300,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                         self._stage_latest_artifact_epoch[stage_id] = int(
                             event.get("epoch", 0)
                         )
+            self._sync_analysis_epoch_selector(reset_to_latest=False)
             self._render_live_dashboard()
         elif kind == "epoch":
             epoch = int(event.get("epoch", 0))
@@ -24955,6 +25513,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 f"MPS {float(memory.get('mps_driver_mib', 0.0)):.0f} MiB"
                 + ("  MEMORY GROWTH WARNING" if event.get("memory_leak_warning") else "")
             )
+        self._sync_analysis_metric_menu(force=False)
+        self._sync_analysis_epoch_selector(reset_to_latest=False)
         self._render_live_dashboard()
 
     @staticmethod
@@ -24984,7 +25544,9 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             spine.set_color("#DED7E3")
 
     def _latest_regression_image(
-        self, stage_id: Optional[str] = None
+        self,
+        stage_id: Optional[str] = None,
+        epoch: Optional[int] = None,
     ) -> Optional[Path]:
         selected_stage = str(stage_id or self._active_stage_id).strip()
         if selected_stage:
@@ -24997,7 +25559,12 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     directory = self._artifact_dir_for_checkpoint(str(checkpoint))
             if directory is None:
                 return None
-            expected_epoch = self._stage_latest_artifact_epoch.get(selected_stage)
+            requested_epoch = int(epoch or 0)
+            expected_epoch = (
+                requested_epoch
+                if requested_epoch > 0
+                else self._stage_latest_artifact_epoch.get(selected_stage)
+            )
             if expected_epoch is None:
                 return None
             if expected_epoch > 0:
@@ -25013,6 +25580,79 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         )
         candidates = sorted((directory / "plots").glob("regression_full_epoch_*.png"))
         return candidates[-1] if candidates else None
+
+    def _latest_regression_data(
+        self,
+        stage_id: Optional[str] = None,
+        epoch: Optional[int] = None,
+    ) -> Optional[Path]:
+        selected_stage = str(stage_id or self._active_stage_id).strip()
+        if not selected_stage:
+            return None
+        directory = self._stage_artifacts.get(selected_stage)
+        if directory is None:
+            checkpoint = self._stage_info.get(selected_stage, {}).get(
+                "stage_checkpoint"
+            )
+            if checkpoint:
+                directory = self._artifact_dir_for_checkpoint(str(checkpoint))
+        if directory is None:
+            return None
+        requested_epoch = int(epoch or 0)
+        expected_epoch = (
+            requested_epoch
+            if requested_epoch > 0
+            else self._stage_latest_artifact_epoch.get(selected_stage)
+        )
+        if expected_epoch is None or int(expected_epoch) <= 0:
+            return None
+        candidate = (
+            directory
+            / "plots"
+            / f"regression_data_epoch_{int(expected_epoch):04d}.npz"
+        )
+        return candidate if candidate.is_file() else None
+
+    def _resize_analysis_canvas(self, desired_height: int) -> None:
+        """Apply an absolute canvas size so repeated redraws cannot shrink axes."""
+        scroll = getattr(self, "analysis_canvas_scroll", None)
+        viewport = scroll.viewport() if scroll is not None else None
+        width = max(
+            640,
+            int(viewport.width()) if viewport is not None else int(self.canvas.width()),
+        )
+        viewport_height = (
+            int(viewport.height()) if viewport is not None else int(self.canvas.height())
+        )
+        height = max(300, int(desired_height), viewport_height)
+        self.canvas.setMinimumHeight(300)
+        self.canvas.setMinimumHeight(height)
+        self.canvas.setMaximumHeight(height)
+        if self.canvas.width() != width or self.canvas.height() != height:
+            self.canvas.resize(width, height)
+
+    def _analysis_viewport_size(self) -> Tuple[int, int]:
+        scroll = getattr(self, "analysis_canvas_scroll", None)
+        viewport = scroll.viewport() if scroll is not None else None
+        return (
+            max(
+                640,
+                int(viewport.width())
+                if viewport is not None else int(self.canvas.width()),
+            ),
+            max(
+                300,
+                int(viewport.height())
+                if viewport is not None else int(self.canvas.height()),
+            ),
+        )
+
+    def resizeEvent(self, event: Any) -> None:
+        """Reflow live charts after the GUI viewport settles at its new ratio."""
+        super().resizeEvent(event)
+        timer = getattr(self, "_analysis_resize_timer", None)
+        if timer is not None and getattr(self, "canvas", None) is not None:
+            timer.start()
 
     def _render_live_dashboard(self) -> None:
         if getattr(self, "figure", None) is None or getattr(self, "canvas", None) is None:
@@ -25033,6 +25673,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         ]
         if not stage_groups and history:
             stage_groups = [("", history)]
+        self._sync_analysis_metric_menu(force=False)
+        self._sync_analysis_epoch_selector(reset_to_latest=False)
         stage_text = "All stages (independent epoch axes)"
         if selected_stage:
             info = self._stage_info.get(selected_stage, {})
@@ -25061,12 +25703,23 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 latest_metric_summaries.append(f"{label}: {metric_summary}")
         if latest_metric_summaries:
             stage_text += "\n" + "\n".join(latest_metric_summaries)
+        if (
+            selected_stage
+            and str(self.value("live_plot")) == "Regression"
+            and self._selected_regression_epoch() > 0
+        ):
+            stage_text += (
+                f"\nRegression replay: epoch {self._selected_regression_epoch()}"
+            )
         if hasattr(self, "analysis_stage_summary"):
             self.analysis_stage_summary.setText(stage_text)
         view = str(self.value("live_plot")) if "live_plot" in self.controls else "Regression"
         if view == "Multi-Task":
             view = "MAE History"
+        if view not in {"Regression", "MAE History"}:
+            self._resize_analysis_canvas(360)
         if not history:
+            self._resize_analysis_canvas(360)
             axis = figure.add_subplot(111)
             axis.set_axis_off()
             axis.text(
@@ -25081,6 +25734,9 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             figure.tight_layout(pad=2.0)
             self.canvas.draw_idle()
             return
+        regression_export_panels: List[
+            Tuple[str, int, str, Dict[str, Any]]
+        ] = []
         if view == "Regression":
             regression_stages = (
                 [selected_stage]
@@ -25091,56 +25747,160 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     if self._stage_histories.get(stage_id)
                 ]
             )
-            regression_images = [
-                (stage_id, self._latest_regression_image(stage_id))
-                for stage_id in regression_stages
-            ]
-            regression_images = [
-                (stage_id, path)
-                for stage_id, path in regression_images
-                if path is not None
-            ]
-            if regression_images:
-                from matplotlib import image as mpl_image
-                columns = 2 if len(regression_images) > 1 else 1
-                rows = int(math.ceil(len(regression_images) / columns))
-                for index, (stage_id, image_path) in enumerate(regression_images):
-                    axis = figure.add_subplot(rows, columns, index + 1)
-                    axis.imshow(mpl_image.imread(str(image_path)))
-                    axis.set_axis_off()
-                    info = self._stage_info.get(stage_id, {})
-                    label = str(info.get("stage_label", stage_id or "Current run"))
-                    epoch = self._stage_latest_artifact_epoch.get(
-                        stage_id,
-                        int(self._stage_histories.get(stage_id, [{}])[-1].get("epoch", 0)),
+            requested_epoch = (
+                self._selected_regression_epoch() if selected_stage else 0
+            )
+            replay_payloads: List[Tuple[str, Dict[str, Any]]] = []
+            for stage_id in regression_stages:
+                data_path = self._latest_regression_data(
+                    stage_id, requested_epoch
+                )
+                if data_path is None:
+                    continue
+                try:
+                    replay_payloads.append(
+                        (stage_id, _load_regression_plot_data(data_path))
                     )
-                    axis.set_title(
-                        f"{label} - epoch {epoch}", loc="left",
-                        fontsize=10, fontweight="bold", color="#302C3C", pad=6,
+                except (OSError, KeyError, ValueError) as exc:
+                    self._append_log(
+                        f"[{self.backend._now()}] WARN: cannot replay "
+                        f"{data_path.name}: {exc}"
+                    )
+            selected_metrics = set(self._selected_analysis_metrics())
+            metric_color_index = {
+                name: index
+                for index, name in enumerate(self._analysis_metric_menu_names)
+            }
+            replay_panels: List[Tuple[str, int, str, Dict[str, Any]]] = []
+            for stage_id, payload in replay_payloads:
+                metrics = dict(payload.get("metrics", {}))
+                for metric_name in _ordered_plottable_mae_metric_names(metrics):
+                    if metric_name in selected_metrics:
+                        replay_panels.append(
+                            (
+                                stage_id,
+                                int(payload.get("epoch", 0)),
+                                metric_name,
+                                metrics[metric_name],
+                            )
+                        )
+            if replay_panels:
+                available_width, available_height = self._analysis_viewport_size()
+                # About 245 px per cell is sufficient once the metric name is
+                # kept in the title. A normal 800-900 px dashboard therefore
+                # uses three columns instead of growing into a six-panel tower.
+                maximum_columns = max(1, min(4, available_width // 245))
+                rows, columns = _automatic_panel_grid(
+                    len(replay_panels), max_columns=maximum_columns
+                )
+                if len(replay_panels) <= 2:
+                    # One or two metrics always occupy one viewport-height row.
+                    # There is no vertical expansion or hidden placeholder row.
+                    target_height = available_height
+                else:
+                    row_height = 270 if columns >= 3 else 300
+                    target_height = max(460, row_height * rows, available_height)
+                self._resize_analysis_canvas(target_height)
+                regression_export_panels = list(replay_panels)
+                for index, (stage_id, replayed_epoch, metric_name, metric) in enumerate(
+                    replay_panels
+                ):
+                    axis = figure.add_subplot(rows, columns, index + 1)
+                    label = str(
+                        self._stage_info.get(stage_id, {}).get(
+                            "stage_label", stage_id or "Current run"
+                        )
+                    )
+                    _draw_regression_replay_panel(
+                        axis,
+                        metric_name=metric_name,
+                        metric=metric,
+                        stage_label=f"{label} | epoch {replayed_epoch}",
+                        color=MAE_PLOT_COLORS[
+                            metric_color_index.get(metric_name, 0)
+                            % len(MAE_PLOT_COLORS)
+                        ],
                     )
             else:
-                axis = figure.add_subplot(111)
-                axis.set_axis_off()
-                axis.text(
-                    0.5, 0.54,
-                    "Waiting for a current-stage regression image",
-                    ha="center", va="center", fontsize=14, fontweight="bold",
-                    color="#302C3C", transform=axis.transAxes,
-                )
-                axis.text(
-                    0.5, 0.44,
-                    "Stale images already present in the output directory are intentionally ignored.",
-                    ha="center", va="center", fontsize=9, color="#797386",
-                    transform=axis.transAxes,
-                )
-        combined_mae_legend_rows = 0
+                self._resize_analysis_canvas(360)
+                legacy_images = [
+                    (
+                        stage_id,
+                        self._latest_regression_image(stage_id, requested_epoch),
+                    )
+                    for stage_id in regression_stages
+                ]
+                legacy_images = [
+                    (stage_id, path)
+                    for stage_id, path in legacy_images
+                    if path is not None
+                ]
+                if legacy_images and selected_metrics:
+                    from matplotlib import image as mpl_image
+
+                    columns = 2 if len(legacy_images) > 1 else 1
+                    rows = int(math.ceil(len(legacy_images) / columns))
+                    self._resize_analysis_canvas(max(420, 350 * rows))
+                    for index, (stage_id, image_path) in enumerate(legacy_images):
+                        axis = figure.add_subplot(rows, columns, index + 1)
+                        axis.imshow(mpl_image.imread(str(image_path)))
+                        axis.set_axis_off()
+                        label = str(
+                            self._stage_info.get(stage_id, {}).get(
+                                "stage_label", stage_id or "Current run"
+                            )
+                        )
+                        epoch_value = requested_epoch or self._stage_latest_artifact_epoch.get(
+                            stage_id, 0
+                        )
+                        axis.set_title(
+                            f"{label} - epoch {epoch_value}", loc="left",
+                            fontsize=10, fontweight="bold", color="#302C3C", pad=6,
+                        )
+                else:
+                    axis = figure.add_subplot(111)
+                    axis.set_axis_off()
+                    message = (
+                        "No Regression metrics selected"
+                        if not selected_metrics
+                        else "Waiting for regression replay data"
+                    )
+                    axis.text(
+                        0.5, 0.5, message,
+                        ha="center", va="center", fontsize=13,
+                        fontweight="bold", color="#302C3C",
+                        transform=axis.transAxes,
+                    )
+        combined_mae_legend_bottom = 0.0
         if view == "MAE History":
+            available_metric_names = _ordered_plottable_mae_metric_names({
+                name
+                for _stage_id, stage_history in stage_groups
+                for item in stage_history
+                for name in _event_all_mae(item)
+            })
+            metric_names = self._selected_analysis_metrics(
+                available_metric_names
+            )
+            legend_columns = 2 if self.canvas.width() < 1200 else 4
+            metric_legend_rows = int(math.ceil(
+                len(metric_names) / max(1, legend_columns)
+            ))
+            stage_legend_rows = (
+                int(math.ceil(len(stage_groups) / 4.0))
+                if len(stage_groups) > 1 else 0
+            )
+            _available_width, available_height = self._analysis_viewport_size()
+            extra_legend_rows = max(
+                0, metric_legend_rows + stage_legend_rows - 2
+            )
+            unscaled_height = 390 + 18 * extra_legend_rows
+            self._resize_analysis_canvas(max(
+                available_height,
+                int(round(0.85 * unscaled_height)),
+            ))
             loss_axis, axis = figure.subplots(
                 1, 2, gridspec_kw={"width_ratios": (0.85, 1.35)}
-            )
-            loss_colors = (
-                "#4A7FC1", "#D48851", "#4A9478", "#8F7AC8", "#C35F79",
-                "#76869B",
             )
             all_loss_values: List[float] = []
             for stage_index, (stage_id, stage_history) in enumerate(stage_groups):
@@ -25149,10 +25909,12 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                         "stage_label", stage_id or "Current run"
                     )
                 )
-                color = loss_colors[stage_index % len(loss_colors)]
+                stage_color = MAE_PLOT_COLORS[
+                    stage_index % len(MAE_PLOT_COLORS)
+                ]
                 for key, split_label, linestyle, alpha in (
-                    ("train_loss", "train", "--", 0.72),
-                    ("val_loss", "validation", "-", 1.0),
+                    ("train_loss", "Train", "-", 0.95),
+                    ("val_loss", "Validation", "--", 0.82),
                 ):
                     x, y = self._finite_history(stage_history, key)
                     if not y:
@@ -25160,11 +25922,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     all_loss_values.extend(y)
                     loss_axis.plot(
                         x, y, marker="o", markersize=3,
-                        linewidth=1.6 if split_label == "train" else 1.8,
-                        linestyle=linestyle, color=color, alpha=alpha,
-                        label=f"{stage_label} {split_label}",
+                        linewidth=1.6 if split_label == "Train" else 1.8,
+                        linestyle=linestyle, color=stage_color, alpha=alpha,
+                        label=f"{stage_label} {split_label.lower()}",
                     )
-            _set_combined_mae_axis_scale(loss_axis, all_loss_values)
+            loss_axis.set_yscale("linear")
             self._style_axis(loss_axis, "Objective by training stage", "Loss")
             if loss_axis.lines:
                 loss_axis.legend(frameon=False, fontsize=7)
@@ -25174,12 +25936,6 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     ha="center", va="center", color="#797386",
                     transform=loss_axis.transAxes,
                 )
-            metric_names = _ordered_plottable_mae_metric_names({
-                name
-                for _stage_id, stage_history in stage_groups
-                for item in stage_history
-                for name in _event_all_mae(item)
-            })
             metric_handles: Dict[str, Any] = {}
             all_mae_values: List[float] = []
             stage_labels: List[str] = []
@@ -25217,12 +25973,17 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 "MAE (native units; units in legend)",
             )
             if metric_handles:
-                combined_mae_legend_rows = _add_combined_mae_legends(
+                combined_mae_legend_bottom = _add_combined_mae_legends(
                     axis, metric_handles, stage_labels
                 )
             else:
                 axis.text(
-                    0.5, 0.5, "No labeled validation data",
+                    0.5, 0.5,
+                    (
+                        "No MAE metrics selected"
+                        if available_metric_names
+                        else "No labeled validation data"
+                    ),
                     ha="center", va="center", color="#797386",
                     transform=axis.transAxes,
                 )
@@ -25286,12 +26047,204 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     0.5, 0.5, "Memory telemetry starts after the first epoch",
                     ha="center", va="center", color="#797386", transform=axis.transAxes,
                 )
-        if combined_mae_legend_rows:
-            bottom = min(0.46, 0.17 + 0.045 * combined_mae_legend_rows)
-            figure.tight_layout(pad=1.5, rect=(0.0, bottom, 1.0, 1.0))
+        if combined_mae_legend_bottom:
+            figure.tight_layout(
+                pad=1.5,
+                rect=(0.0, combined_mae_legend_bottom, 1.0, 1.0),
+            )
         else:
             figure.tight_layout(pad=1.5)
+        self._export_live_dashboard_figure(
+            view,
+            selected_stage,
+            regression_panels=regression_export_panels,
+        )
         self.canvas.draw_idle()
+
+    def _export_live_dashboard_figure(
+        self,
+        view: str,
+        selected_stage: str,
+        *,
+        regression_panels: Sequence[
+            Tuple[str, int, str, Dict[str, Any]]
+        ] = (),
+    ) -> Optional[Path]:
+        """Save the current GUI chart at a stable 16:9 production ratio."""
+        if getattr(self, "figure", None) is None:
+            return None
+        target_stage = str(selected_stage or self._active_stage_id).strip()
+        directory = self._stage_artifacts.get(target_stage) if target_stage else None
+        if directory is None:
+            directory = self._artifact_dir
+        if directory is None or not Path(directory).exists():
+            return None
+        plots = Path(directory) / "plots"
+        plots.mkdir(parents=True, exist_ok=True)
+        view_slug = re.sub(r"[^a-z0-9]+", "_", str(view).lower()).strip("_")
+        scope_source = (
+            self._stage_info.get(target_stage, {}).get("stage_label", target_stage)
+            if selected_stage else "all_stages"
+        )
+        scope = re.sub(
+            r"[^a-z0-9]+", "_", str(scope_source).lower()
+        ).strip("_") or "current"
+        selected_metrics = tuple(self._selected_analysis_metrics())
+        latest_epochs = tuple(
+            (stage_id, int(self._stage_latest_artifact_epoch.get(stage_id, 0)))
+            for stage_id in self._stage_order
+        )
+        epoch_suffix = ""
+        replay_epoch = 0
+        if view == "Regression":
+            replay_epoch = (
+                self._selected_regression_epoch() if selected_stage else 0
+            )
+            effective_epoch = replay_epoch or int(
+                self._stage_latest_artifact_epoch.get(target_stage, 0)
+            )
+            epoch_suffix = (
+                f"_epoch_{effective_epoch:04d}" if effective_epoch > 0 else "_latest"
+            )
+        destination = plots / f"gui_{view_slug}_{scope}{epoch_suffix}.png"
+        export_jobs: List[
+            Tuple[Path, Sequence[Tuple[str, int, str, Dict[str, Any]]], str]
+        ] = []
+        if view == "Regression" and regression_panels:
+            export_jobs.append((destination, regression_panels, str(scope_source)))
+            if not selected_stage:
+                panels_by_stage: Dict[
+                    str, List[Tuple[str, int, str, Dict[str, Any]]]
+                ] = {}
+                for panel in regression_panels:
+                    panels_by_stage.setdefault(str(panel[0]), []).append(panel)
+                for stage_id, stage_panels in panels_by_stage.items():
+                    stage_directory = self._stage_artifacts.get(stage_id)
+                    if stage_directory is None:
+                        continue
+                    stage_label = str(
+                        self._stage_info.get(stage_id, {}).get(
+                            "stage_label", stage_id or "current"
+                        )
+                    )
+                    stage_scope = re.sub(
+                        r"[^a-z0-9]+", "_", stage_label.lower()
+                    ).strip("_") or "current"
+                    stage_epoch = max(int(panel[1]) for panel in stage_panels)
+                    stage_destination = (
+                        Path(stage_directory)
+                        / "plots"
+                        / f"gui_regression_{stage_scope}_epoch_{stage_epoch:04d}.png"
+                    )
+                    if stage_destination != destination:
+                        export_jobs.append(
+                            (stage_destination, stage_panels, stage_label)
+                        )
+        signature = (
+            tuple(str(job[0]) for job in export_jobs) or (str(destination),),
+            str(view), str(selected_stage), replay_epoch,
+            selected_metrics, latest_epochs,
+        )
+        expected_destinations = [job[0] for job in export_jobs] or [destination]
+        if (
+            signature == self._last_live_export_signature
+            and all(path.is_file() for path in expected_destinations)
+        ):
+            return destination
+        if export_jobs:
+            for export_path, panels, export_scope in export_jobs:
+                export_path.parent.mkdir(parents=True, exist_ok=True)
+                if not self._save_regression_dashboard_image(
+                    panels, export_path, export_scope
+                ):
+                    return None
+            self._last_live_export_signature = signature
+            return destination
+        # Render an independent copy at the production ratio. The GUI Figure
+        # remains bound to the viewport and cannot inherit export dimensions.
+        if not self._save_live_figure_image(destination):
+            return None
+        self._last_live_export_signature = signature
+        return destination
+
+    def _save_regression_dashboard_image(
+        self,
+        panels: Sequence[Tuple[str, int, str, Dict[str, Any]]],
+        destination: Path,
+        scope_label: str,
+    ) -> bool:
+        """Render replay panels on an independent fixed 1600x900 canvas."""
+        if not panels:
+            return False
+        try:
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+            from matplotlib.figure import Figure
+
+            figure = Figure(
+                figsize=(16.0, 9.0), dpi=100, facecolor="#FFFDFE"
+            )
+            canvas = FigureCanvasAgg(figure)
+            rows, columns = _automatic_panel_grid(
+                len(panels), max_columns=4
+            )
+            color_index = {
+                name: index
+                for index, name in enumerate(self._analysis_metric_menu_names)
+            }
+            for index, (stage_id, epoch, metric_name, metric) in enumerate(panels):
+                axis = figure.add_subplot(rows, columns, index + 1)
+                stage_label = str(
+                    self._stage_info.get(stage_id, {}).get(
+                        "stage_label", stage_id or "Current run"
+                    )
+                )
+                _draw_regression_replay_panel(
+                    axis,
+                    metric_name=metric_name,
+                    metric=metric,
+                    stage_label=f"{stage_label} | epoch {epoch}",
+                    color=MAE_PLOT_COLORS[
+                        color_index.get(metric_name, 0) % len(MAE_PLOT_COLORS)
+                    ],
+                )
+            for index in range(len(panels), rows * columns):
+                unused_axis = figure.add_subplot(rows, columns, index + 1)
+                unused_axis.set_visible(False)
+            figure.suptitle(
+                f"Validation Regression - {scope_label}",
+                fontsize=12,
+                fontweight="bold",
+                color="#302C3C",
+            )
+            figure.tight_layout(pad=1.25, rect=(0.01, 0.01, 0.99, 0.955))
+            canvas.draw()
+            canvas.print_png(str(destination))
+            return True
+        except Exception as exc:
+            self._append_log(
+                f"[{self.backend._now()}] WARN: failed to save {destination}: {exc}"
+            )
+            return False
+
+    def _save_live_figure_image(
+        self, destination: Path, *, width: int = 1600, height: int = 900
+    ) -> bool:
+        """Render the GUI figure at a fixed ratio without resizing its canvas."""
+        try:
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+            export_figure = copy.deepcopy(self.figure)
+            export_figure.set_dpi(100)
+            export_figure.set_size_inches(width / 100.0, height / 100.0)
+            export_canvas = FigureCanvasAgg(export_figure)
+            export_canvas.draw()
+            export_canvas.print_png(str(destination))
+            return True
+        except Exception as exc:
+            self._append_log(
+                f"[{self.backend._now()}] WARN: failed to save {destination}: {exc}"
+            )
+            return False
 
     @staticmethod
     def _artifact_dir_for_checkpoint(checkpoint: str) -> Path:
