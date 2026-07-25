@@ -1,0 +1,94 @@
+{
+  "project_root": "/Users/Fona/Desktop/For Morikawa Lab/miu3-GNN",
+  "generated_at": "2026-07-24T22:51:25.085098+00:00",
+  "health": "green",
+  "research_spine": {
+    "objective": "Build non-OMat24 stress coverage for Neo Tiny-Large and connect strain response explicitly to L2 electric and L3 spin physics.",
+    "active_claim_id": "C03",
+    "current_gate": "Obtain licensed POTCAR provenance and resource approval for a bounded constrained-spin VASP convergence pilot.",
+    "next_action": "Run only the bounded constraint-lambda/cutoff/k-point pilot after those prerequisites are documented; do not launch the 1,080-job campaign.",
+    "stop_rule": "Keep w_magnetoelastic=0 and make no L3 differential-stress accuracy claim until same-geometry, same-method spin pairs pass DFT convergence and grouped holdout gates.",
+    "non_goals": [
+      "Plus/Max rematerialization",
+      "production checkpoint accuracy",
+      "MLMD or continuum deployment"
+    ]
+  },
+  "counts": {
+    "claims": 3,
+    "stages": 6,
+    "branches": 2,
+    "artifacts": 12,
+    "actions": 2
+  },
+  "claim_status": {
+    "<missing>": 3
+  },
+  "stage_status": {
+    "planned": 1,
+    "ready": 1,
+    "validated": 4
+  },
+  "branch_status": {
+    "deferred": 1,
+    "passed": 1
+  },
+  "blockers": [],
+  "orphaned_branches": [],
+  "unbounded_branches": [],
+  "stale_branches": [],
+  "next_actions": [
+    {
+      "action_id": "DERIVED-NEXT-STAGE",
+      "action": "Define and execute gate for S05 (dft)",
+      "why_now": "No explicit action queue entry exists for the next planned stage.",
+      "status": "derived"
+    }
+  ],
+  "placeholder_count": 0,
+  "errors": [],
+  "warnings": [],
+  "spine_file": "/Users/Fona/Desktop/For Morikawa Lab/miu3-GNN/workflow/research_spine.md",
+  "spine_markdown": {
+    "objective": "Build non-OMat24 stress coverage for Neo Tiny-Large and connect strain response explicitly to L2 electric and L3 spin physics.",
+    "active_claim_id": "C03",
+    "current_gate": "Obtain licensed POTCAR provenance and resource approval for a bounded constrained-spin VASP convergence pilot.",
+    "next_action": "Run only the bounded constraint-lambda/cutoff/k-point pilot after those prerequisites are documented; do not launch the 1,080-job campaign.",
+    "stop_rule": "Keep w_magnetoelastic=0 and make no L3 differential-stress accuracy claim until same-geometry, same-method spin pairs pass DFT convergence and grouped holdout gates."
+  },
+  "planning_artifact_path": "/Users/Fona/Desktop/For Morikawa Lab/miu3-GNN/workflow/integrated_research_plan.md",
+  "planning_artifact": {
+    "path": "/Users/Fona/Desktop/For Morikawa Lab/miu3-GNN/workflow/integrated_research_plan.md",
+    "valid": true,
+    "errors": [],
+    "warnings": [],
+    "sections": [
+      "control snapshot",
+      "definition of done",
+      "e3-miu-gnn stress-coupled dataset plan",
+      "evidence, models, and assumptions",
+      "research decision and scope",
+      "research spine synchronization",
+      "resource-aware execution order",
+      "risks, negative results, and escalation",
+      "s01: source and convention audit",
+      "s02: conservative coupled model",
+      "s03: raw-label enrichment",
+      "s04: tiny-large tier rebuild",
+      "s05: paired l3 vasp reference campaign",
+      "s06: training and challenge validation",
+      "scientific rationale and scale decision",
+      "stage gates and deliverables",
+      "stage roadmap"
+    ],
+    "snapshot": {
+      "objective": "Build non-OMat24 stress coverage for Neo Tiny-Large and connect strain response explicitly to L2 electric and L3 spin physics.",
+      "active_claim_id": "C03",
+      "current_gate": "Obtain licensed POTCAR provenance and resource approval for a bounded constrained-spin VASP convergence pilot.",
+      "next_action": "Run only the bounded constraint-lambda/cutoff/k-point pilot after those prerequisites are documented; do not launch the 1,080-job campaign.",
+      "stop_rule": "Keep w_magnetoelastic=0 and make no L3 differential-stress accuracy claim until same-geometry, same-method spin pairs pass DFT convergence and grouped holdout gates."
+    },
+    "status": "current",
+    "placeholders": 0
+  }
+}

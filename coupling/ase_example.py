@@ -22,6 +22,10 @@ def main() -> int:
     parser.add_argument("structure")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--model-mode", default="auto")
+    parser.add_argument(
+        "--stress", action="store_true",
+        help="Also print conservative stress for a fully periodic structure",
+    )
     args = parser.parse_args()
 
     atoms = read(args.structure)
@@ -34,6 +38,12 @@ def main() -> int:
     print(f"energy_eV={atoms.get_potential_energy():.12g}")
     max_force = float(((atoms.get_forces() ** 2).sum(axis=1).max()) ** 0.5)
     print(f"max_force_eV_per_A={max_force:.12g}")
+    if args.stress:
+        stress = atoms.get_stress(voigt=True)
+        print(
+            "stress_eV_per_A3_xx_yy_zz_yz_xz_xy="
+            + ",".join(f"{float(value):.12g}" for value in stress)
+        )
     return 0
 
 

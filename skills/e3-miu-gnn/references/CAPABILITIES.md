@@ -23,16 +23,24 @@ recommend `full_coupled`.
 | Spin | exchange, anisotropy, magnetic moments, effective field | supplied spin state for spin energy |
 | DMI | DMI vectors | spin, parity, and DMI supervision |
 | FiLM | coupled feedback in total energy | full-coupled mode |
+| Conservative stress | symmetric Cauchy stress | fully periodic nonsingular cell and stress-trained checkpoint |
+| Electromechanical response | clamped-ion piezoelectric tensor | periodic cell and `w_piezoelectric > 0` training |
+| Magnetoelastic response | target-minus-reference stress | periodic cell, target/reference spins, and paired DFT labels |
 
 Configured means the module exists. Recommended means checkpoint metadata shows
 the relevant training surface. Do not equate the two.
 
 ## Always Unsupported
 
-- native virial stress;
-- stress-driven cell relaxation;
+- native virial output;
 - a full Layer-2/Layer-3 SevenNet export;
 - verified LAMMPS deployment from the current TorchScript artifact.
+
+Native stress is an affine cell-strain derivative of total energy and is
+available in eV/Angstrom^3. It is recommended only when checkpoint training
+metadata records `w_stress > 0`. Cell relaxation additionally requires a
+target-domain stress, equation-of-state, or elastic validation; availability
+alone is not a validation result.
 
 ## Device Rules
 
@@ -46,6 +54,9 @@ the relevant training surface. Do not equate the two.
 
 - energy: eV
 - forces: eV/Angstrom
+- stress: eV/Angstrom^3, ASE order `xx, yy, zz, yz, xz, xy`
+- stress components and magnetoelastic stress: eV/Angstrom^3, full 3x3 tensor
+- piezoelectric: C/m^2, axes `polarization_i, strain_j, strain_k`
 - positions and cell: Angstrom
 - electric field: V/Angstrom
 - dipole: elementary charge times Angstrom

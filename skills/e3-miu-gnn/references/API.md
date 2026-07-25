@@ -33,11 +33,20 @@ lists them as recommended:
 "properties": ["energy", "forces", "dipole", "polarizability"]
 ```
 
-Possible native names are `energy`, `forces`, `dipole`, `polarizability`, `bec`,
-`charges`, `atomic_dipoles`, `atomic_polarizability`, `c6`, `Jij`, `Di`,
-`DMIij`, `magnetic_moments`, and `effective_field`.
+Possible native names are `energy`, `forces`, `stress`, `stress_l1`,
+`stress_l2`, `stress_l3`, `stress_dispersion`, `dipole`, `polarizability`,
+`bec`, `piezoelectric`, `charges`, `atomic_dipoles`,
+`atomic_polarizability`, `c6`, `Jij`, `Di`, `DMIij`, `magnetic_moments`,
+`effective_field`, and `magnetoelastic_stress`.
 
-`stress` and `virial` are rejected.
+`stress` is accepted only for a fully periodic, nonsingular cell and is returned
+in eV/Angstrom^3 using ASE Voigt order `xx, yy, zz, yz, xz, xy`. Use it
+scientifically only when checkpoint inspection recommends it. `virial` is
+rejected.
+
+Stress components are full 3x3 tensors. `piezoelectric` is a 3x3x3 tensor in
+C/m^2. Paired `magnetoelastic_stress` additionally requires target spins and
+an ASE array named `e3mu_reference_spins` or `reference_spins`.
 
 ## Inference Options
 

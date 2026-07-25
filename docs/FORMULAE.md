@@ -298,6 +298,7 @@ A general unmasked objective has the schematic form
 \mathcal L
 =\lambda_E\|\widehat E-E\|^2
 +\lambda_F\|\widehat{\mathbf F}-\mathbf F\|^2
++\lambda_\sigma\|\widehat{\boldsymbol\sigma}-\boldsymbol\sigma\|^2
 +\lambda_{\mathrm{BEC}}\|\widehat{\mathbf Z}^*-\mathbf Z^*\|^2
 +\lambda_\mu\|\widehat{\boldsymbol\mu}-\boldsymbol\mu\|^2
 +\lambda_\alpha\|\widehat{\boldsymbol\alpha}-\boldsymbol\alpha\|^2.
@@ -317,6 +318,79 @@ E_{\mathrm{tot}}
 
 The code refines this schematic into named QEq, PME, D4, spin, and external
 field contributions, all evaluated before force differentiation.
+
+### Formula 14a: conservative force and cell stress
+
+For graph $`g`$ with undeformed volume $`V_g`$, an infinitesimal symmetric
+strain deforms Cartesian positions, lattice rows, and periodic image shifts by
+the same affine map:
+
+```math
+\mathbf r_i(\boldsymbol\varepsilon)
+=(\mathbf I+\boldsymbol\varepsilon)\mathbf r_i,
+\qquad
+\mathbf H(\boldsymbol\varepsilon)
+=\mathbf H(\mathbf I+\boldsymbol\varepsilon)^{\mathsf T}.
+```
+
+The implemented outputs are
+
+```math
+\mathbf F_i=-\frac{\partial E_{\mathrm{tot}}}{\partial\mathbf r_i},
+\qquad
+\boldsymbol\sigma_g=
+\frac{1}{V_g}\mathrm{sym}
+\left(\frac{\partial E_{\mathrm{tot}}}
+{\partial\boldsymbol\varepsilon_g}\right).
+```
+
+Stress is tensile-positive Cauchy stress in eV/Angstrom$^3$. The same autograd
+call produces force and stress derivatives. Stress supervision is masked out
+for nonperiodic, partially periodic, or singular cells; source adapters must
+resolve sign and extensive/intensive conventions before training.
+
+The implementation can also expose the exact energy decomposition
+
+```math
+\boldsymbol\sigma=
+\boldsymbol\sigma_{L1}+\boldsymbol\sigma_{L2}
++\boldsymbol\sigma_{L3}+\boldsymbol\sigma_{\mathrm{disp}},
+```
+
+where every term is differentiated from its named scalar energy contribution.
+This is diagnostic decomposition, not four independent tensor heads.
+
+### Formula 14b: L2 electromechanical response
+
+For the VASP clamped-ion convention stored by Neo,
+
+```math
+e_{i,jk}=\frac{1}{V_0}
+\frac{\partial \mu_i}{\partial\varepsilon_{jk}}
+=-\frac{1}{V_0}
+\frac{\partial^2 G}{\partial \mathcal E_i\,\partial\varepsilon_{jk}}.
+```
+
+The tensor is reported in C/m$^2$, has axes `[polarization_i, strain_j,
+strain_k]`, and is symmetric in its last two axes. This is VASP's
+energy-conjugate mixed derivative normalized by the reference volume; the
+ionic-relaxation contribution is not mixed into the label.
+
+### Formula 14c: L3 magnetoelastic response
+
+For a target spin state and a same-geometry, same-method reference state,
+
+```math
+\Delta\boldsymbol\sigma_{\mathrm{mag}}=
+\frac{1}{V_0}\frac{\partial}{\partial\boldsymbol\varepsilon}
+\left[G(\mathbf S)-G(\mathbf S_{\mathrm{ref}})\right].
+```
+
+Both free energies are recomputed through the complete coupled Hamiltonian.
+Consequently charge, polarization, dispersion, and FiLM feedback induced by a
+spin change remain part of the DFT-comparable stress difference. A magnetic
+trajectory frame with no matched reference remains useful for total stress,
+but is not assigned a synthetic magnetoelastic label.
 
 ## Formula 15: charge equilibrium
 
@@ -403,7 +477,24 @@ The implemented scalar update bounds the scale perturbation,
 ```
 
 while polar, axial, $`L=2`$, and optional $`L=3`$ tensors receive bounded
-multiplicative modulation without an equivariance-breaking tensor bias.
+multiplicative modulation without an equivariance-breaking tensor bias. A
+separate mechanism-activity mask multiplies the projected FiLM parameters,
+making an inactive graph an exact identity modulation without altering active
+checkpoint behavior.
+
+Each physical mechanism $`m`$ also receives a graph activity mask:
+
+```math
+a_g^{(m)}=\mathbb 1\!\left[
+\bigvee_{t\in\mathcal T_m}m_{g,t}\gt 0
+\;\lor\;\text{an associated field, charge, or spin state is active}
+\right].
+```
+
+Electric, polarization, dispersion, and spin masks are evaluated separately.
+Their energy and FiLM contributions are multiplied by $`a_g^{(m)}`$ during
+training. A Joint batch with no response activity therefore executes only the
+Layer-1 energy path; explicit inference remains fully coupled by default.
 
 ## Formula 19: comprehensive objective
 
@@ -416,8 +507,8 @@ A broad multi-target objective can be written as
 +w_W\mathcal L_{\mathrm{wave}}+w_{\mathrm{Ha}}\mathcal L_{\mathrm{Hamiltonian}}.
 ```
 
-Stress, wavefunction, and a direct Hessian loss are not implemented targets.
-The actual objective is
+Wavefunction and a direct Hessian loss are not implemented targets. The actual
+objective is
 
 ```math
 \mathcal L_{\mathrm{implemented}}
@@ -431,10 +522,14 @@ where the implemented target set may contain
 
 ```math
 \mathcal T_{\mathrm{available}}\subseteq
-\{E,\mathbf F,\boldsymbol\mu,\boldsymbol\alpha,
+\{E,\mathbf F,\boldsymbol\sigma,\mathbf e,\Delta\boldsymbol\sigma_{\mathrm{mag}},
+\boldsymbol\mu,\boldsymbol\alpha,
 q,\boldsymbol\mu_i,\boldsymbol\alpha_i,C_6,Z^*,
 \mathbf m,\mathbf H^{\mathrm{eff}},J,\mathbf D,\mathbf D^{\mathrm{DMI}}\}.
 ```
 
 Availability is determined by both the selected architecture and the dataset
-mask. This is the formula used in the manuscript and code.
+mask. The implementation can additionally penalize the BEC acoustic sum rule,
+$`\sum_i Z_i^*=0`$, and active electric/spin FiLM fixed-point residuals. These
+remain auxiliary physical constraints rather than substitutes for observable
+labels.

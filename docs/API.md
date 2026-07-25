@@ -67,6 +67,7 @@ atoms.calc = E3MUCalculator(
 
 energy_eV = atoms.get_potential_energy()
 forces_eV_per_A = atoms.get_forces()
+stress_eV_per_A3 = atoms.get_stress(voigt=True)  # fully periodic structures
 ```
 
 Constructor parameters:
@@ -81,9 +82,24 @@ Constructor parameters:
 | `compile_inference` | boolean | Optional PyTorch compile path. It is disabled on MPS because Metal compilation can abort the process. |
 | `allow_unsafe_legacy` | boolean | Permit pickle loading only for a trusted local legacy checkpoint. |
 
-The calculator provides conservative energy and forces. It does not advertise
-stress because native virial stress is not implemented. Cell relaxation must
-therefore not be inferred from this API.
+The calculator provides conservative energy, forces, and three-dimensional
+Cauchy stress. Stress is computed as the symmetric homogeneous cell-strain
+derivative of the same total energy, divided by the undeformed volume. The ASE
+Voigt order is `xx, yy, zz, yz, xz, xy`, the unit is eV/Angstrom^3, and positive
+values are tensile. Stress requires periodicity in all three directions and a
+finite, nonsingular cell.
+
+The output is technically available for every native checkpoint, but the
+manifest recommends it only when training metadata records `w_stress > 0`.
+Variable-cell relaxation is scientifically appropriate only after stress and
+elastic response have passed a target-domain held-out validation; a finite
+stress from an older energy/force-only checkpoint is not evidence of accuracy.
+
+`stress_l1`, `stress_l2`, `stress_l3`, and `stress_dispersion` return full
+3x3 tensors whose sum equals total stress. `piezoelectric` returns a 3x3x3
+tensor in C/m$^2$. `magnetoelastic_stress` requires target spins plus an
+`Atoms` array named `e3mu_reference_spins` or `reference_spins`; it returns the
+full target-minus-reference stress tensor in eV/Angstrom$^3$.
 
 ## Prediction API
 
@@ -95,7 +111,7 @@ from e3mu import predict
 result = predict(
     "model.pt",
     atoms,
-    properties=("energy", "forces", "dipole", "polarizability"),
+    properties=("energy", "forces", "stress", "dipole", "polarizability"),
 )
 ```
 
@@ -113,12 +129,13 @@ NaN or infinity causes an error instead of invalid JSON.
 
 Supported result names include:
 
-- always: `energy`, `forces`;
-- response branch: `dipole`, `polarizability`, `bec`;
+- native conservative derivatives: `energy`, `forces`, periodic `stress`, and
+  `stress_l1`, `stress_l2`, `stress_l3`, `stress_dispersion`;
+- response branch: `dipole`, `polarizability`, `bec`, `piezoelectric`;
 - enabled domain layers: `charges`, `atomic_dipoles`,
   `atomic_polarizability`, `c6`;
 - enabled spin layer: `Jij`, `Di`, `DMIij`, `magnetic_moments`,
-  `effective_field`.
+  `effective_field`, and paired `magnetoelastic_stress`.
 
 The manifest's `recommended` list is authoritative for scientific use. A base
 checkpoint may contain initialized response modules without having trained
@@ -142,7 +159,9 @@ report = relax(
 
 `relax` optimizes positions at a fixed cell with FIRE or BFGS. The result records
 convergence, final energy, maximum force, final geometry, and calculator
-metadata.
+metadata. For cell optimization, use the ASE calculator directly with an ASE
+cell filter and only a checkpoint whose manifest recommends stress; the public
+`relax` helper intentionally remains fixed-cell.
 
 ## Dataset Evaluation
 

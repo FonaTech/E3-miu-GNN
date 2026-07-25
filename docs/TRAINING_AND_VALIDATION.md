@@ -115,9 +115,31 @@ S_{\mathrm{val}}=
 
 where $`s_t`$ is a fixed characteristic scale. Current scales are 1 for energy,
 force, dipole, polarizability, and magnetic moment; 0.1 for charge, atomic
-dipole, atomic polarizability, and BEC; 10 for C6; and 0.01 eV for effective
-spin field and Hamiltonian parameters. A candidate cannot appear better by
-reducing its own loss coefficient.
+dipole, atomic polarizability, BEC, and stress in eV/Angstrom$^3$; 10 for C6;
+and 0.01 eV for effective spin field and Hamiltonian parameters. A candidate
+cannot appear better by reducing its own loss coefficient.
+
+The electromechanical scale is 0.5 C/m$^2$ and the paired magnetoelastic scale
+is 0.02 eV/Angstrom$^3$. `w_piezoelectric` and `w_magnetoelastic` remain zero
+unless their explicit masks are present; a total magnetic stress label does
+not silently activate the paired magnetoelastic objective.
+
+Stress loss is evaluated over the six independent symmetric components. `mse`
+and scaled `huber` are supported; the default Huber threshold is 0.05
+eV/Angstrom$^3$. Only fully periodic, nonsingular cells with active stress masks
+contribute. The predicted tensor is never an independent regressor: it is the
+cell-strain derivative of the same total energy used for force training.
+The piezoelectric objective differentiates the model dipole with respect to the
+same strain variable. The magnetoelastic objective differentiates the complete
+target-minus-reference coupled energy, and therefore requires co-located
+`spins`, `reference_spins`, and `magnetoelastic_stress` masks.
+
+With `label_aware_coupling=True`, each Joint batch activates only the electric,
+polarization, dispersion, and spin mechanisms supported by its labels or
+explicit field/charge/spin state. Batches with only L1 energy, force, and stress
+targets skip the response core entirely. Optional BEC acoustic-sum-rule and
+electric/spin FiLM residual losses add explicit physical constraints without
+turning missing L2/L3 labels into zero targets.
 
 ## Auto Research
 
@@ -155,11 +177,11 @@ With epoch artifacts enabled, training writes under
 `<checkpoint parent>/train/<checkpoint stem>/`:
 
 - safe per-epoch checkpoints;
-- full and clipped energy/force parity plots;
+- full and clipped energy/force parity plots plus stress MAE history;
 - force-norm plots;
 - loss and MAE histories;
 - active auxiliary-task MAEs;
-- QEq, polarization, and FiLM residual histories;
+- QEq, polarization, and separate electric/spin FiLM residual histories;
 - memory histories and machine-readable JSON; and
 - the best validated checkpoint at the requested output path.
 
@@ -182,14 +204,17 @@ differences. With the documented seed 7, the current maximum errors are:
 | Reflection: energy, force, dipole, polarizability | 0 |
 | Time reversal: spin energy and effective field | 0 |
 | Charge conservation | 0 e |
-| QEq stationarity residual | $`9.39\times10^{-12}`$ |
-| Conservative-force finite difference | $`8.15\times10^{-12}`$ eV/angstrom |
+| QEq stationarity residual | $`9.45\times10^{-12}`$ |
+| Conservative-force finite difference | $`2.02\times10^{-11}`$ eV/angstrom |
+| Conservative-stress finite difference | $`1.87\times10^{-14}`$ eV/angstrom$^3$ |
+| Stress symmetry | 0 |
 
 ![Deterministic validation margins](assets/generated/physics-self-tests.png)
 
-The current regression suite contains 67 passing tests. It covers O(3)
-channels, QEq on Apple MPS, PME and D4 reference behavior, polarization
-gradients, spin losses, checkpoint safety, HDF5 masks and splits, dataset-aware
+The regression suite covers affine-strain stress finite differences, stress
+rotation covariance and nonperiodic masking, O(3) channels, QEq on Apple MPS,
+PME and D4 reference behavior, polarization gradients, label-aware L1/L2/L3
+routing, spin losses, checkpoint safety, HDF5 masks and splits, dataset-aware
 GUI state, and VASP magnetic mapping.
 
 ## Short held-out benchmarks
@@ -209,7 +234,7 @@ physically calibrated.
 
 ## Memory behavior
 
-Force and BEC losses require higher-order autograd graphs. On Apple MPS,
+Force, stress, and BEC losses require higher-order autograd graphs. On Apple MPS,
 batches are packed by edge count rather than structure count; graph references,
 optimizer gradients, plotting figures, and reclaimable allocator blocks are
 released after their useful lifetime. Every epoch reports process RSS, active

@@ -17,7 +17,10 @@ python coupling/ase_example.py model_base.pt mp-2998_BaTiO3.cif --device cpu
 python -m e3mu run-task coupling/task_example.json --output prediction.json
 ```
 
-The native API does not advertise stress because the current implementation
-does not derive virial stress. The SevenNet TorchScript export contains only the
-Layer-1 ground energy and forces; it is not a serialization of the coupled
-Layer-2/Layer-3 Hamiltonian.
+The native API provides conservative Cauchy stress for fully periodic,
+nonsingular cells through the same energy derivative as forces. Use it for
+scientific conclusions only when checkpoint inspection recommends `stress`
+(`w_stress > 0` in training metadata) and target-domain validation passes.
+`virial` remains unsupported. The SevenNet TorchScript export contains only the
+Layer-1 ground energy and forces; it does not serialize native stress or the
+coupled Layer-2/Layer-3 Hamiltonian.

@@ -30,11 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from ase import Atoms
-from ase.build import bulk, make_supercell
 from ase.data import atomic_numbers as ASE_ATOMIC_NUMBERS
 from ase.data import chemical_symbols as ASE_CHEMICAL_SYMBOLS
-from ase.io import read as ase_read
-from ase.io import write as ase_write
 from ase.io.extxyz import key_val_str_to_dict
 from ase.neighborlist import neighbor_list
 
@@ -112,6 +109,9 @@ _resolve_composite_source = _core._resolve_composite_source
 
 _NEO_TIER_LABEL_FAMILIES: Dict[str, Tuple[str, ...]] = {
     "energy_force": ("energy", "forces"),
+    "mechanical_response": ("stress",),
+    "electromechanical_response": ("piezoelectric",),
+    "magnetoelastic_response": ("magnetoelastic_stress",),
     "spin": ("spins", "magnetic_moments"),
     "effective_spin_field": ("effective_field",),
     "charge_response": ("charges", "atomic_dipoles"),
@@ -119,6 +119,8 @@ _NEO_TIER_LABEL_FAMILIES: Dict[str, Tuple[str, ...]] = {
     "polarization_dispersion": ("polarizability", "atomic_polarizability", "c6"),
     "born_effective_charge": ("bec",),
 }
+
+VASP_KBAR_TO_EV_PER_ANGSTROM3 = _core.VASP_KBAR_TO_EV_PER_ANGSTROM3
 
 NEO_HF_TIER_PATHS: Dict[str, str] = {
     "tiny": "canonical/neo_tiny_l1_l2_l3.h5",
@@ -128,6 +130,19 @@ NEO_HF_TIER_PATHS: Dict[str, str] = {
     "plus": "canonical/neo_plus_l1_l2_l3.h5",
     "max": "canonical/neo_max_l1_l2_l3.h5",
 }
+# Local format/capability analysis includes the temporary Plus Half tier.  It
+# intentionally remains separate from ``NEO_HF_TIER_PATHS`` so release staging
+# and public documentation continue to expose only the six production tiers.
+NEO_ANALYSIS_TIER_PATHS: Dict[str, str] = {
+    "tiny": NEO_HF_TIER_PATHS["tiny"],
+    "small": NEO_HF_TIER_PATHS["small"],
+    "standard": NEO_HF_TIER_PATHS["standard"],
+    "plus_half": "canonical/neo_plus_half_l1_l2_l3.h5",
+    "large": NEO_HF_TIER_PATHS["large"],
+    "plus": NEO_HF_TIER_PATHS["plus"],
+    "max": NEO_HF_TIER_PATHS["max"],
+}
+NEO_TEMPORARY_ANALYSIS_TIERS = frozenset({"plus_half"})
 NEO_HF_REQUIRED_DOCUMENTS: Tuple[str, ...] = (
     "README.md",
     "SOURCES_AND_PROCESSING.md",
@@ -290,6 +305,18 @@ def write_hdf5_dataset(
         meta_fields["provenance_id"].append(str(props.get("provenance_id", "unknown")))
         meta_fields["dataset_role"].append(str(props.get("dataset_role", "unknown")))
         meta_fields["curriculum_role"].append(str(props.get("curriculum_role", "all")))
+        meta_fields["response_family_id"].append(
+            str(props.get("response_family_id", props.get("parent_id", group_id)))
+        )
+        meta_fields["perturbation_id"].append(
+            str(props.get("perturbation_id", props.get("sample_id", f"structure-{structure_index}")))
+        )
+        meta_fields["stress_method_id"].append(
+            str(props.get("stress_method_id", props.get("method_id", "unknown")))
+        )
+        meta_fields["stress_convention"].append(
+            str(props.get("stress_convention", "unknown"))
+        )
 
     with h5py.File(output, "w") as handle:
         handle.attrs["schema_version"] = HDF5_SCHEMA_VERSION
@@ -512,6 +539,19 @@ def write_hdf5_dataset_stream(
                     "provenance_id": str(props.get("provenance_id", "unknown")),
                     "dataset_role": str(props.get("dataset_role", "unknown")),
                     "curriculum_role": str(props.get("curriculum_role", "all")),
+                    "response_family_id": str(
+                        props.get("response_family_id", props.get("parent_id", group_id))
+                    ),
+                    "perturbation_id": str(
+                        props.get(
+                            "perturbation_id",
+                            props.get("sample_id", f"structure-{global_index}"),
+                        )
+                    ),
+                    "stress_method_id": str(
+                        props.get("stress_method_id", props.get("method_id", "unknown"))
+                    ),
+                    "stress_convention": str(props.get("stress_convention", "unknown")),
                 }
                 for name in HDF5_METADATA_FIELDS:
                     metadata_values[name].append(defaults[name])
@@ -1428,8 +1468,45 @@ def download_jarvis_dfpt_archives(
     }
 
 
+def _parse_vasp_clamped_ion_piezoelectric(outcar_text: str) -> np.ndarray:
+    """Parse VASP's electronic (clamped-ion) e tensor in C/m^2.
+
+    VASP prints a 3x6 matrix with columns ``XX YY ZZ XY YZ ZX``.  The ionic
+    contribution is deliberately excluded. The stored full tensor matches
+    VASP's mixed electric-enthalpy derivative ``(1/V0) d(mu_i)/d(strain_jk)``;
+    no additional finite-volume polarization correction is applied.
+    """
+    pattern = re.compile(
+        r"PIEZOELECTRIC\s+TENSOR\s+for\s+field\s+in\s+x,\s*y,\s*z\s+"
+        r"\(C/m\^2\).*?\n\s*XX\s+YY\s+ZZ\s+XY\s+YZ\s+ZX\s*\n"
+        r"\s*-+\s*\n"
+        r"\s*x\s+([^\n]+)\n\s*y\s+([^\n]+)\n\s*z\s+([^\n]+)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    matches = list(pattern.finditer(outcar_text))
+    if not matches:
+        raise ValueError("OUTCAR has no cumulative clamped-ion piezoelectric tensor")
+    rows = np.asarray(
+        [
+            [float(value) for value in matches[-1].group(index).split()[:6]]
+            for index in range(1, 4)
+        ],
+        dtype=float,
+    )
+    if rows.shape != (3, 6) or not np.isfinite(rows).all():
+        raise ValueError("OUTCAR clamped-ion piezoelectric tensor is malformed")
+    tensor = np.zeros((3, 3, 3), dtype=float)
+    tensor[:, 0, 0] = rows[:, 0]
+    tensor[:, 1, 1] = rows[:, 1]
+    tensor[:, 2, 2] = rows[:, 2]
+    tensor[:, 0, 1] = tensor[:, 1, 0] = rows[:, 3]
+    tensor[:, 1, 2] = tensor[:, 2, 1] = rows[:, 4]
+    tensor[:, 2, 0] = tensor[:, 0, 2] = rows[:, 5]
+    return tensor
+
+
 def _parse_jarvis_dfpt_archive(path: str, item: Dict[str, Any]) -> Configuration:
-    """Parse geometry and per-ion Born charges from a JARVIS vasprun.xml ZIP."""
+    """Parse matched geometry, stress, BEC, and piezoelectric JARVIS labels."""
     archive = Path(path).expanduser().resolve()
     with zipfile.ZipFile(archive, "r") as zipped:
         members = {Path(name).name: name for name in zipped.namelist()}
@@ -1437,6 +1514,11 @@ def _parse_jarvis_dfpt_archive(path: str, item: Dict[str, Any]) -> Configuration
             raise KeyError(f"JARVIS DFPT archive has no vasprun.xml: {archive}")
         with zipped.open(members["vasprun.xml"], "r") as handle:
             xml_bytes = handle.read()
+        if "OUTCAR" not in members:
+            raise KeyError(f"JARVIS DFPT archive has no OUTCAR: {archive}")
+        outcar_text = zipped.read(members["OUTCAR"]).decode(
+            "utf-8", errors="replace"
+        )
         poscar_text = (
             zipped.read(members["POSCAR"]).decode("utf-8", errors="replace")
             if "POSCAR" in members else ""
@@ -1497,12 +1579,26 @@ def _parse_jarvis_dfpt_archive(path: str, item: Dict[str, Any]) -> Configuration
     # The acoustic sum rule should be close to zero, but retain the published
     # tensor rather than projecting/correcting the scientific label.
     residual = float(np.max(np.abs(np.sum(bec, axis=0))))
+    stress_nodes = root.findall(".//varray[@name='stress']")
+    if not stress_nodes:
+        raise ValueError(f"No VASP stress tensor in {archive}")
+    raw_stress_kbar = vectors(stress_nodes[-1]).reshape(3, 3)
+    if not np.isfinite(raw_stress_kbar).all():
+        raise ValueError(f"Non-finite VASP stress tensor in {archive}")
+    stress = (
+        0.5 * (raw_stress_kbar + raw_stress_kbar.T)
+        * VASP_KBAR_TO_EV_PER_ANGSTROM3
+    )
+    piezoelectric = _parse_vasp_clamped_ion_piezoelectric(outcar_text)
     props: Dict[str, Any] = {
         "field": np.zeros(3, dtype=float),
         "bec": bec,
+        "stress": stress,
+        "stress_volume_normalized": 1.0,
+        "piezoelectric": piezoelectric,
         "total_charge": 0.0,
         "source": "JARVIS-DFT-DFPT-v2025.09",
-        "method_id": "VASP-DFPT-PBE",
+        "method_id": "VASP-DFPT-optB88vdW",
         "system_id": str(item["jid"]),
         "group_id": f"JARVIS-DFPT:{item['jid']}",
         "sample_id": f"JARVIS-DFPT:{item['jid']}",
@@ -1511,17 +1607,31 @@ def _parse_jarvis_dfpt_archive(path: str, item: Dict[str, Any]) -> Configuration
         "energy_reference": "masked:DFPT-response-only",
         "provenance_id": f"figshare:{item['archive_url'].rsplit('/', 1)[-1]}#{item['jid']}",
         "bec_acoustic_sum_residual_max": residual,
+        "response_family_id": f"JARVIS-DFPT:{item['jid']}",
+        "perturbation_id": "zero-field-clamped-ion",
+        "stress_method_id": "VASP-DFPT-optB88vdW",
+        "stress_convention": (
+            "tensile-positive-cauchy:eV/angstrom^3;"
+            "source=VASP-compressive-positive-kBar;factor=-0.0006241509074460763"
+        ),
     }
     props["split"] = stable_split(props["group_id"])
     cfg = Configuration(
         atomic_numbers=np.asarray([ASE_ATOMIC_NUMBERS[value] for value in symbols], dtype=int),
         positions=fractional @ cell,
         properties=props,
-        property_weights={"field": 1.0, "bec": 1.0, "total_charge": 1.0},
+        property_weights={
+            "field": 1.0,
+            "bec": 1.0,
+            "stress": 1.0,
+            "stress_volume_normalized": 1.0,
+            "piezoelectric": 1.0,
+            "total_charge": 1.0,
+        },
         cell=cell,
         pbc=(True, True, True),
         config_type="JARVIS-DFT-DFPT",
-        head="JARVIS:VASP-DFPT-PBE",
+        head="JARVIS:VASP-DFPT-optB88vdW",
     )
     _validate_configuration(cfg, context=f"JARVIS-DFPT/{item['jid']}")
     return cfg
@@ -1581,7 +1691,20 @@ def rebuild_jarvis_dfpt_hdf5(
             },
             "figshare_article": "10.6084/m9.figshare.6815699.v11",
             "license": "CC-BY-4.0",
-            "label_policy": "Published per-ion 3x3 born_charges from vasprun.xml; no ASR correction",
+            "label_policy": (
+                "Published per-ion 3x3 born_charges and final VASP stress from "
+                "vasprun.xml plus the electronic clamped-ion piezoelectric tensor "
+                "from OUTCAR; no ASR or tensor projection"
+            ),
+            "stress_conversion": (
+                "VASP compressive-positive kBar multiplied by "
+                "-0.0006241509074460763 to tensile-positive eV/angstrom^3"
+            ),
+            "piezoelectric_convention": (
+                "VASP mixed electric-enthalpy derivative (1/V0) d(mu_i)/dstrain_jk "
+                "in C/m^2; XX YY ZZ XY YZ ZX expanded to a full tensor symmetric "
+                "in j,k; ionic contribution excluded"
+            ),
             "energy_policy": "DFPT energy and force records are masked from the shared loss",
             "sanity_filter": {
                 "max_abs_bec": float(max_abs_bec),
@@ -2030,9 +2153,15 @@ def _configuration_from_mptrj_record(
     moments = np.zeros((len(numbers), 3), dtype=float)
     moments[magnetic_mask, 2] = moments_scalar[magnetic_mask]
     corrected_energy = float(record["corrected_total_energy"])
+    raw_stress = np.asarray(record.get("stress"), dtype=float).reshape(3, 3)
+    if not np.isfinite(raw_stress).all():
+        raise ValueError(f"MPtrj/{mp_id}/{frame_id}: non-finite VASP stress")
+    stress = 0.5 * (raw_stress + raw_stress.T) * VASP_KBAR_TO_EV_PER_ANGSTROM3
     props: Dict[str, Any] = {
         "energy": corrected_energy,
         "forces": np.asarray(record["force"], dtype=float).reshape(-1, 3),
+        "stress": stress,
+        "stress_volume_normalized": 1.0,
         "spins": spins,
         "magnetic_moments": moments,
         "source": "MPtrj-v2022.9-magnetic",
@@ -2044,6 +2173,13 @@ def _configuration_from_mptrj_record(
         "domain": "periodic-collinear-spin",
         "energy_reference": "MPtrj:corrected_total_energy:MP2020-compatible",
         "provenance_id": f"figshare:10.6084/m9.figshare.23713842.v2#{mp_id}/{frame_id}",
+        "response_family_id": f"MPtrj:{mp_id}",
+        "perturbation_id": str(frame_id),
+        "stress_method_id": "VASP-MP-GGA/GGA+U",
+        "stress_convention": (
+            "tensile-positive-cauchy:eV/angstrom^3;"
+            "source=VASP-compressive-positive-kBar;factor=-0.0006241509074460763"
+        ),
     }
     cfg = Configuration(
         atomic_numbers=numbers,
@@ -2154,7 +2290,23 @@ def _configuration_from_mptrj_large_record(
         "domain": "periodic",
         "energy_reference": "MPtrj:corrected_total_energy:MP2020-compatible",
         "provenance_id": f"figshare:10.6084/m9.figshare.23713842.v2#{mp_id}/{frame_id}",
+        "response_family_id": f"MPtrj:{mp_id}",
+        "perturbation_id": str(frame_id),
+        "stress_method_id": "VASP-MP-GGA/GGA+U",
+        "stress_convention": (
+            "tensile-positive-cauchy:eV/angstrom^3;"
+            "source=VASP-compressive-positive-kBar;factor=-0.0006241509074460763"
+        ),
     }
+    raw_stress = record.get("stress")
+    if raw_stress is not None:
+        stress = np.asarray(raw_stress, dtype=float).reshape(3, 3)
+        if not np.isfinite(stress).all():
+            raise ValueError(f"MPtrj-large/{mp_id}/{frame_id}: non-finite VASP stress")
+        props["stress"] = (
+            0.5 * (stress + stress.T) * VASP_KBAR_TO_EV_PER_ANGSTROM3
+        )
+        props["stress_volume_normalized"] = 1.0
     raw_moments = record.get("magmom")
     if raw_moments is not None:
         try:
@@ -2273,7 +2425,6 @@ def rebuild_mptrj_large_hdf5(
                     except Exception:
                         continue
                     counters["eligible_frames"] += 1
-                    sample_id = f"MPtrj:{mp_id}:{frame_id}"
                     required = frame_id in required_frames
                     rank = hashlib.sha256(
                         f"neo-large-mptrj|{mp_id}|{frame_id}".encode()
@@ -3279,6 +3430,230 @@ def build_neo_stratified_tier(
     return result
 
 
+def enrich_mptrj_stress_hdf5(
+    raw_json: str,
+    hdf5_paths: Sequence[str],
+    *,
+    overwrite: bool = False,
+    report_path: Optional[str] = None,
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """Transactionally add official MPtrj stress to existing canonical shards.
+
+    All requested shards are indexed first and the 12 GB JSON is streamed only
+    once.  No geometry or other label is rewritten.  A shard is replaced only
+    after every requested MPtrj sample was found and its converted stress is
+    finite.
+    """
+    if not HAS_IJSON:
+        raise RuntimeError("MPtrj streaming requires ijson>=3.3,<4")
+    paths = [Path(value).expanduser().resolve() for value in hdf5_paths]
+    if not paths:
+        raise ValueError("At least one canonical HDF5 shard is required")
+    if any(not path.is_file() for path in paths):
+        missing = [str(path) for path in paths if not path.is_file()]
+        raise FileNotFoundError(f"Missing canonical HDF5 shards: {missing}")
+    if not overwrite:
+        raise FileExistsError(
+            "Stress enrichment replaces the requested canonical shards; pass --overwrite"
+        )
+
+    target_indices: List[Dict[str, int]] = []
+    stress_values: List[np.ndarray] = []
+    found_masks: List[np.ndarray] = []
+    lookup: Dict[str, List[Tuple[int, int]]] = collections.defaultdict(list)
+    for file_index, path in enumerate(paths):
+        with h5py.File(path, "r") as handle:
+            samples = [str(value) for value in handle["metadata/sample_id"].asstr()[:]]
+            schema = str(handle.attrs.get("schema_version", ""))
+            if schema != HDF5_SCHEMA_VERSION:
+                raise ValueError(f"Stress enrichment requires canonical {HDF5_SCHEMA_VERSION}: {path}")
+        mapping: Dict[str, int] = {}
+        for row_index, sample_id in enumerate(samples):
+            if not sample_id.startswith("MPtrj:"):
+                continue
+            if sample_id in mapping:
+                raise ValueError(f"Duplicate MPtrj sample ID in {path}: {sample_id}")
+            mapping[sample_id] = row_index
+            lookup[sample_id].append((file_index, row_index))
+        if not mapping:
+            raise ValueError(f"No MPtrj sample IDs found in {path}")
+        target_indices.append(mapping)
+        stress_values.append(np.full((len(samples), 3, 3), np.nan, dtype=np.float64))
+        found_masks.append(np.zeros((len(samples),), dtype=np.bool_))
+
+    materials_scanned = 0
+    frames_scanned = 0
+    matched = 0
+    source = Path(raw_json).expanduser().resolve()
+    with source.open("rb") as handle:
+        for mp_id, family in ijson.kvitems(handle, ""):
+            materials_scanned += 1
+            for frame_id, record in dict(family).items():
+                frames_scanned += 1
+                sample_id = f"MPtrj:{mp_id}:{frame_id}"
+                destinations = lookup.get(sample_id)
+                if not destinations:
+                    continue
+                raw_stress = record.get("stress")
+                if raw_stress is None:
+                    raise ValueError(f"Official MPtrj record has no stress: {sample_id}")
+                tensor = np.asarray(raw_stress, dtype=np.float64).reshape(3, 3)
+                tensor = (
+                    0.5 * (tensor + tensor.T)
+                    * VASP_KBAR_TO_EV_PER_ANGSTROM3
+                )
+                if not np.isfinite(tensor).all():
+                    raise ValueError(f"Converted MPtrj stress is non-finite: {sample_id}")
+                for file_index, row_index in destinations:
+                    if not found_masks[file_index][row_index]:
+                        matched += 1
+                    stress_values[file_index][row_index] = tensor
+                    found_masks[file_index][row_index] = True
+            del family
+            if materials_scanned % 5000 == 0:
+                log(
+                    f"[{_now()}] MPtrj stress enrichment: materials={materials_scanned} "
+                    f"frames={frames_scanned} matched={matched}/{sum(len(x) for x in target_indices)}"
+                )
+
+    missing_by_file: Dict[str, List[str]] = {}
+    for file_index, path in enumerate(paths):
+        missing_rows = np.flatnonzero(~found_masks[file_index])
+        if missing_rows.size:
+            inverse = {index: sample for sample, index in target_indices[file_index].items()}
+            missing_by_file[str(path)] = [inverse[int(index)] for index in missing_rows[:20]]
+    if missing_by_file:
+        raise KeyError(
+            "MPtrj stress enrichment did not find every requested sample: "
+            + json.dumps(missing_by_file, sort_keys=True)
+        )
+
+    convention = (
+        "tensile-positive-cauchy:eV/angstrom^3;"
+        "source=VASP-compressive-positive-kBar;factor=-0.0006241509074460763"
+    )
+    outputs: List[Dict[str, Any]] = []
+    prepared: List[Tuple[int, Path, Path]] = []
+    string_dtype = h5py.string_dtype(encoding="utf-8")
+    for file_index, path in enumerate(paths):
+        temporary = path.with_name(path.name + ".stress-enriching")
+        if temporary.exists():
+            temporary.unlink()
+        shutil.copy2(path, temporary)
+        with h5py.File(temporary, "r+") as handle:
+            count = int(len(handle["structures/atom_ptr"]) - 1)
+            labels = handle["labels"]
+            masks = handle["masks"]
+            if "stress" not in labels:
+                labels.create_dataset(
+                    "stress", shape=(count, 3, 3), dtype=np.float64,
+                    chunks=True, compression="gzip", fillvalue=np.nan,
+                )
+            if "stress" not in masks:
+                masks.create_dataset(
+                    "stress", shape=(count,), dtype=np.bool_, chunks=True,
+                    compression="gzip", fillvalue=False,
+                )
+            if "stress_volume_normalized" not in labels:
+                labels.create_dataset(
+                    "stress_volume_normalized", shape=(count,), dtype=np.float64,
+                    chunks=True, compression="gzip", fillvalue=np.nan,
+                )
+            if "stress_volume_normalized" not in masks:
+                masks.create_dataset(
+                    "stress_volume_normalized", shape=(count,), dtype=np.bool_,
+                    chunks=True, compression="gzip", fillvalue=False,
+                )
+            active = found_masks[file_index]
+            labels["stress"][:] = stress_values[file_index]
+            masks["stress"][:] = active
+            labels["stress_volume_normalized"][:] = np.where(active, 1.0, np.nan)
+            masks["stress_volume_normalized"][:] = active
+
+            metadata = handle["metadata"]
+            method_values = (
+                metadata["method_id"].asstr()[:]
+                if "method_id" in metadata
+                else np.asarray(["MP-GGA/GGA+U"] * count, dtype=object)
+            )
+            group_values = (
+                metadata["group_id"].asstr()[:]
+                if "group_id" in metadata
+                else np.asarray(["unknown"] * count, dtype=object)
+            )
+            sample_values = metadata["sample_id"].asstr()[:]
+            additions = {
+                "response_family_id": np.asarray(group_values, dtype=object),
+                "perturbation_id": np.asarray(
+                    [str(value).rsplit(":", 1)[-1] for value in sample_values],
+                    dtype=object,
+                ),
+                "stress_method_id": np.asarray(method_values, dtype=object),
+                "stress_convention": np.asarray([convention] * count, dtype=object),
+            }
+            for name, values in additions.items():
+                if name in metadata:
+                    metadata[name][:] = values
+                else:
+                    metadata.create_dataset(name, data=values, dtype=string_dtype)
+
+            root_metadata = json.loads(str(handle.attrs.get("metadata_json", "{}")))
+            root_metadata["stress_enrichment"] = {
+                "source": str(source),
+                "source_md5_expected": "50ead5f27f9a4f6beb7564c4188f1e9f",
+                "source_doi": "10.6084/m9.figshare.23713842.v2",
+                "source_unit": "kBar",
+                "target_unit": "eV/angstrom^3",
+                "conversion_factor": float(VASP_KBAR_TO_EV_PER_ANGSTROM3),
+                "target_convention": "tensile-positive Cauchy stress",
+                "structures": int(np.count_nonzero(active)),
+            }
+            writer_summary = root_metadata.get("writer_summary")
+            if isinstance(writer_summary, dict):
+                labels_summary = writer_summary.setdefault("labels", {})
+                labels_summary["stress"] = int(np.count_nonzero(active))
+                labels_summary["stress_volume_normalized"] = int(np.count_nonzero(active))
+            handle.attrs["metadata_json"] = json.dumps(
+                _checkpoint_safe(root_metadata), sort_keys=True
+            )
+        prepared.append((file_index, path, temporary))
+
+    # Validate every candidate before replacing any source shard. A conversion
+    # or schema failure therefore leaves the complete original set untouched.
+    validations: Dict[str, Dict[str, Any]] = {}
+    for _file_index, path, temporary in prepared:
+        validation = validate_neo_hdf5(str(temporary))
+        if not bool(validation.get("valid")):
+            raise ValueError(
+                f"Stress-enriched candidate failed validation for {path}: "
+                f"{validation.get('errors', [])}"
+            )
+        validations[str(path)] = validation
+    for file_index, path, temporary in prepared:
+        temporary.replace(path)
+        outputs.append({
+            "path": str(path),
+            "structures": int(len(found_masks[file_index])),
+            "stress_labels": int(np.count_nonzero(found_masks[file_index])),
+            "sha256": str(validations[str(path)]["sha256"]),
+            "mechanism_coverage": dict(
+                validations[str(path)].get("mechanism_coverage", {})
+            ),
+        })
+
+    result = {
+        "raw_json": str(source),
+        "materials_scanned": int(materials_scanned),
+        "frames_scanned": int(frames_scanned),
+        "matched_assignments": int(matched),
+        "conversion_factor": float(VASP_KBAR_TO_EV_PER_ANGSTROM3),
+        "outputs": outputs,
+    }
+    _write_json(report_path, result)
+    return result
+
+
 def audit_neo_tier_hierarchy(
     tiers: Sequence[Tuple[str, str]],
     *,
@@ -3640,6 +4015,7 @@ def validate_neo_hdf5(path: str) -> Dict[str, Any]:
         ptr = np.asarray(handle["structures/atom_ptr"], dtype=np.int64)
         numbers = np.asarray(handle["structures/atomic_numbers"], dtype=int)
         positions = np.asarray(handle["structures/positions"], dtype=float)
+        cells = np.asarray(handle["structures/cell"], dtype=float)
         pbc = np.asarray(handle["structures/pbc"], dtype=bool)
         groups = [str(value) for value in handle["metadata/group_id"].asstr()[:]]
         splits = [str(value) for value in handle["metadata/split"].asstr()[:]]
@@ -3651,6 +4027,8 @@ def validate_neo_hdf5(path: str) -> Dict[str, Any]:
             report["errors"].append("one or more structures have no atoms")
         if positions.shape != (len(numbers), 3) or not np.isfinite(positions).all():
             report["errors"].append("positions are non-finite or have the wrong shape")
+        if cells.shape != (structure_count, 3, 3) or not np.isfinite(cells).all():
+            report["errors"].append("cells are non-finite or have the wrong shape")
         if np.any(numbers <= 0) or np.any(numbers >= len(ASE_CHEMICAL_SYMBOLS)):
             report["errors"].append("atomic numbers are outside the ASE element table")
         group_split: Dict[str, str] = {}
@@ -3680,6 +4058,159 @@ def validate_neo_hdf5(path: str) -> Dict[str, Any]:
                 labeled = np.asarray(values[atom_mask], dtype=float)
             if labeled.size and not np.isfinite(labeled).all():
                 report["errors"].append(f"label {name} contains non-finite values under its mask")
+
+        def label_mask(name: str) -> np.ndarray:
+            if name not in handle["masks"]:
+                return np.zeros((structure_count,), dtype=bool)
+            return np.asarray(handle[f"masks/{name}"], dtype=bool)
+
+        fully_periodic = np.all(pbc, axis=1)
+        volumes = np.abs(np.linalg.det(cells))
+        valid_cells = fully_periodic & np.isfinite(volumes) & (volumes > 1e-10)
+        stress_mask = label_mask("stress")
+        piezo_mask = label_mask("piezoelectric")
+        magneto_mask = label_mask("magnetoelastic_stress")
+        spin_mask = label_mask("spins")
+        reference_spin_mask = label_mask("reference_spins")
+        bec_mask = label_mask("bec")
+        strain_mask = label_mask("strain")
+
+        for name, mask in (
+            ("stress", stress_mask),
+            ("piezoelectric", piezo_mask),
+            ("magnetoelastic_stress", magneto_mask),
+        ):
+            invalid = np.flatnonzero(mask & ~valid_cells)
+            if invalid.size:
+                report["errors"].append(
+                    f"{name} labels include {invalid.size} non-3D-periodic or singular cells"
+                )
+
+        stress_symmetry_error = 0.0
+        if np.any(stress_mask):
+            values = np.asarray(handle["labels/stress"][stress_mask], dtype=float)
+            stress_symmetry_error = float(
+                np.max(np.abs(values - values.transpose(0, 2, 1)))
+            )
+            if stress_symmetry_error > 1e-10:
+                report["errors"].append(
+                    f"stress tensors are not symmetric; max error={stress_symmetry_error:.6g}"
+                )
+
+        piezoelectric_symmetry_error = 0.0
+        if np.any(piezo_mask):
+            values = np.asarray(handle["labels/piezoelectric"][piezo_mask], dtype=float)
+            piezoelectric_symmetry_error = float(
+                np.max(np.abs(values - values.transpose(0, 1, 3, 2)))
+            )
+            if piezoelectric_symmetry_error > 1e-10:
+                report["errors"].append(
+                    "piezoelectric strain axes are not symmetric; max error="
+                    f"{piezoelectric_symmetry_error:.6g}"
+                )
+            unmatched = int(np.count_nonzero(piezo_mask & ~bec_mask))
+            if unmatched:
+                report["warnings"].append(
+                    f"{unmatched} piezoelectric records have no co-located BEC label"
+                )
+
+        magnetoelastic_symmetry_error = 0.0
+        if np.any(magneto_mask):
+            values = np.asarray(
+                handle["labels/magnetoelastic_stress"][magneto_mask], dtype=float
+            )
+            magnetoelastic_symmetry_error = float(
+                np.max(np.abs(values - values.transpose(0, 2, 1)))
+            )
+            if magnetoelastic_symmetry_error > 1e-10:
+                report["errors"].append(
+                    "magnetoelastic stress tensors are not symmetric; max error="
+                    f"{magnetoelastic_symmetry_error:.6g}"
+                )
+            incomplete = magneto_mask & ~(spin_mask & reference_spin_mask)
+            if np.any(incomplete):
+                report["errors"].append(
+                    "magnetoelastic labels include "
+                    f"{int(np.count_nonzero(incomplete))} records without co-located "
+                    "target/reference spins"
+                )
+
+        strain_symmetry_error = 0.0
+        if np.any(strain_mask):
+            values = np.asarray(handle["labels/strain"][strain_mask], dtype=float)
+            strain_symmetry_error = float(
+                np.max(np.abs(values - values.transpose(0, 2, 1)))
+            )
+            if strain_symmetry_error > 1e-10:
+                report["errors"].append(
+                    f"strain tensors are not symmetric; max error={strain_symmetry_error:.6g}"
+                )
+
+        response_families = (
+            [str(value) for value in handle["metadata/response_family_id"].asstr()[:]]
+            if "response_family_id" in handle["metadata"]
+            else groups
+        )
+        response_family_split: Dict[str, str] = {}
+        response_split_conflicts: set = set()
+        for family, split_name in zip(response_families, splits):
+            previous = response_family_split.setdefault(family, split_name)
+            if previous != split_name:
+                response_split_conflicts.add(family)
+        if response_split_conflicts:
+            report["errors"].append(
+                f"{len(response_split_conflicts)} response families cross split boundaries"
+            )
+
+        stress_methods = (
+            [str(value) for value in handle["metadata/stress_method_id"].asstr()[:]]
+            if "stress_method_id" in handle["metadata"]
+            else ["unknown"] * structure_count
+        )
+        stress_conventions = (
+            [str(value) for value in handle["metadata/stress_convention"].asstr()[:]]
+            if "stress_convention" in handle["metadata"]
+            else ["unknown"] * structure_count
+        )
+        active_strain_mask = stress_mask | piezo_mask | magneto_mask
+        unknown_method = sum(
+            bool(active_strain_mask[index]) and value.strip().lower() in {"", "unknown"}
+            for index, value in enumerate(stress_methods)
+        )
+        unknown_convention = sum(
+            bool(active_strain_mask[index]) and value.strip().lower() in {"", "unknown"}
+            for index, value in enumerate(stress_conventions)
+        )
+        if unknown_method:
+            report["errors"].append(
+                f"{unknown_method} strain-response records have no stress_method_id"
+            )
+        if unknown_convention:
+            report["errors"].append(
+                f"{unknown_convention} strain-response records have no stress_convention"
+            )
+
+        mechanism_coverage = {
+            "l1_total_stress": int(np.count_nonzero(stress_mask)),
+            "l2_stress_and_bec": int(np.count_nonzero(stress_mask & bec_mask)),
+            "l2_stress_and_piezoelectric": int(
+                np.count_nonzero(stress_mask & piezo_mask)
+            ),
+            "l3_stress_and_spins": int(np.count_nonzero(stress_mask & spin_mask)),
+            "l3_paired_magnetoelastic": int(
+                np.count_nonzero(magneto_mask & spin_mask & reference_spin_mask)
+            ),
+        }
+        label_source_counts = {
+            name: dict(sorted(collections.Counter(
+                source for source, active in zip(sources, mask) if bool(active)
+            ).items()))
+            for name, mask in (
+                ("stress", stress_mask),
+                ("piezoelectric", piezo_mask),
+                ("magnetoelastic_stress", magneto_mask),
+            )
+        }
         charge_residual_max = 0.0
         if label_counts.get("charges", 0) and label_counts.get("total_charge", 0):
             charge_mask = np.asarray(handle["masks/charges"], dtype=bool)
@@ -3739,6 +4270,16 @@ def validate_neo_hdf5(path: str) -> Dict[str, Any]:
             "charge_sum_residual_max_e": charge_residual_max,
             "active_spin_norm_max_error": spin_norm_error,
             "bec_acoustic_sum_residual_max_e": bec_acoustic_sum_residual,
+            "stress_symmetry_max_error": stress_symmetry_error,
+            "piezoelectric_strain_symmetry_max_error": piezoelectric_symmetry_error,
+            "magnetoelastic_symmetry_max_error": magnetoelastic_symmetry_error,
+            "strain_symmetry_max_error": strain_symmetry_error,
+            "mechanism_coverage": mechanism_coverage,
+            "label_source_counts": label_source_counts,
+            "stress_method_counts": dict(sorted(collections.Counter(
+                method for method, active in zip(stress_methods, active_strain_mask)
+                if bool(active)
+            ).items())),
             "composition": _composition_statistics(ptr, numbers),
         })
     return report
@@ -3812,6 +4353,228 @@ def hdf5_dataset_summary(path: str) -> Dict[str, Any]:
             "composition": _composition_statistics(ptr, z),
             "sha256": sha256_file(path),
         }
+
+
+def analyze_neo_dataset_formats(
+    neo_root: str,
+    *,
+    tier_paths: Optional[Dict[str, str]] = None,
+    output_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Inventory canonical and composite Neo tiers without hashing huge files.
+
+    This is a format/capability analysis, not a nested-sample audit.  Plus Half
+    participates as a local temporary tier while the Hugging Face release map
+    remains unchanged.
+    """
+    if not HAS_H5PY:
+        raise RuntimeError("Neo format analysis requires h5py")
+    root = Path(neo_root).expanduser().resolve()
+    paths = dict(tier_paths or NEO_ANALYSIS_TIER_PATHS)
+    if not paths:
+        raise ValueError("At least one Neo analysis tier is required")
+
+    tier_reports: List[Dict[str, Any]] = []
+    for tier, relative_path in paths.items():
+        path = Path(str(relative_path)).expanduser()
+        if not path.is_absolute():
+            path = (root / path).resolve()
+        report: Dict[str, Any] = {
+            "tier": str(tier),
+            "path": str(path),
+            "relative_path": str(relative_path),
+            "analysis_status": (
+                "temporary_local_only"
+                if tier in NEO_TEMPORARY_ANALYSIS_TIERS
+                else "formal_release_tier"
+            ),
+            "formal_release_tier": tier in NEO_HF_TIER_PATHS,
+            "exists": path.is_file(),
+            "errors": [],
+        }
+        if not path.is_file():
+            report["errors"].append("dataset file is missing")
+            report.update({"format_valid": False, "self_contained": False})
+            tier_reports.append(report)
+            continue
+
+        report.update({
+            "bytes": int(path.stat().st_size),
+            "decimal_mb": path.stat().st_size / 1_000_000.0,
+            "mib": path.stat().st_size / float(1 << 20),
+        })
+        with h5py.File(path, "r") as handle:
+            schema = str(handle.attrs.get("schema_version", ""))
+            report["schema_version"] = schema
+            report["root_groups"] = sorted(str(name) for name in handle.keys())
+            external_links: List[Dict[str, str]] = []
+
+            def inspect_links(group: Any, prefix: str = "") -> None:
+                for name in group:
+                    location = f"{prefix}/{name}"
+                    link = group.get(name, getlink=True)
+                    if isinstance(link, h5py.ExternalLink):
+                        external_links.append({
+                            "path": location,
+                            "filename": str(link.filename),
+                            "target": str(link.path),
+                        })
+                        continue
+                    child = group.get(name)
+                    if isinstance(child, h5py.Group):
+                        inspect_links(child, location)
+
+            inspect_links(handle)
+            report["external_links"] = external_links
+            canonical_present = all(
+                name in handle for name in HDF5_CANONICAL_ROOT_GROUPS
+            )
+            report["canonical_payload_present"] = canonical_present
+            if canonical_present:
+                structures = handle["structures"]
+                atom_ptr = structures["atom_ptr"]
+                canonical_structures = max(0, int(atom_ptr.shape[0]) - 1)
+                canonical_atoms = int(atom_ptr[-1]) if atom_ptr.shape[0] else 0
+                canonical_labels = {
+                    str(name): int(np.count_nonzero(dataset[:]))
+                    for name, dataset in handle["masks"].items()
+                }
+                report["canonical_payload"] = {
+                    "structures": canonical_structures,
+                    "atoms": canonical_atoms,
+                    "active_labels": sorted(
+                        name for name, count in canonical_labels.items() if count > 0
+                    ),
+                    "label_counts": canonical_labels,
+                    "layout": {
+                        "atom_ptr": str(structures["atom_ptr"].dtype),
+                        "atomic_numbers": str(structures["atomic_numbers"].dtype),
+                        "positions": str(structures["positions"].dtype),
+                        "cell": str(structures["cell"].dtype),
+                        "pbc": str(structures["pbc"].dtype),
+                        "labels": sorted(
+                            set(str(dataset.dtype) for dataset in handle["labels"].values())
+                        ),
+                        "masks": sorted(
+                            set(str(dataset.dtype) for dataset in handle["masks"].values())
+                        ),
+                        "compression": "gzip numerical arrays; ragged atom_ptr index",
+                    },
+                }
+                report["label_counts"] = dict(canonical_labels)
+                report["active_labels"] = sorted(
+                    name for name, count in canonical_labels.items() if count > 0
+                )
+
+            if schema == HDF5_SCHEMA_VERSION:
+                report["format_family"] = "canonical_ragged_hdf5"
+                report["structures"] = int(
+                    report.get("canonical_payload", {}).get("structures", 0)
+                )
+                report["atoms"] = int(
+                    report.get("canonical_payload", {}).get("atoms", 0)
+                )
+                if not canonical_present:
+                    report["errors"].append("canonical root groups are incomplete")
+            elif schema == COMPOSITE_HDF5_SCHEMA_VERSION:
+                report["format_family"] = "composite_packed_hdf5"
+                required = {"atomic_reference", "selection", "sources"}
+                missing = sorted(required - set(handle))
+                if missing:
+                    report["errors"].append(
+                        "composite root groups are missing: " + ", ".join(missing)
+                    )
+                omat = handle.get("sources/omat24")
+                large = handle.get("sources/neo_large")
+                packed = omat.get("packed") if isinstance(omat, h5py.Group) else None
+                storage = str(omat.attrs.get("storage", "")) if omat is not None else ""
+                packed_schema = (
+                    str(packed.attrs.get("schema", ""))
+                    if isinstance(packed, h5py.Group) else ""
+                )
+                report["structures"] = int(handle.attrs.get("structures", 0))
+                report["atoms"] = int(handle.attrs.get("atoms", 0))
+                report["composite_payload"] = {
+                    "omat24_storage": storage,
+                    "omat24_packed_schema": packed_schema,
+                    "omat24_embedded": bool(
+                        omat.attrs.get("embedded", False)
+                    ) if omat is not None else False,
+                    "omat24_structures": int(
+                        handle.attrs.get("omat24_structures", 0)
+                    ),
+                    "omat24_atoms": int(
+                        packed.attrs.get("atoms", 0)
+                    ) if isinstance(packed, h5py.Group) else 0,
+                    "canonical_embedded": bool(
+                        large.attrs.get("embedded", False)
+                    ) if large is not None else False,
+                    "canonical_structures": int(
+                        handle.attrs.get("large_structures", 0)
+                    ),
+                    "canonical_original_path": str(
+                        large.attrs.get("original_path", "")
+                    ) if large is not None else "",
+                }
+                combined_labels = dict(report.get("label_counts", {}))
+                omat24_structures = int(
+                    handle.attrs.get("omat24_structures", 0)
+                )
+                for label in ("energy", "forces", "stress"):
+                    combined_labels[label] = int(
+                        combined_labels.get(label, 0)
+                    ) + omat24_structures
+                report["label_counts"] = combined_labels
+                report["active_labels"] = sorted(
+                    name for name, count in combined_labels.items() if count > 0
+                )
+                if storage != OMAT24_PACKED_SCHEMA_VERSION:
+                    report["errors"].append(
+                        f"OMat24 storage is {storage!r}, expected "
+                        f"{OMAT24_PACKED_SCHEMA_VERSION!r}"
+                    )
+                if packed_schema != OMAT24_PACKED_SCHEMA_VERSION:
+                    report["errors"].append("packed OMat24 schema is missing or stale")
+                if not canonical_present:
+                    report["errors"].append("embedded canonical payload is incomplete")
+                if external_links:
+                    report["errors"].append("composite contains external links")
+            else:
+                report["format_family"] = "unsupported"
+                report["errors"].append(f"unsupported schema: {schema!r}")
+
+        report["self_contained"] = not bool(report["external_links"])
+        if report.get("format_family") == "composite_packed_hdf5":
+            composite = dict(report.get("composite_payload", {}))
+            report["self_contained"] = bool(
+                report["self_contained"]
+                and composite.get("omat24_embedded", False)
+                and composite.get("canonical_embedded", False)
+            )
+        report["format_valid"] = not report["errors"]
+        tier_reports.append(report)
+
+    result = {
+        "strategy": "neo_local_format_inventory",
+        "release_registry": list(NEO_HF_TIER_PATHS),
+        "analysis_registry": list(paths),
+        "temporary_analysis_tiers": sorted(
+            set(paths) & set(NEO_TEMPORARY_ANALYSIS_TIERS)
+        ),
+        "plus_half_public_release": False,
+        "tiers": tier_reports,
+        "all_present": all(report["exists"] for report in tier_reports),
+        "all_format_valid": all(report["format_valid"] for report in tier_reports),
+        "all_self_contained": all(report["self_contained"] for report in tier_reports),
+    }
+    if output_path:
+        output = Path(output_path).expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(_checkpoint_safe(result), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return result
 
 
 def _select_balanced_half_composite_indices(
@@ -4154,7 +4917,26 @@ def pack_omat24_selection_in_composite(
             result.update({
                 "output": str(source), "already_packed": True,
                 "storage": OMAT24_PACKED_SCHEMA_VERSION,
+                "packed": True,
+                "self_contained": bool(
+                    result.get("embedded_omat24", False)
+                    and result.get("embedded_large", False)
+                ),
+                "bytes": int(source.stat().st_size),
+                "precision_policy": (
+                    "Source float64 geometry and labels retained without quantization"
+                ),
             })
+            if report_path:
+                result["sha256"] = sha256_file(str(source))
+                report = Path(report_path).expanduser().resolve()
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    json.dumps(
+                        _checkpoint_safe(result), indent=2, sort_keys=True
+                    ) + "\n",
+                    encoding="utf-8",
+                )
             return result
         if not bool(omat.attrs.get("embedded", False)) or not bool(
             omat.attrs.get("materialized", False)
@@ -6228,6 +7010,42 @@ def _spin_family(base: np.ndarray, rng: np.random.Generator) -> List[np.ndarray]
     ]
 
 
+def _systematic_strain_family(
+    pbc: Sequence[bool],
+    *,
+    amplitude: float,
+) -> List[Tuple[str, np.ndarray]]:
+    """Return a balanced small-strain basis for periodic cell directions."""
+    periodic_axes = [index for index, active in enumerate(pbc) if bool(active)]
+    base_amplitude = float(amplitude)
+    if not math.isfinite(base_amplitude) or base_amplitude <= 0.0:
+        raise ValueError("strain amplitude must be finite and greater than zero")
+    designs: List[Tuple[str, np.ndarray]] = [
+        ("strain-zero", np.zeros((3, 3), dtype=float))
+    ]
+    axis_names = "xyz"
+    for axis in periodic_axes:
+        for sign, suffix in ((1.0, "plus"), (-1.0, "minus")):
+            tensor = np.zeros((3, 3), dtype=float)
+            tensor[axis, axis] = sign * base_amplitude
+            designs.append((f"strain-{axis_names[axis]}{axis_names[axis]}-{suffix}", tensor))
+    for first, second in itertools.combinations(periodic_axes, 2):
+        for sign, suffix in ((1.0, "plus"), (-1.0, "minus")):
+            tensor = np.zeros((3, 3), dtype=float)
+            tensor[first, second] = sign * base_amplitude
+            tensor[second, first] = sign * base_amplitude
+            designs.append(
+                (f"strain-{axis_names[first]}{axis_names[second]}-{suffix}", tensor)
+            )
+    if periodic_axes:
+        for sign, suffix in ((1.0, "plus"), (-1.0, "minus")):
+            tensor = np.zeros((3, 3), dtype=float)
+            for axis in periodic_axes:
+                tensor[axis, axis] = sign * base_amplitude
+            designs.append((f"strain-hydrostatic-{suffix}", tensor))
+    return designs
+
+
 def _vasp_incar_text(
     system_id: str,
     spins: np.ndarray,
@@ -6296,11 +7114,15 @@ def generate_vasp_magnetic_jobs(
     *,
     total_jobs: int = 360,
     seed: int = 20260718,
+    strain_amplitude: float = 0.005,
+    position_noise: float = 0.01,
     overwrite_metadata: bool = False,
 ) -> Dict[str, Any]:
-    """Generate constrained non-collinear Fe/NiO/interface jobs without POTCAR data."""
+    """Generate paired spin/strain VASP jobs without distributing POTCAR data."""
     from ase.io import write as ase_write
 
+    if not math.isfinite(float(position_noise)) or float(position_noise) < 0.0:
+        raise ValueError("position_noise must be finite and non-negative")
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     systems = _base_magnetic_structures()
@@ -6315,23 +7137,44 @@ def generate_vasp_magnetic_jobs(
         "seed": int(seed),
         "potcar_distributed": False,
         "nio_u_eff_ev": 5.0,
+        "strain_amplitude": float(strain_amplitude),
+        "position_noise_A": float(position_noise),
+        "stress_policy": (
+            "Collect tensile-positive 3D Cauchy stress only for fully periodic cells; "
+            "partial-periodic interfaces remain energy/force/spin data."
+        ),
+        "split_strategy": (
+            "Whole strain-series replicas assigned train/val/test by replica index; "
+            "all strains and spin variants from one replica remain together."
+        ),
         "jobs": [],
     }
     for system_id, base_atoms in systems.items():
         base_atoms = _order_atoms_for_vasp(base_atoms, system_id)
         parent_count = per_system // family_size
         base_spins = _initial_spin_vectors(base_atoms, system_id)
+        strain_designs = _systematic_strain_family(
+            base_atoms.pbc, amplitude=float(strain_amplitude)
+        )
+        replica_atoms: Dict[int, Atoms] = {}
         for parent_index in range(parent_count):
-            atoms = base_atoms.copy()
-            strain = rng.normal(0.0, 0.008, size=(3, 3))
-            strain = 0.5 * (strain + strain.T)
-            if not bool(atoms.pbc[2]):
-                strain[2, :] = 0.0
-                strain[:, 2] = 0.0
+            design_index = parent_index % len(strain_designs)
+            design_cycle = parent_index // len(strain_designs)
+            perturbation_id, base_strain = strain_designs[design_index]
+            cycle_scale = min(3.0, 1.0 + float(design_cycle))
+            strain = np.asarray(base_strain, dtype=float) * cycle_scale
+            if design_cycle not in replica_atoms:
+                replica = base_atoms.copy()
+                if float(position_noise) > 0.0:
+                    replica.positions += rng.normal(
+                        0.0, float(position_noise), size=replica.positions.shape
+                    )
+                replica_atoms[design_cycle] = replica
+            atoms = replica_atoms[design_cycle].copy()
             atoms.set_cell(np.asarray(atoms.cell) @ (np.eye(3) + strain), scale_atoms=True)
-            atoms.positions += rng.normal(0.0, 0.025, size=atoms.positions.shape)
             parent_id = f"{system_id}-parent-{parent_index:03d}"
-            split = stable_split(parent_id, train=60, val=20)
+            response_family_id = f"{system_id}-strain-series-{design_cycle:03d}"
+            split = ("train", "val", "test")[design_cycle % 3]
             spin_family = _spin_family(base_spins, rng)
             for variant, spins in enumerate(spin_family):
                 soc = variant >= 4
@@ -6345,8 +7188,16 @@ def generate_vasp_magnetic_jobs(
                     metadata = {
                         "sample_id": sample_id,
                         "parent_id": parent_id,
+                        "response_family_id": response_family_id,
+                        "perturbation_id": (
+                            perturbation_id
+                            if design_cycle == 0
+                            else f"{perturbation_id}-scale-{cycle_scale:g}"
+                        ),
                         "system_id": system_id,
                         "split": split,
+                        "pbc": [bool(value) for value in atoms.pbc],
+                        "strain": strain.tolist(),
                         "soc": bool(soc),
                         "spin_variant": int(variant),
                         "spin_design": (
@@ -6555,11 +7406,113 @@ def attach_spin_energy_mappings(
     return {"mapped_families": mapped, "diagnostics": diagnostics}
 
 
+def _outcar_has_completed_footer(path: Path) -> bool:
+    """Check the VASP footer without loading a potentially large OUTCAR."""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - 512 * 1024), os.SEEK_SET)
+        tail = handle.read().decode("utf-8", errors="replace")
+    return "General timing and accounting informations for this job" in tail
+
+
+def _last_constraint_penalty_energy(path: Path) -> float:
+    """Read the last constrained-moment penalty energy reported by VASP."""
+    pattern = re.compile(
+        r"\bE_p\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?)"
+    )
+    last_value: Optional[float] = None
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            match = pattern.search(line)
+            if match:
+                last_value = float(match.group(1))
+    if last_value is None or not math.isfinite(last_value):
+        raise ValueError("OUTCAR has no finite constrained-moment E_p value")
+    return float(last_value)
+
+
+def attach_magnetoelastic_stress_pairs(
+    configurations: Sequence[Configuration],
+) -> Dict[str, Any]:
+    """Attach same-geometry, same-method spin-difference stress labels."""
+    families: Dict[str, List[Configuration]] = collections.defaultdict(list)
+    for cfg in configurations:
+        families[str(cfg.properties.get("group_id", "unknown"))].append(cfg)
+    paired_records = 0
+    paired_families = 0
+    diagnostics: List[Dict[str, Any]] = []
+    for group_id, family in sorted(families.items()):
+        by_variant = {
+            int(round(float(cfg.properties.get("spin_variant", -1)))): cfg
+            for cfg in family
+        }
+        family_pairs = 0
+        family_max_delta = 0.0
+        for reference_variant, variants in ((0, range(1, 4)), (4, range(5, 8))):
+            reference = by_variant.get(reference_variant)
+            if reference is None or "stress" not in reference.properties:
+                continue
+            reference_numbers = np.asarray(reference.atomic_numbers, dtype=int)
+            reference_positions = np.asarray(reference.positions, dtype=float)
+            reference_cell = np.asarray(reference.cell, dtype=float)
+            reference_method = str(reference.properties.get("method_id", "unknown"))
+            reference_stress = np.asarray(reference.properties["stress"], dtype=float).reshape(3, 3)
+            for variant in variants:
+                cfg = by_variant.get(int(variant))
+                if cfg is None or "stress" not in cfg.properties:
+                    continue
+                if str(cfg.properties.get("method_id", "unknown")) != reference_method:
+                    raise ValueError(
+                        f"{group_id}: spin variants {reference_variant}/{variant} "
+                        "do not use the same DFT method"
+                    )
+                if not np.array_equal(np.asarray(cfg.atomic_numbers, dtype=int), reference_numbers):
+                    raise ValueError(f"{group_id}: paired spin variants change atom ordering")
+                if not np.allclose(np.asarray(cfg.cell, dtype=float), reference_cell, rtol=0.0, atol=1e-9):
+                    raise ValueError(f"{group_id}: paired spin variants change the cell")
+                if not np.allclose(
+                    np.asarray(cfg.positions, dtype=float),
+                    reference_positions,
+                    rtol=0.0,
+                    atol=1e-8,
+                ):
+                    raise ValueError(f"{group_id}: paired spin variants change geometry")
+                if not all(bool(value) for value in cfg.pbc):
+                    continue
+                delta = np.asarray(cfg.properties["stress"], dtype=float).reshape(3, 3) - reference_stress
+                delta = 0.5 * (delta + delta.T)
+                if not np.isfinite(delta).all():
+                    raise ValueError(f"{group_id}: non-finite magnetoelastic stress difference")
+                cfg.properties["reference_spins"] = np.asarray(
+                    reference.properties["spins"], dtype=float
+                ).copy()
+                cfg.properties["magnetoelastic_stress"] = delta
+                cfg.property_weights["reference_spins"] = 1.0
+                cfg.property_weights["magnetoelastic_stress"] = 1.0
+                paired_records += 1
+                family_pairs += 1
+                family_max_delta = max(family_max_delta, float(np.max(np.abs(delta))))
+        if family_pairs:
+            paired_families += 1
+        diagnostics.append({
+            "group_id": group_id,
+            "paired_records": family_pairs,
+            "max_abs_stress_difference_eV_per_A3": family_max_delta,
+        })
+    return {
+        "paired_families": paired_families,
+        "paired_records": paired_records,
+        "diagnostics": diagnostics,
+    }
+
+
 def collect_vasp_magnetic_jobs(
     jobs_root: str,
     output_hdf5: str,
     *,
     overwrite: bool = False,
+    max_constraint_penalty_per_atom: float = 1e-3,
 ) -> Dict[str, Any]:
     from ase.io import read as ase_read
 
@@ -6567,6 +7520,7 @@ def collect_vasp_magnetic_jobs(
     metadata_files = sorted(root.glob("*/*/metadata.json"))
     configs: List[Configuration] = []
     failures: List[Dict[str, str]] = []
+    accepted_penalties: List[Dict[str, Any]] = []
     for metadata_path in metadata_files:
         directory = metadata_path.parent
         outcar = directory / "OUTCAR"
@@ -6575,13 +7529,33 @@ def collect_vasp_magnetic_jobs(
             continue
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not _outcar_has_completed_footer(outcar):
+                raise ValueError("OUTCAR has no completed VASP timing footer")
             atoms = ase_read(outcar, index=-1)
+            declared_pbc = tuple(
+                bool(value) for value in metadata.get("pbc", atoms.pbc)
+            )
+            atoms.set_pbc(declared_pbc)
             energy = float(atoms.get_potential_energy())
             forces = np.asarray(atoms.get_forces(), dtype=float)
+            penalty_energy = _last_constraint_penalty_energy(outcar)
+            penalty_per_atom = abs(penalty_energy) / max(1, len(atoms))
+            if penalty_per_atom > float(max_constraint_penalty_per_atom):
+                raise ValueError(
+                    "constrained-moment penalty exceeds acceptance threshold: "
+                    f"{penalty_per_atom:.6g} > {float(max_constraint_penalty_per_atom):.6g} eV/atom"
+                )
+            accepted_penalties.append({
+                "sample_id": str(metadata["sample_id"]),
+                "penalty_energy_eV": float(penalty_energy),
+                "penalty_per_atom_eV": float(penalty_per_atom),
+            })
             try:
                 magmoms = np.asarray(atoms.get_magnetic_moments(), dtype=float)
                 if magmoms.ndim == 1:
-                    magmoms = np.pad(magmoms.reshape(-1, 1), ((0, 0), (0, 2)))
+                    scalar_moments = magmoms.reshape(-1)
+                    magmoms = np.zeros((len(atoms), 3), dtype=float)
+                    magmoms[:, 2] = scalar_moments
             except Exception:
                 magmoms = np.zeros((len(atoms), 3), dtype=float)
             props = {
@@ -6591,14 +7565,40 @@ def collect_vasp_magnetic_jobs(
                 "magnetic_moments": magmoms,
                 "field": np.zeros(3, dtype=float),
                 "total_charge": 0.0,
+                "strain": np.asarray(
+                    metadata.get("strain", np.zeros((3, 3))), dtype=float
+                ).reshape(3, 3),
                 "source": "VASP-local",
                 "method_id": str(metadata["method_id"]),
                 "system_id": str(metadata["system_id"]),
                 "group_id": str(metadata["parent_id"]),
+                "sample_id": str(metadata["sample_id"]),
+                "parent_id": str(metadata["parent_id"]),
                 "split": str(metadata["split"]),
+                "domain": (
+                    "periodic-constrained-noncollinear-spin"
+                    if all(declared_pbc)
+                    else "partial-periodic-interface-spin"
+                ),
+                "energy_reference": "VASP constrained noncollinear total energy",
+                "provenance_id": f"local-vasp:{directory}",
+                "response_family_id": str(
+                    metadata.get("response_family_id", metadata["parent_id"])
+                ),
+                "perturbation_id": str(
+                    metadata.get("perturbation_id", metadata["sample_id"])
+                ),
+                "stress_method_id": str(metadata["method_id"]),
+                "stress_convention": (
+                    "tensile-positive-cauchy:eV/angstrom^3;source=ASE-VASP-OUTCAR"
+                ),
                 "spin_variant": float(metadata["spin_variant"]),
                 "soc": float(bool(metadata["soc"])),
             }
+            if all(declared_pbc):
+                stress = np.asarray(atoms.get_stress(voigt=False), dtype=float).reshape(3, 3)
+                props["stress"] = 0.5 * (stress + stress.T)
+                props["stress_volume_normalized"] = 1.0
             configs.append(
                 Configuration(
                     atomic_numbers=np.asarray(atoms.numbers, dtype=int),
@@ -6609,8 +7609,14 @@ def collect_vasp_magnetic_jobs(
                         "forces": 1.0,
                         "spins": 1.0,
                         "magnetic_moments": 1.0,
+                        "strain": 1.0,
                         "spin_variant": 1.0,
                         "soc": 1.0,
+                        **(
+                            {"stress": 1.0, "stress_volume_normalized": 1.0}
+                            if all(declared_pbc)
+                            else {}
+                        ),
                     },
                     cell=np.asarray(atoms.cell.array, dtype=float),
                     pbc=tuple(bool(x) for x in atoms.pbc),
@@ -6621,6 +7627,7 @@ def collect_vasp_magnetic_jobs(
             failures.append({"directory": str(directory), "reason": f"{type(exc).__name__}: {exc}"})
     if not configs:
         return {"collected": 0, "failed": len(failures), "failures": failures, "output": None}
+    magnetoelastic = attach_magnetoelastic_stress_pairs(configs)
     mapping = attach_spin_energy_mappings(configs)
     output = write_hdf5_dataset(
         configs,
@@ -6630,6 +7637,18 @@ def collect_vasp_magnetic_jobs(
             "jobs_root": str(root),
             "failures": failures,
             "energy_mapping": mapping,
+            "magnetoelastic_pairing": magnetoelastic,
+            "stress_policy": (
+                "ASE tensile-positive 3D Cauchy stress only for fully periodic cells; "
+                "magnetoelastic labels are target-minus-reference stress for matched "
+                "geometry and DFT method"
+            ),
+            "constraint_penalty_policy": {
+                "max_abs_penalty_per_atom_eV": float(
+                    max_constraint_penalty_per_atom
+                ),
+                "accepted": accepted_penalties,
+            },
         },
         overwrite=overwrite,
     )
@@ -6638,6 +7657,12 @@ def collect_vasp_magnetic_jobs(
         "failed": len(failures),
         "failures": failures,
         "mapped_families": int(mapping["mapped_families"]),
+        "paired_magnetoelastic_families": int(magnetoelastic["paired_families"]),
+        "paired_magnetoelastic_records": int(magnetoelastic["paired_records"]),
+        "max_constraint_penalty_per_atom_eV": max(
+            (float(item["penalty_per_atom_eV"]) for item in accepted_penalties),
+            default=0.0,
+        ),
         "output": output,
     }
 
@@ -6682,6 +7707,15 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     command.add_argument("--max-per-material", type=int, default=4); command.add_argument("--min-elements", type=int, default=2); command.add_argument("--max-atoms", type=int, default=160); command.add_argument("--min-abs-moment", type=float, default=0.05)
     command.add_argument("--report"); command.add_argument("--overwrite", action="store_true")
 
+    command = subparsers.add_parser(
+        "dataset-mptrj-stress-enrich",
+        help="Add official VASP stress to canonical MPtrj shards in one JSON pass",
+    )
+    command.add_argument("raw_json")
+    command.add_argument("--hdf5", action="append", required=True)
+    command.add_argument("--report")
+    command.add_argument("--overwrite", action="store_true")
+
     command = subparsers.add_parser("dataset-static-mptrj-select", help="Recover balanced MPtrj IDs from Parquet")
     command.add_argument("parquet_directory"); command.add_argument("selection"); command.add_argument("--source-rows", type=int, default=200000); command.add_argument("--target", type=int, default=40000); command.add_argument("--min-elements", type=int, default=2); command.add_argument("--max-atoms", type=int, default=160)
 
@@ -6718,6 +7752,13 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     for name, help_text in (("dataset-validate", "Strictly validate canonical Neo HDF5"), ("dataset-summary", "Inspect canonical or composite HDF5")):
         command = subparsers.add_parser(name, help=help_text); command.add_argument("input"); command.add_argument("--output")
 
+    command = subparsers.add_parser(
+        "dataset-format-inventory",
+        help="Analyze local Tiny-Max formats, including temporary Plus Half",
+    )
+    command.add_argument("neo_root")
+    command.add_argument("--output")
+
     command = subparsers.add_parser("dataset-omat-composite-build", help="Build Neo Plus/Max from OMat24 + Large")
     command.add_argument("omat_root"); command.add_argument("large_hdf5"); command.add_argument("output"); command.add_argument("--tier", required=True, choices=("plus", "max")); command.add_argument("--seed", type=int, default=20260722); command.add_argument("--report"); command.add_argument("--overwrite", action="store_true")
     command = subparsers.add_parser("dataset-composite-half-build", help="Build local self-contained Standard + 1/N OMat24 corpus")
@@ -6739,11 +7780,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     command.add_argument("url"); command.add_argument("output"); command.add_argument("--sha256")
 
     command = subparsers.add_parser("vasp-generate", help="Generate Fe/NiO magnetic VASP jobs")
-    command.add_argument("output_dir"); command.add_argument("--total-jobs", type=int, default=360); command.add_argument("--seed", type=int, default=20260718); command.add_argument("--overwrite-metadata", action="store_true")
+    command.add_argument("output_dir"); command.add_argument("--total-jobs", type=int, default=360); command.add_argument("--seed", type=int, default=20260718); command.add_argument("--strain-amplitude", type=float, default=0.005); command.add_argument("--position-noise", type=float, default=0.01); command.add_argument("--overwrite-metadata", action="store_true")
     command = subparsers.add_parser("vasp-run", help="Run one generated VASP job or job tree")
     command.add_argument("path"); command.add_argument("--executable", default="vasp_std"); command.add_argument("--mpi-ranks", type=int, default=1); command.add_argument("--limit", type=int); command.add_argument("--fail-fast", action="store_true")
     command = subparsers.add_parser("vasp-collect", help="Collect OUTCAR files into canonical HDF5")
-    command.add_argument("jobs_root"); command.add_argument("output"); command.add_argument("--overwrite", action="store_true")
+    command.add_argument("jobs_root"); command.add_argument("output"); command.add_argument("--max-constraint-penalty-per-atom", type=float, default=1e-3); command.add_argument("--overwrite", action="store_true")
     return parser
 
 
@@ -6784,6 +7825,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif command == "dataset-mptrj-select": result = select_mptrj_magnetic_candidates(args.index, args.selection, target_structures=args.target)
     elif command == "dataset-mptrj-build": result = {"output": rebuild_mptrj_magnetic_hdf5(args.raw_json, args.selection, args.output, min_abs_moment=args.min_abs_moment, overwrite=args.overwrite)}
     elif command == "dataset-mptrj-large-build": result = rebuild_mptrj_large_hdf5(args.raw_json, args.output, required_hdf5=args.required_hdf5, max_per_material=args.max_per_material, min_elements=args.min_elements, max_atoms=args.max_atoms, min_abs_moment=args.min_abs_moment, report_path=args.report, overwrite=args.overwrite)
+    elif command == "dataset-mptrj-stress-enrich": result = enrich_mptrj_stress_hdf5(args.raw_json, args.hdf5, overwrite=args.overwrite, report_path=args.report)
     elif command == "dataset-static-mptrj-select": result = select_static_mptrj_parquet_rows(args.parquet_directory, args.selection, source_rows=args.source_rows, target_materials=args.target, min_elements=args.min_elements, max_atoms=args.max_atoms)
     elif command == "dataset-static-mptrj-build": result = {"output": rebuild_static_mptrj_hdf5(args.static_extxyz, args.parquet_directory, args.selection, args.output, overwrite=args.overwrite)}
     elif command == "dataset-scfnn": result = {"output": rebuild_scfnn_from_combined_extxyz(args.response_extxyz, args.output, overwrite=args.overwrite)}
@@ -6807,6 +7849,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = audit_neo_tier_hierarchy(tiers, output_path=args.output)
     elif command == "dataset-validate": result = validate_neo_hdf5(args.input); _write_json(args.output, result)
     elif command == "dataset-summary": result = inspect_composite_dataset(args.input, verify_sources=False) if _core._is_composite_hdf5_path(args.input) else hdf5_dataset_summary(args.input); _write_json(args.output, result)
+    elif command == "dataset-format-inventory": result = analyze_neo_dataset_formats(args.neo_root, output_path=args.output)
     elif command == "dataset-omat-composite-build": result = build_neo_omat24_composite(args.omat_root, args.large_hdf5, args.output, tier=args.tier, seed=args.seed, overwrite=args.overwrite, report_path=args.report)
     elif command == "dataset-composite-half-build": result = build_neo_composite_half(args.parent, args.standard, args.output, seed=args.seed, omat_denominator=args.omat_denominator, max_bytes=int(float(args.max_mb) * 1_000_000), overwrite=args.overwrite, report_path=args.report)
     elif command == "dataset-composite-embed-omat": result = embed_omat24_parquet_in_composite(args.input, output_path=args.output, chunk_bytes=int(float(args.chunk_mb) * 1024 * 1024), overwrite=args.overwrite, report_path=args.report)
@@ -6816,7 +7859,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif command == "dataset-composite-embed-large": result = embed_neo_large_in_composite(args.input, args.large_hdf5, overwrite=args.overwrite); _write_json(args.output, result)
     elif command == "dataset-hf-prepare": result = prepare_neo_huggingface_release(args.neo_root, args.output_directory, tiers=args.tier or ("tiny", "small", "standard", "large"), acknowledge_rights_review=args.acknowledge_rights_review, validate_hdf5=not args.skip_hdf5_validation, overwrite=args.overwrite)
     elif command == "dataset-download": result = {"output": download_with_sha256(args.url, args.output, expected_sha256=args.sha256)}
-    elif command == "vasp-generate": result = generate_vasp_magnetic_jobs(args.output_dir, total_jobs=args.total_jobs, seed=args.seed, overwrite_metadata=args.overwrite_metadata)
+    elif command == "vasp-generate": result = generate_vasp_magnetic_jobs(args.output_dir, total_jobs=args.total_jobs, seed=args.seed, strain_amplitude=args.strain_amplitude, position_noise=args.position_noise, overwrite_metadata=args.overwrite_metadata)
     elif command == "vasp-run":
         path = Path(args.path).expanduser().resolve(); jobs = [path] if (path / "INCAR").exists() else [item.parent for item in sorted(path.glob("*/*/metadata.json"))]
         if args.limit is not None: jobs = jobs[:max(0, args.limit)]
@@ -6825,7 +7868,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             code = run_vasp_job(str(job), executable=args.executable, mpi_ranks=args.mpi_ranks); runs.append({"directory": str(job), "return_code": code})
             if code and args.fail_fast: break
         result = {"jobs": len(runs), "failed": sum(item["return_code"] != 0 for item in runs), "results": runs}
-    elif command == "vasp-collect": result = collect_vasp_magnetic_jobs(args.jobs_root, args.output, overwrite=args.overwrite)
+    elif command == "vasp-collect": result = collect_vasp_magnetic_jobs(args.jobs_root, args.output, overwrite=args.overwrite, max_constraint_penalty_per_atom=args.max_constraint_penalty_per_atom)
     else: raise RuntimeError(f"Unhandled command: {command}")
     print(json.dumps(_checkpoint_safe(result), indent=2, sort_keys=True))
     return 0

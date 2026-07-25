@@ -206,8 +206,22 @@ c_i=\left[\tanh q_i,\tanh(\phi_i/10),\|S_i\|^2,
 Every core interaction has a learned linear map from $`c_i`$ to three hidden
 vectors: scalar scale, scalar bias, and tensor scale. Scales are bounded to
 $`\pm0.25`$ through `tanh`; tensor modulation is shared across polar, axial,
-$`L=2`$, and optional $`L=3`$ channels. The outer loop records mean graph-wise
-charge change as `coupling_residual` and can stop before the configured maximum.
+$`L=2`$, and optional $`L=3`$ channels. A separate per-atom mechanism-activity
+mask multiplies all projected FiLM parameters, so an inactive graph receives an
+exact identity transform while active graphs retain the checkpoint's learned
+linear bias. The outer loop
+records graph-wise charge
+and magnetic-moment changes as `coupling_residual_electric` and
+`coupling_residual_spin`; their maximum is `coupling_residual` and can stop the
+loop before the configured maximum.
+
+During Response/Joint training, graph masks associate charge, dipole, BEC,
+polarization, dispersion, and magnetic labels with their physical mechanisms.
+Nonzero external field, net charge, and supplied spin state also activate the
+corresponding mechanism. A foundation graph with only L1 energy/force/stress
+labels takes a ground-only fast path, so sparse L2/L3 branches neither consume
+compute nor perturb that graph. Normal inference stays fully coupled unless the
+caller explicitly selects `ground_only`.
 
 ## Energy and derivative order
 
@@ -222,8 +236,11 @@ flowchart LR
     E[Spin energy] --> T
     F[Field response energy] --> T
     T --> G[-dE / dR]
+    T --> S["sym(dE / d strain) / V"]
     T --> H[d dipole / dR]
+    T --> P["d dipole / (V d strain)"]
     E --> I[-dE_spin / dS]
+    T --> M["stress(S) - stress(S_ref)"]
 ```
 
 This order is essential. Adding a force correction after differentiation would
@@ -234,13 +251,16 @@ physics term.
 
 The complete model returns:
 
-- `energy`, `forces`, and each named energy component;
+- `energy`, `forces`, conservative `stress`, `stress_l1`, `stress_l2`,
+  `stress_l3`, `stress_dispersion`, and each named energy component;
 - `charges`, molecular and atomic dipoles;
 - molecular and atomic polarizability;
-- `c6` and `bec`;
+- `c6`, `bec`, and the clamped-ion `piezoelectric` tensor;
 - pair `Jij`, atom-wise `Di`, pair `DMIij`, and graph summaries;
-- magnetic moments and effective spin field; and
-- QEq, polarization, stability, and FiLM coupling diagnostics.
+- magnetic moments, effective spin field, and paired `magnetoelastic_stress`
+  when `reference_spins` are supplied; and
+- QEq, polarization, stability, mechanism-activity masks, and electric/spin
+  FiLM coupling diagnostics.
 
 Outputs exist even when a branch is inactive, but inactive outputs are zeros
 and do not become labels unless the corresponding HDF5 mask and loss weight are

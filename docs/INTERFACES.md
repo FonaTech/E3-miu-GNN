@@ -140,7 +140,12 @@ cannot provide the requested spin Hamiltonian.
 ## Capability Rules
 
 - Inspect first and use only the manifest's `recommended` outputs for scientific conclusions.
-- Do not request stress or cell relaxation; native virial stress is unavailable.
+- Request stress only for fully periodic, nonsingular cells. Treat it as
+  validated only when the manifest recommends `stress` and target-domain stress
+  or elastic benchmarks pass.
+- The native tensor is Cauchy stress in eV/Angstrom^3 and ASE Voigt order;
+  `virial` remains unsupported. Variable-cell optimization is not exposed by
+  the fixed-cell `e3mu relax` command.
 - Do not treat initialized but unsupervised heads in a base checkpoint as predictions.
 - Do not use `allow_unsafe_legacy` for downloaded or untrusted files.
 - Do not describe the SevenNet export as a full mixed-granularity checkpoint.

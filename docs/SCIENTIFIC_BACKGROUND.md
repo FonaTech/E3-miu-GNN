@@ -142,6 +142,9 @@ Observable derivatives are taken from this common scalar,
 ```math
 \mathbf F_i=-\frac{\partial E_{\mathrm{tot}}}{\partial\mathbf R_i},
 \qquad
+\boldsymbol\sigma=\frac{1}{V}\mathrm{sym}
+\frac{\partial E_{\mathrm{tot}}}{\partial\boldsymbol\varepsilon},
+\qquad
 Z^*_{i,\alpha\beta}=
 \frac{\partial\mu_\alpha}{\partial R_{i\beta}},
 \qquad
@@ -149,7 +152,7 @@ Z^*_{i,\alpha\beta}=
 \frac{\partial E_{\mathrm{spin}}}{\partial\mathbf S_i}.
 ```
 
-This energy-first design makes conservative-force and symmetry checks
+This energy-first design makes conservative-force, stress, and symmetry checks
 meaningful across learned and analytic components. A finite prediction alone
 does not establish physical calibration; solver residuals and held-out errors
 must also be reported.

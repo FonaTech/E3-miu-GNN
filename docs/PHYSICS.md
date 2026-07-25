@@ -10,6 +10,7 @@ of the [paper](PAPER.md).
 | Position | angstrom |
 | Energy | eV |
 | Force | eV/angstrom |
+| Cauchy stress | eV/angstrom$^3$, tensile-positive |
 | Charge and BEC | elementary charge $`e`$ |
 | Dipole | $`e\,\mathrm{angstrom}`$ |
 | Polarizability | $`\mathrm{angstrom}^3`$ |
@@ -38,9 +39,20 @@ For a static field $`\mathcal E`$, the implemented second-order response is
 
 ```math
 E_{\mathrm{resp}}
-=-\mu\cdot\mathcal E
+=-\mu_{\mathrm{permanent}}\cdot\mathcal E
 -\frac{1}{2}c_\alpha\mathcal E^{\mathsf T}\alpha\mathcal E.
 ```
+
+The reported field-dependent dipole is the exact conjugate response,
+
+```math
+\mu_{\mathrm{reported}}
+=-\frac{\partial E_{\mathrm{resp}}}{\partial\mathcal E}
+=\mu_{\mathrm{permanent}}+c_\alpha\alpha\mathcal E.
+```
+
+Using the reported dipole in the linear energy term would double count the
+induced response, so the permanent and induced contributions remain explicit.
 
 The response head predicts permanent atomic dipoles and polarizabilities from
 equivariant channels. Total dipole includes charge displacement and, when the
@@ -253,13 +265,18 @@ The derivative contract is
 ```math
 F_i=-\frac{\partial E_{\mathrm{tot}}}{\partial R_i},
 \qquad
+\boldsymbol\sigma=\frac{1}{V}\mathrm{sym}
+\frac{\partial E_{\mathrm{tot}}}{\partial\boldsymbol\varepsilon},
+\qquad
 Z^*_{i,\alpha\beta}=\frac{\partial\mu_\alpha}{\partial R_{i\beta}},
 \qquad
 H_i^{\mathrm{eff}}=-\frac{\partial E_{\mathrm{spin}}}{\partial S_i}.
 ```
 
-Force training requires differentiating these first derivatives with respect
-to model parameters. BEC supervision similarly requires a higher-order graph.
+Force and stress training require differentiating these first derivatives with
+respect to model parameters. Positions, cell, and periodic image shifts receive
+the same affine strain, and stress is masked for cells that are not fully
+periodic and nonsingular. BEC supervision similarly requires a higher-order graph.
 This explains why MPS batches are limited by edge count and why graph references
 are released immediately after every optimizer step.
 
@@ -272,7 +289,9 @@ are released immediately after every optimizer step.
 | `deq_residual` | residual of the stabilized induced-dipole linear system |
 | `deq_stability_shift` | curvature added to the polarization Hessian |
 | `deq_iterations` | number of equilibrium solves, currently one |
-| `coupling_residual` | graph mean charge change between FiLM passes |
+| `coupling_residual_electric` | graph mean charge change between FiLM passes |
+| `coupling_residual_spin` | graph mean magnetic-moment change between FiLM passes |
+| `coupling_residual` | maximum of active electric and spin residuals |
 
 A finite output is necessary but not sufficient for physical calibration.
 Residual and stability histories are therefore exposed in checkpoints, JSON

@@ -270,7 +270,7 @@ Retaining second order gives
 ```math
 E(\mathbf R,\boldsymbol{\mathcal E})
 =E_{\mathrm{PES}}(\mathbf R)
--\boldsymbol\mu(\mathbf R)\cdot\boldsymbol{\mathcal E}
+-\boldsymbol\mu^{(0)}(\mathbf R)\cdot\boldsymbol{\mathcal E}
 -\frac{1}{2}\boldsymbol{\mathcal E}^{\mathsf T}
 \boldsymbol\alpha(\mathbf R)\boldsymbol{\mathcal E}
 +\mathcal O(\|\boldsymbol{\mathcal E}\|^3).
@@ -301,6 +301,13 @@ The total dipole combines permanent, charge-displacement, and induced terms,
 For non-periodic structures $`\mathbf R_c`$ is the geometric center. Periodic
 relative positions use the minimum-image finite-cell convention recorded in
 the data metadata.
+
+Here $`\boldsymbol\mu^{(0)}`$ contains the permanent and charge-displacement
+terms. The reported finite-field dipole is
+$`-\partial E/\partial\boldsymbol{\mathcal E}
+=\boldsymbol\mu^{(0)}+\boldsymbol\alpha\boldsymbol{\mathcal E}`$ (including the
+configured unit factor), so the induced contribution is not counted again in
+the linear energy term.
 
 ### 3.4 Layer 2: charge and long-range domain physics
 
@@ -515,6 +522,9 @@ Observables are differentiated after assembling this total energy:
 ```math
 \mathbf F_i=-\frac{\partial E_{\mathrm{tot}}}{\partial\mathbf R_i},
 \qquad
+\boldsymbol\sigma=\frac{1}{V}\mathrm{sym}
+\frac{\partial E_{\mathrm{tot}}}{\partial\boldsymbol\varepsilon},
+\qquad
 Z^{*}_{i,\alpha\beta}
 =\frac{\partial\mu_\alpha}{\partial R_{i\beta}},
 \qquad
@@ -587,10 +597,11 @@ reference $`\mathbf{y}_{t,k}`$, the training objective is
 ```
 
 where $`d_t`$ is the number of components per labelled item. The implemented
-target set includes energy, forces, dipole, molecular and atomic
+target set includes energy, forces, conservative Cauchy stress, dipole, molecular and atomic
 polarizability, charges, atomic dipoles, C6, BEC, magnetic moments, effective
 spin fields, and available $`J/D_i`$/DMI targets. Energy loss is evaluated per
-atom so large cells do not dominate solely by size.
+atom so large cells do not dominate solely by size. Stress uses only fully
+periodic nonsingular cells and the six independent symmetric components.
 
 Checkpoint selection and Auto Research use a weight-independent normalized
 score,
@@ -611,7 +622,7 @@ The trainer supports a ground-state base stage, a response stage, and joint
 fine-tuning. The full-chain workflow can freeze the ground branch during
 response warmup, assign separate branch learning rates, ramp response weights,
 and progressively reduce the joint learning rate. On Apple MPS, batches are
-packed by edge count because force and BEC supervision require higher-order
+packed by edge count because force, stress, and BEC supervision require higher-order
 autograd graphs whose memory cost follows edges more closely than structure
 count.
 

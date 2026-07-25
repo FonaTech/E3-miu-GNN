@@ -14,6 +14,7 @@ atoms = read("structure.cif")
 atoms.calc = E3MUCalculator("model.pt", model_mode="auto")
 energy = atoms.get_potential_energy()
 forces = atoms.get_forces()
+stress = atoms.get_stress(voigt=True)  # xx, yy, zz, yz, xz, xy
 ```
 
 The runnable version is [`coupling/ase_example.py`](../coupling/ase_example.py).
@@ -48,7 +49,8 @@ the same division while preserving its own capability boundaries.
 | Dipole, polarizability, BEC | When trained | No |
 | Spin Hamiltonian | When enabled, trained, and supplied a spin state | No |
 | FiLM feedback | When enabled | No |
-| Virial stress | No | No; a zero placeholder is not advertised as a prediction |
+| Conservative Cauchy stress | Fully periodic native checkpoint; recommend only when trained | No |
+| Virial tensor | No | No |
 
 Export with:
 
@@ -57,8 +59,9 @@ e3mu export-sevennet model.pt --output export_report.json
 ```
 
 The generated `*_compat_sevennet.pt` file is a Layer-1 ground-only TorchScript
-artifact. It is not claimed as a drop-in LAMMPS deployment until an external
-pair style, stress implementation, and cross-platform validation are provided.
+artifact. Native stress is not serialized into that export. It is not claimed
+as a drop-in LAMMPS deployment until an external pair style and cross-platform
+energy-force-stress validation are provided.
 
 ## Workflow Engines and Services
 

@@ -1,0 +1,230 @@
+{
+  "schema_version": "1.1",
+  "project": {
+    "name": "e3mu-neo-stress-coupling",
+    "system": "multi-source periodic materials with electric and spin response",
+    "root": "."
+  },
+  "user_preferences": {
+    "route": "public DFT label recovery plus conservative MLIP coupling and a deferred paired-spin VASP lane",
+    "depth": "validated dataset and launch-ready reference scaffold",
+    "deliverables": [
+      "stress-enriched Neo Tiny-Large",
+      "L2/L3 strain-coupled model and API",
+      "paired magnetoelastic VASP scaffold",
+      "validation and provenance reports"
+    ],
+    "constraints": [
+      "no synthetic stress labels",
+      "no 3D Cauchy stress for partially periodic systems",
+      "preserve legacy datasets and checkpoints",
+      "do not launch VASP without licensed POTCAR and a pilot gate"
+    ],
+    "accepted_alternatives": [
+      "retain w_magnetoelastic=0 until paired labels exist",
+      "use MPtrj magnetic stress only as total spin-conditioned stress"
+    ]
+  },
+  "research_spine": {
+    "objective": "Build non-OMat24 stress coverage for Neo Tiny-Large and connect strain response explicitly to L2 electric and L3 spin physics.",
+    "active_claim_id": "C03",
+    "current_gate": "Obtain licensed POTCAR provenance and resource approval for a bounded constrained-spin VASP convergence pilot.",
+    "next_action": "Run only the bounded constraint-lambda/cutoff/k-point pilot after those prerequisites are documented; do not launch the 1,080-job campaign.",
+    "stop_rule": "Keep w_magnetoelastic=0 and make no L3 differential-stress accuracy claim until same-geometry, same-method spin pairs pass DFT convergence and grouped holdout gates.",
+    "non_goals": [
+      "Plus/Max rematerialization",
+      "production checkpoint accuracy",
+      "MLMD or continuum deployment"
+    ]
+  },
+  "scale_decision": {
+    "required_scales": ["electronic", "atomistic-surrogate"],
+    "deferred_scales": ["MLMD", "homogenization", "continuum"],
+    "rationale": "Stress, piezoelectric response, and magnetoelastic response are resolved by periodic DFT labels and derivatives of the atomistic generalized energy.",
+    "escalation_trigger": "Add extended dynamics or continuum only after a validated stress-trained checkpoint and a downstream observable require those scales."
+  },
+  "planning_artifact": {
+    "path": "workflow/integrated_research_plan.md",
+    "status": "current",
+    "required_sections": [
+      "Research Decision And Scope",
+      "Control Snapshot",
+      "Scientific Rationale And Scale Decision",
+      "Evidence, Models, And Assumptions",
+      "Stage Roadmap",
+      "Stage Gates And Deliverables",
+      "Resource-Aware Execution Order",
+      "Risks, Negative Results, And Escalation",
+      "Research Spine Synchronization",
+      "Definition Of Done"
+    ],
+    "synchronizes": ["research_spine", "claims", "stages", "handoffs", "next_action_queue"],
+    "last_reviewed": "2026-07-25T06:44:48+08:00"
+  },
+  "claims": [
+    {
+      "id": "C01",
+      "text": "One coupled scalar energy yields conservative total and component stress, L2 piezoelectric response, and paired L3 magnetoelastic stress.",
+      "observable": "finite-difference error, stress component closure, symmetry, and time-reversal invariance",
+      "pass_condition": "CPU float64 tests pass within declared tolerances and higher-derivative losses backpropagate finite gradients"
+    },
+    {
+      "id": "C02",
+      "text": "MPtrj and JARVIS provide non-OMat24 mechanism-matched stress coverage for Neo Tiny-Large.",
+      "observable": "validated source-specific counts for stress, stress+BEC+piezoelectric, and stress+spins",
+      "pass_condition": "all four tiers validate with finite symmetric tensors, provenance, response-family split isolation, and nonzero L1/L2/L3 total-stress coverage"
+    },
+    {
+      "id": "C03",
+      "text": "Same-geometry constrained-spin DFT pairs can identify differential L3 magnetoelastic response.",
+      "observable": "target-minus-reference DFT stress under systematic strain",
+      "pass_condition": "constraint/convergence pilot passes and grouped held-out magnetoelastic error meets a predeclared target"
+    }
+  ],
+  "stages": [
+    {
+      "id": "S01",
+      "kind": "analysis",
+      "name": "source and convention audit",
+      "depends_on": [],
+      "claim_ids": ["C01", "C02"],
+      "inputs": ["public raw archives and local canonical shards"],
+      "outputs": ["source policy and tensor conversion contract"],
+      "controls": ["periodicity", "units", "sign", "method", "license"],
+      "validation": ["raw-field presence", "negative-source audit"],
+      "pass_condition": "Every accepted source has an unambiguous periodicity, unit, sign, method, and provenance contract.",
+      "status": "validated"
+    },
+    {
+      "id": "S02",
+      "kind": "coupling",
+      "name": "conservative stress and response implementation",
+      "depends_on": ["S01"],
+      "claim_ids": ["C01", "C03"],
+      "inputs": ["generalized energy and tensor contract"],
+      "outputs": ["model/API derivatives and training losses"],
+      "controls": ["float64 finite differences", "rotation", "time reversal", "component closure"],
+      "validation": ["focused tests", "legacy compatibility", "finite backward gradients"],
+      "pass_condition": "Finite-difference, invariance, component-closure, and backward tests pass.",
+      "status": "validated"
+    },
+    {
+      "id": "S03",
+      "kind": "analysis",
+      "name": "raw stress and DFPT enrichment",
+      "depends_on": ["S01"],
+      "claim_ids": ["C02"],
+      "inputs": ["MPtrj JSON", "JARVIS DFPT ZIP archives"],
+      "outputs": ["stress-enriched canonical source shards"],
+      "controls": ["single unit conversion", "transactional replacement", "BEC sanity bounds"],
+      "validation": ["sample-ID completeness", "finite symmetric tensors", "source checksums"],
+      "pass_condition": "Every selected source sample is matched and each converted shard passes strict validation.",
+      "status": "validated"
+    },
+    {
+      "id": "S04",
+      "kind": "analysis",
+      "name": "Tiny-Large tier rebuild and audit",
+      "depends_on": ["S03"],
+      "claim_ids": ["C02"],
+      "inputs": ["canonical source shards", "mixed and large source policies"],
+      "outputs": ["Tiny", "Small", "Standard", "Large", "tier audit"],
+      "controls": ["source stratification", "group caps", "rare-source preservation", "fixed splits"],
+      "validation": ["schema", "mechanism coverage", "response-family leakage", "element coverage"],
+      "pass_condition": "All four tiers validate and report nonzero L1, matched L2, and spin-conditioned L3 stress coverage.",
+      "status": "validated"
+    },
+    {
+      "id": "S05",
+      "kind": "dft",
+      "name": "paired spin-strain VASP references",
+      "depends_on": ["S01"],
+      "claim_ids": ["C03"],
+      "inputs": ["bcc Fe", "AFM NiO", "Fe/NiO interface", "local licensed POTCAR"],
+      "outputs": ["paired energies, forces, stress, spins, and provenance"],
+      "controls": ["strain sign/mode", "SOC", "time reversal", "constraint lambda", "cutoff", "k points"],
+      "validation": ["completed footer", "same geometry/method", "constraint penalty below 1e-3 eV/atom", "3D periodic stress only"],
+      "pass_condition": "The bounded pilot converges and demonstrates stable stress below the constraint-penalty threshold.",
+      "status": "ready"
+    },
+    {
+      "id": "S06",
+      "kind": "mlip",
+      "name": "stress-coupled training and challenge validation",
+      "depends_on": ["S02", "S04", "S05"],
+      "claim_ids": ["C01", "C02", "C03"],
+      "inputs": ["validated tiers", "validated paired VASP labels"],
+      "outputs": ["checkpoint", "source-stratified challenge report"],
+      "controls": ["no-stress ablation", "multi-seed", "grouped holdouts", "method strata"],
+      "validation": ["energy", "force", "stress", "EOS", "elastic", "piezoelectric", "magnetoelastic"],
+      "pass_condition": "Grouped challenge metrics meet predeclared tolerances without degrading protected energy/force targets.",
+      "status": "planned"
+    }
+  ],
+  "handoffs": [
+    {
+      "id": "H01",
+      "from_stage": "S01",
+      "to_stage": "S03",
+      "artifact": "raw periodic stress and DFPT tensors",
+      "quantity_type": "rank-2 stress, rank-3 piezoelectric, per-atom BEC",
+      "schema": "source VASP to e3mu-hdf5-v1",
+      "mapping": "MPtrj kBar times -0.0006241509074460763; VASP Voigt XX YY ZZ XY YZ ZX expanded without shear rescaling",
+      "units": "eV/Angstrom^3, C/m^2, e",
+      "basis": "Cartesian source cell basis",
+      "voigt_order": "XX YY ZZ XY YZ ZX at ingestion; full tensors in HDF5",
+      "sign_convention": "tensile-positive Cauchy stress",
+      "state_variables": "geometry, cell, method, spin state, electric response state",
+      "averaging_rule": "none",
+      "uncertainty": "source-method and numerical convergence retained as provenance limits",
+      "validity": "fully periodic nonsingular cells",
+      "acceptance": "finite symmetric tensors and complete sample-ID match"
+    },
+    {
+      "id": "H02",
+      "from_stage": "S03",
+      "to_stage": "S04",
+      "artifact": "canonical source shards",
+      "quantity_type": "masked multi-target atomistic configurations",
+      "schema": "e3mu-hdf5-v1",
+      "mapping": "policy-driven label retention and deterministic source/group stratification",
+      "units": "registry in HDF5 units_json",
+      "basis": "Cartesian",
+      "voigt_order": "full tensors",
+      "sign_convention": "tensile-positive stress",
+      "state_variables": "source, method, group, split, response family, perturbation",
+      "averaging_rule": "none",
+      "uncertainty": "no relabeling; source heterogeneity remains explicit",
+      "validity": "declared source domains",
+      "acceptance": "strict dataset validation and no response-family split leakage"
+    },
+    {
+      "id": "H03",
+      "from_stage": "S05",
+      "to_stage": "S06",
+      "artifact": "paired magnetoelastic configurations",
+      "quantity_type": "target-minus-reference stress with target/reference spins",
+      "schema": "e3mu-hdf5-v1 paired response fields",
+      "mapping": "stress_variant - stress_reference at identical geometry and method",
+      "units": "eV/Angstrom^3",
+      "basis": "Cartesian source cell basis",
+      "voigt_order": "full symmetric 3x3",
+      "sign_convention": "target minus reference; tensile-positive",
+      "state_variables": "strain, SOC, spin pair, method",
+      "averaging_rule": "none",
+      "uncertainty": "constraint and DFT convergence bounded by pilot",
+      "validity": "fully periodic bulk cells and passed constrained-spin calculations",
+      "acceptance": "same geometry/method, completed VASP, penalty and convergence gates"
+    }
+  ],
+  "resources": {
+    "software": ["Python 3.10", "PyTorch 2.10", "ASE 3.28", "h5py 3.16", "VASP detected", "phonopy 4.0"],
+    "hardware": {"local": "Apple workstation; MPS available to project runtime"},
+    "licenses": ["VASP executable detected; POTCAR files are not distributed in the scaffold"]
+  },
+  "metadata": {
+    "created_by": "Codex",
+    "created_at": "2026-07-24T22:19:39Z",
+    "notes": "Stage status distinguishes converted data, software validation, unrun DFT, and unrun model training."
+  }
+}

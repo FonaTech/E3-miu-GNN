@@ -69,7 +69,11 @@ def _model_outputs(model: torch.nn.Module, recommended_mode: str) -> Dict[str, A
     backend = get_backend()
     cfg = getattr(model, "cfg", None)
     mixed = isinstance(model, backend.MixedGranularityE3GNN)
-    potential = ["energy", "forces", "dipole", "polarizability", "bec"]
+    potential = [
+        "energy", "forces", "stress", "stress_l1", "stress_l2",
+        "stress_l3", "stress_dispersion", "dipole", "polarizability",
+        "bec", "piezoelectric",
+    ]
     if mixed:
         potential.extend(
             [
@@ -82,9 +86,24 @@ def _model_outputs(model: torch.nn.Module, recommended_mode: str) -> Dict[str, A
                 "DMIij",
                 "magnetic_moments",
                 "effective_field",
+                "magnetoelastic_stress",
             ]
         )
     recommended = ["energy", "forces"]
+    metadata = getattr(model, "checkpoint_metadata", {})
+    loss_weights = metadata.get("loss_weights", {}) if isinstance(metadata, Mapping) else {}
+    try:
+        if isinstance(loss_weights, Mapping) and float(loss_weights.get("w_stress", 0.0)) > 0.0:
+            recommended.append("stress")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if isinstance(loss_weights, Mapping) and float(loss_weights.get("w_piezoelectric", 0.0)) > 0.0:
+            recommended.append("piezoelectric")
+        if isinstance(loss_weights, Mapping) and float(loss_weights.get("w_magnetoelastic", 0.0)) > 0.0:
+            recommended.append("magnetoelastic_stress")
+    except (TypeError, ValueError):
+        pass
     if recommended_mode == "full_coupled":
         recommended.extend(["dipole", "polarizability", "bec"])
         if bool(getattr(cfg, "enable_qeq", False) or getattr(cfg, "enable_pme", False)):
@@ -100,7 +119,7 @@ def _model_outputs(model: torch.nn.Module, recommended_mode: str) -> Dict[str, A
     return {
         "potential": sorted(set(potential)),
         "recommended": sorted(set(recommended)),
-        "unsupported": ["stress", "virial"],
+        "unsupported": ["virial"],
     }
 
 
@@ -135,7 +154,8 @@ def inspect_checkpoint(
         int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad
     )
     limitations = [
-        "Native checkpoints do not currently provide virial stress.",
+        "Native stress is conservative, but scientific use requires a checkpoint trained with w_stress > 0.",
+        "Piezoelectric and magnetoelastic predictions require their corresponding audited training labels.",
         "SevenNet TorchScript export contains Layer-1 ground energy and forces only.",
     ]
     if mode == "ground_only":
@@ -226,10 +246,10 @@ def predict(
     log: Callable[[str], None] = lambda _message: None,
 ) -> Dict[str, Any]:
     requested = list(properties or ("energy", "forces"))
-    forbidden = sorted(set(requested) & {"stress", "virial"})
+    forbidden = sorted(set(requested) & {"virial"})
     if forbidden:
         raise NotImplementedError(
-            "The native checkpoint does not provide conservative virial stress: "
+            "The native checkpoint does not provide the requested virial tensor: "
             + ", ".join(forbidden)
         )
     calculator = create_calculator(
@@ -241,6 +261,12 @@ def predict(
         spin_policy=spin_policy,
         compile_inference=compile_inference,
         compute_bec="bec" in requested,
+        compute_piezoelectric="piezoelectric" in requested,
+        compute_stress_components=bool(
+            set(requested)
+            & {"stress_l1", "stress_l2", "stress_l3", "stress_dispersion"}
+        ),
+        compute_magnetoelastic="magnetoelastic_stress" in requested,
         allow_unsafe_legacy=allow_unsafe_legacy,
         log=log,
     )
@@ -263,6 +289,13 @@ def predict(
         "units": {
             "energy": "eV",
             "forces": "eV/Angstrom",
+            "stress": "eV/Angstrom^3 (ASE Voigt order: xx, yy, zz, yz, xz, xy)",
+            "stress_l1": "eV/Angstrom^3 (full symmetric 3x3 tensor)",
+            "stress_l2": "eV/Angstrom^3 (full symmetric 3x3 tensor)",
+            "stress_l3": "eV/Angstrom^3 (full symmetric 3x3 tensor)",
+            "stress_dispersion": "eV/Angstrom^3 (full symmetric 3x3 tensor)",
+            "magnetoelastic_stress": "eV/Angstrom^3 (target minus reference spin state)",
+            "piezoelectric": "C/m^2 (axes: polarization_i, strain_j, strain_k)",
             "dipole": "e*Angstrom",
             "polarizability": str(
                 getattr(calculator._source_model.cfg, "polarizability_unit", "angstrom3")

@@ -1,0 +1,3 @@
+action_id,claim_id,branch_id,action,why_now,expected_information_gain,prerequisites,cost,pass_condition,kill_criterion,owner,status,due_or_review_date
+A01,C02,ROOT,"finish Tiny-Large rebuild and strict tier audit","closes the active dataset gate","high","S03 validated","local CPU and disk time","all four tiers valid with reported mechanism coverage","any tensor/provenance/split error",Codex,done,2026-07-25
+A02,C03,B01,"run a small constraint-lambda/cutoff/k-point VASP pilot","bounds penalty contamination before 1080 jobs","high","licensed POTCAR; compute allocation; A01 complete","small DFT pilot","stress and energy stable and E_p below threshold","uncontrolled penalty or nonconvergence",Fona Group,blocked,"after resource approval"

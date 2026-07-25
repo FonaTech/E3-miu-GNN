@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from ase import Atoms
 from ase.calculators.calculator import Calculator, all_changes
+from ase.stress import full_3x3_to_voigt_6_stress
 from torch_geometric.data import Batch as TGBatch
 
 from ._backend import get_backend
@@ -18,6 +19,8 @@ from ._backend import get_backend
 MODEL_MODES = ("auto", "full_coupled", "ground_only")
 SPIN_POLICIES = ("auto", "off", "required")
 RESPONSE_LOSS_KEYS = (
+    "w_piezoelectric",
+    "w_magnetoelastic",
     "w_dipole",
     "w_polarizability",
     "w_charges",
@@ -141,6 +144,27 @@ def spin_vectors_from_atoms(
     return spins
 
 
+def reference_spin_vectors_from_atoms(atoms: Atoms) -> Optional[np.ndarray]:
+    """Return normalized reference spins for paired magnetoelastic inference."""
+    raw: Optional[np.ndarray] = None
+    for key in ("e3mu_reference_spins", "reference_spins"):
+        if key in atoms.arrays:
+            raw = np.asarray(atoms.arrays[key], dtype=float)
+            break
+    if raw is None:
+        return None
+    if raw.shape != (len(atoms), 3) or not np.isfinite(raw).all():
+        raise ValueError(
+            "Reference spin data must be finite with shape "
+            f"({len(atoms)}, 3)"
+        )
+    norms = np.linalg.norm(raw, axis=1)
+    active = norms > 1e-10
+    normalized = np.zeros_like(raw)
+    normalized[active] = raw[active] / norms[active, None]
+    return normalized
+
+
 def _tensor_value(value: torch.Tensor) -> Any:
     array = value.detach().cpu().numpy()
     if np.issubdtype(array.dtype, np.floating) and not np.isfinite(array).all():
@@ -153,15 +177,22 @@ def _tensor_value(value: torch.Tensor) -> Any:
 class E3MUCalculator(Calculator):
     """ASE calculator for safe native E3-miu-GNN checkpoint inference.
 
-    Stress is intentionally absent because the current native model does not
-    derive virial stress. SevenNet-compatible exports are ground-only and are
-    handled separately by the project's exporter.
+    Native stress is the homogeneous cell-strain derivative of the same energy
+    used for conservative forces. SevenNet-compatible exports are ground-only
+    and are handled separately by the project's exporter.
     """
 
     implemented_properties = (
         "energy",
         "free_energy",
         "forces",
+        "stress",
+        "stress_l1",
+        "stress_l2",
+        "stress_l3",
+        "stress_dispersion",
+        "piezoelectric",
+        "magnetoelastic_stress",
         "dipole",
         "polarizability",
         "charges",
@@ -184,6 +215,9 @@ class E3MUCalculator(Calculator):
         spin_policy: str = "auto",
         compile_inference: bool = False,
         compute_bec: bool = False,
+        compute_piezoelectric: bool = False,
+        compute_stress_components: bool = False,
+        compute_magnetoelastic: bool = False,
         allow_unsafe_legacy: bool = False,
         log: Callable[[str], None] = print,
         **kwargs: Any,
@@ -216,6 +250,9 @@ class E3MUCalculator(Calculator):
             raise ValueError("total_charge must be finite")
         self.electric_field = _normalise_field(electric_field)
         self.compute_bec = bool(compute_bec)
+        self.compute_piezoelectric = bool(compute_piezoelectric)
+        self.compute_stress_components = bool(compute_stress_components)
+        self.compute_magnetoelastic = bool(compute_magnetoelastic)
         self._is_mixed = isinstance(loaded, backend.MixedGranularityE3GNN)
         if self.spin_policy == "required" and (
             self.model_mode != "full_coupled"
@@ -276,12 +313,20 @@ class E3MUCalculator(Calculator):
         *,
         use_spin: bool,
         compute_forces: bool,
+        compute_stress: bool,
+        compute_piezoelectric: bool,
+        compute_stress_components: bool,
+        compute_magnetoelastic: bool,
     ) -> Dict[str, torch.Tensor]:
         use_coupled = self.model_mode == "full_coupled"
         kwargs: Dict[str, Any] = {
             "training": False,
             "compute_forces": bool(compute_forces),
+            "compute_stress": bool(compute_stress),
             "compute_bec": bool(self.compute_bec),
+            "compute_piezoelectric": bool(compute_piezoelectric),
+            "compute_stress_components": bool(compute_stress_components),
+            "compute_magnetoelastic": bool(compute_magnetoelastic),
             "use_response_terms": use_coupled,
             "retain_graph": False,
         }
@@ -361,6 +406,7 @@ class E3MUCalculator(Calculator):
             raise ValueError(f"Structure contains elements not in checkpoint z_table_zs: {missing}")
 
         spins = spin_vectors_from_atoms(atoms, policy=self.spin_policy)
+        reference_spins = reference_spin_vectors_from_atoms(atoms)
         use_spin = bool(
             self.model_mode == "full_coupled"
             and self._is_mixed
@@ -386,6 +432,8 @@ class E3MUCalculator(Calculator):
         }
         if spins is not None:
             model_properties["spins"] = spins
+        if reference_spins is not None:
+            model_properties["reference_spins"] = reference_spins
         configuration = backend.Configuration(
             atomic_numbers=atomic_numbers,
             positions=positions,
@@ -404,6 +452,36 @@ class E3MUCalculator(Calculator):
         # Cache both from the same conservative Hamiltonian evaluation so a
         # later get_forces() can never observe the model's disabled-force zeros.
         compute_forces = True
+        component_names = {
+            "stress_l1", "stress_l2", "stress_l3", "stress_dispersion"
+        }
+        compute_stress = "stress" in properties
+        compute_stress_components = bool(
+            self.compute_stress_components or set(properties) & component_names
+        )
+        compute_piezoelectric = bool(
+            self.compute_piezoelectric or "piezoelectric" in properties
+        )
+        compute_magnetoelastic = bool(
+            self.compute_magnetoelastic or "magnetoelastic_stress" in properties
+        )
+        needs_periodic_response = bool(
+            compute_stress
+            or compute_stress_components
+            or compute_piezoelectric
+            or compute_magnetoelastic
+        )
+        if needs_periodic_response and not all(pbc):
+            raise ValueError(
+                "Conservative 3D stress and strain response require periodicity "
+                "in all three axes"
+            )
+        if compute_magnetoelastic:
+            if not use_spin or reference_spins is None:
+                raise ValueError(
+                    "magnetoelastic_stress requires target spins, reference spins, "
+                    "and a full_coupled spin-enabled checkpoint"
+                )
 
         with torch.enable_grad():
             try:
@@ -411,6 +489,10 @@ class E3MUCalculator(Calculator):
                     batch,
                     use_spin=use_spin,
                     compute_forces=compute_forces,
+                    compute_stress=compute_stress,
+                    compute_piezoelectric=compute_piezoelectric,
+                    compute_stress_components=compute_stress_components,
+                    compute_magnetoelastic=compute_magnetoelastic,
                 )
             except Exception:
                 if not self._compiled:
@@ -422,6 +504,10 @@ class E3MUCalculator(Calculator):
                     batch,
                     use_spin=use_spin,
                     compute_forces=compute_forces,
+                    compute_stress=compute_stress,
+                    compute_piezoelectric=compute_piezoelectric,
+                    compute_stress_components=compute_stress_components,
+                    compute_magnetoelastic=compute_magnetoelastic,
                 )
 
         converted: Dict[str, Any] = {}
@@ -460,11 +546,38 @@ class E3MUCalculator(Calculator):
         self.results["energy"] = energy
         self.results["free_energy"] = energy
         self.results["forces"] = forces.copy()
+        if compute_stress:
+            stress = np.asarray(converted.get("stress"), dtype=float)
+            if stress.shape == (1, 3, 3):
+                stress = stress[0]
+            if stress.shape != (3, 3):
+                raise RuntimeError(
+                    f"Native model returned stress with shape {stress.shape}; expected (3, 3)"
+                )
+            self.results["stress"] = full_3x3_to_voigt_6_stress(
+                0.5 * (stress + stress.T)
+            )
+        for name in (
+            "stress_l1", "stress_l2", "stress_l3", "stress_dispersion",
+            "magnetoelastic_stress",
+        ):
+            if name not in converted:
+                continue
+            value = np.asarray(converted[name], dtype=float)
+            if value.shape == (1, 3, 3):
+                value = value[0]
+            if value.shape != (3, 3):
+                raise RuntimeError(
+                    f"Native model returned {name} with shape {value.shape}; "
+                    "expected (3, 3)"
+                )
+            self.results[name] = 0.5 * (value + value.T)
         for name in (
             "dipole",
             "polarizability",
             "charges",
             "bec",
+            "piezoelectric",
             "atomic_dipoles",
             "atomic_polarizability",
             "c6",
@@ -474,7 +587,7 @@ class E3MUCalculator(Calculator):
             if name not in converted:
                 continue
             value = np.asarray(converted[name])
-            if name in ("dipole", "polarizability") and value.shape[0:1] == (1,):
+            if name in ("dipole", "polarizability", "piezoelectric") and value.shape[0:1] == (1,):
                 value = value[0]
             self.results[name] = value.copy()
 
@@ -488,5 +601,6 @@ __all__ = [
     "MODEL_MODES",
     "SPIN_POLICIES",
     "recommended_model_mode",
+    "reference_spin_vectors_from_atoms",
     "spin_vectors_from_atoms",
 ]

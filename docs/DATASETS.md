@@ -36,8 +36,8 @@ flowchart LR
 
 | Source | Primary contribution | Upstream terms | Mixed-corpus treatment |
 | --- | --- | --- | --- |
-| MPtrj | periodic structures, energy, force, magnetic moments | MIT | compatible MP2020-corrected energy/force core |
-| JARVIS-DFT | complex periodic structures and selected DFPT BEC tensors | CC BY 4.0 | response labels retained; unrelated energy domain masked |
+| MPtrj | periodic structures, energy, force, Cauchy stress, magnetic moments | MIT | compatible MP2020-corrected energy/force/stress core |
+| JARVIS-DFT | complex periodic structures and selected stress, DFPT BEC, and clamped-ion piezoelectric tensors | CC BY 4.0 | matched response labels retained; unrelated energy domain masked |
 | QM7-X | molecular energy decomposition, force, charge, dipole, polarizability, C6 | CC BY 4.0 | response labels retained; absolute energy masked in aggregate |
 | SO3LR families | diverse molecular charge, dipole, polarizability, and dispersion records | CC BY 4.0 | response labels retained; absolute energy masked in aggregate |
 | SCFNN | periodic water at zero and finite electric field | CC BY 4.0 | geometry-linked field/dipole variants; energy domain masked |
@@ -93,12 +93,12 @@ must never be interpreted as zero observations.
 | Family | Representative labels | Canonical unit |
 | --- | --- | --- |
 | Geometry | positions, cell | angstrom |
-| Layer 1 | energy; forces | eV; eV/angstrom |
+| Layer 1 | energy; forces; tensile-positive Cauchy stress | eV; eV/angstrom; eV/angstrom$^3$ |
 | Electric response | total charge, charges, dipole, atomic dipoles | $`e`$; $`e\,\mathrm{angstrom}`$ |
-| Tensor response | polarizability, atomic polarizability; BEC | $`\mathrm{angstrom}^3`$; $`e`$ |
+| Tensor response | polarizability, atomic polarizability; BEC; clamped-ion piezoelectric | $`\mathrm{angstrom}^3`$; $`e`$; C/m$^2$ |
 | Dispersion | C6 | eV $`\mathrm{angstrom}^6`$ |
 | Layer 3 | spins; magnetic moments; effective field | dimensionless; $`\mu_B`$; eV/spin |
-| Reserved spin targets | $`J`$, $`D_i`$, DMI | eV |
+| Reserved spin targets | $`J`$, $`D_i`$, DMI; paired magnetoelastic stress | eV; eV/angstrom$^3$ |
 
 The current portable tiers contain spins, magnetic moments, and 100 effective
 spin-field records. Direct aggregate $`J`$, $`D_i`$, and DMI masks are all false.
@@ -167,10 +167,10 @@ the numerical labels or the model cutoff.
 
 | Tier | Structures | Atoms | Elements | Periodic structures | File size | Distribution |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Tiny | 5,575 | 371,803 | 85 | 3,978 | 21.3 MB | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
-| Small | 15,221 | 964,550 | 85 | 9,660 | 52.8 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
-| Standard | 46,414 | 2,316,736 | 85 | 28,284 | 135.1 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
-| Large | 613,267 | 17,760,024 | 89 | 511,274 | 1.23 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
+| Tiny | 5,780 | 394,755 | 85 | 3,769 | 21.0 MB | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
+| Small | 16,703 | 1,069,318 | 85 | 11,859 | 53.7 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
+| Standard | 46,414 | 2,316,736 | 85 | 28,284 | 129.7 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
+| Large | 613,267 | 17,760,024 | 87 | 511,274 | 1.31 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
 | Plus | 25,819,271 | 488,227,614 | 94 | 25,717,278 | 40.63 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_plus_l1_l2_l3.h5) |
 | Max | 101,283,549 | 1,899,323,661 | 94 | 101,181,556 | 137.61 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_max_l1_l2_l3.h5) |
 
@@ -178,8 +178,8 @@ The fixed split counts are:
 
 | Tier | Train | Validation | Test |
 | --- | ---: | ---: | ---: |
-| Tiny | 4,361 | 610 | 604 |
-| Small | 12,094 | 1,552 | 1,575 |
+| Tiny | 4,539 | 627 | 614 |
+| Small | 13,319 | 1,698 | 1,686 |
 | Standard | 37,192 | 4,541 | 4,681 |
 | Large | 492,759 | 59,813 | 60,695 |
 
@@ -188,13 +188,22 @@ The fixed split counts are:
 | Target family | Labelled structures |
 | --- | ---: |
 | Energy and forces | 22,761 |
+| Cauchy stress | 22,873 |
 | Field and total charge | 23,553 |
 | Dipole | 22,891 |
 | Charges and atomic dipoles | 18,130 |
 | Molecular polarizability, atomic polarizability, and C6 | 4,060 |
 | Born effective charge | 662 |
+| Clamped-ion piezoelectric tensor | 112 |
 | Spins and magnetic moments | 12,100 |
 | Effective spin field | 100 |
+
+Within Standard, all 112 JARVIS-DFPT records jointly carry stress, BEC, and
+piezoelectric labels, while 12,000 MPtrj records jointly carry stress and spin
+labels. Large contains 505,848 stress labels, of which 72,929 also carry spin
+states. These are mechanism-matched total-stress observations. They are not
+same-geometry spin-pair differences, so `magnetoelastic_stress` has zero active
+records and `w_magnetoelastic` remains zero by default.
 
 These counts describe available supervision, not equal coverage of every
 element, chemical environment, or physical regime.
@@ -234,9 +243,10 @@ python Datasets_Preparation.py dataset-tier-audit \
 ```
 
 The strict validator checks schema and pointers, active-mask finiteness,
-sample-ID uniqueness, group leakage, charge sums, active-spin norms, and BEC
-acoustic-sum diagnostics. It reports label problems without projecting or
-rewriting the source tensor.
+sample-ID uniqueness, response-family leakage, charge sums, active-spin norms,
+BEC acoustic-sum diagnostics, stress periodicity/symmetry/convention metadata,
+and piezoelectric strain-axis symmetry. It reports label problems without
+projecting or rewriting the source tensor.
 
 ## Redistribution boundary
 

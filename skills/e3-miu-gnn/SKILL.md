@@ -64,7 +64,9 @@ the task are resolved from the process working directory.
   ground-only/full-coupled comparison.
 - Use only the manifest's `recommended` outputs for scientific conclusions.
 - Never fabricate stress, virial, response, spin, convergence, or accuracy data.
-- Do not perform cell relaxation because native virial stress is unavailable.
+- Request native stress only for fully periodic, nonsingular cells. Use it for
+  cell relaxation only when the checkpoint manifest recommends `stress` and a
+  target-domain stress or elastic benchmark has passed; `virial` is unsupported.
 - Treat SevenNet TorchScript export as Layer-1 ground energy and forces only.
 - Require `spin_policy=required` only when the structure supplies a spin state
   and the checkpoint enables a trained spin layer.
