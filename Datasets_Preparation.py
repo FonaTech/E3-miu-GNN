@@ -6437,11 +6437,13 @@ def embed_neo_large_in_composite(
     *,
     overwrite: bool = False,
 ) -> Dict[str, Any]:
-    """Atomically upgrade an external-Large Plus/Max file to self-contained HDF5."""
+    """Atomically replace a Composite response payload with canonical HDF5."""
     composite = Path(path).expanduser().resolve()
     large = Path(large_hdf5).expanduser().resolve()
     if not composite.is_file() or not large.is_file():
         raise FileNotFoundError(f"Composite or Large dataset is unavailable: {composite}, {large}")
+    large_summary = hdf5_dataset_summary(str(large))
+    source_sha = str(large_summary["sha256"])
     temporary = composite.with_name(composite.name + ".embedding")
     if temporary.exists():
         if not overwrite:
@@ -6463,31 +6465,97 @@ def embed_neo_large_in_composite(
                 del handle[name]
             for name in HDF5_CANONICAL_ROOT_GROUPS:
                 large_handle.copy(name, handle, name=name)
-            source_sha = str(
-                large_group.attrs.get(
-                    "source_sha256", large_group.attrs.get("sha256", "")
+
+            metadata = json.loads(str(handle.attrs.get("metadata_json", "{}")))
+            omat_metadata = dict(metadata.get("omat24", {}))
+            omat_structures = int(handle.attrs.get("omat24_structures", 0))
+            omat_group = handle["sources/omat24"]
+            packed = omat_group.get("packed")
+            if packed is not None and "atom_ptr" in packed:
+                omat_atoms = int(packed["atom_ptr"][-1])
+            else:
+                atom_counts = handle["selection/atom_count"]
+                omat_atoms = 0
+                for start in range(0, int(atom_counts.shape[0]), 4_000_000):
+                    omat_atoms += int(np.sum(
+                        atom_counts[start:start + 4_000_000], dtype=np.int64
+                    ))
+            omat_elements = {
+                int(value) for value in omat_metadata.get("elements", [])
+            }
+            if not omat_elements and "atomic_reference/elements" in handle:
+                omat_elements.update(
+                    int(value) for value in handle["atomic_reference/elements"][:]
                 )
-            ) or sha256_file(str(large))
-            source_path = str(
-                large_group.attrs.get(
-                    "original_path", large_group.attrs.get("path", large.name)
-                )
-            )
+
+            response_metadata = dict(metadata.get("neo_large", {}))
+            response_metadata.update({
+                "structures": int(large_summary["structures"]),
+                "atoms": int(large_summary["atoms"]),
+                "elements": list(large_summary["elements"]),
+                "periodic_structures": int(large_summary["periodic_structures"]),
+                "labels": dict(large_summary["labels"]),
+                "sources": dict(large_summary["sources"]),
+                "splits": dict(large_summary["splits"]),
+            })
+            embedded_at = _now()
+            metadata["neo_large"] = response_metadata
+            metadata["response_materialization"] = {
+                "embedded_at": embedded_at,
+                "source_file": large.name,
+                "source_sha256": source_sha,
+                "source_schema": str(large_summary["schema_version"]),
+            }
+
             for obsolete in ("path", "sha256"):
                 if obsolete in large_group.attrs:
                     del large_group.attrs[obsolete]
             large_group.attrs["embedded"] = True
-            large_group.attrs["original_path"] = source_path
+            large_group.attrs["original_path"] = large.name
             large_group.attrs["source_sha256"] = source_sha
             large_group.attrs["source_bytes"] = int(large.stat().st_size)
+            large_group.attrs["structures"] = int(large_summary["structures"])
+            large_group.attrs["atoms"] = int(large_summary["atoms"])
+            large_group.attrs["periodic_structures"] = int(
+                large_summary["periodic_structures"]
+            )
+            large_group.attrs["elements_json"] = json.dumps(
+                large_summary["elements"]
+            )
+            large_group.attrs["labels_json"] = json.dumps(
+                large_summary["labels"], sort_keys=True
+            )
+            large_group.attrs["sources_json"] = json.dumps(
+                large_summary["sources"], sort_keys=True
+            )
+            large_group.attrs["splits_json"] = json.dumps(
+                large_summary["splits"], sort_keys=True
+            )
             large_group.attrs["payload_groups_json"] = json.dumps(
                 HDF5_CANONICAL_ROOT_GROUPS
             )
+            handle.attrs["metadata_json"] = json.dumps(metadata, sort_keys=True)
+            handle.attrs["large_structures"] = int(large_summary["structures"])
+            handle.attrs["structures"] = int(
+                omat_structures + int(large_summary["structures"])
+            )
+            handle.attrs["atoms"] = int(omat_atoms + int(large_summary["atoms"]))
+            handle.attrs["elements_json"] = json.dumps(sorted(
+                omat_elements | {int(value) for value in large_summary["elements"]}
+            ))
             handle.attrs["large_storage"] = "embedded-canonical-root"
-            handle.attrs["large_embedded_at"] = _now()
+            handle.attrs["large_embedded_at"] = embedded_at
             handle.flush()
         validation = inspect_composite_dataset(str(temporary), verify_sources=False)
-        if not validation["valid"] or not validation["embedded_large"]:
+        response_stats_match = (
+            int(validation.get("large_structures", -1))
+            == int(large_summary["structures"])
+        )
+        if (
+            not validation["valid"]
+            or not validation["embedded_large"]
+            or not response_stats_match
+        ):
             raise ValueError(
                 "Embedded Large validation failed: "
                 + json.dumps(validation.get("embedded_errors", []))
@@ -6495,7 +6563,15 @@ def embed_neo_large_in_composite(
         temporary.replace(composite)
     finally:
         temporary.unlink(missing_ok=True)
-    return inspect_composite_dataset(str(composite), verify_sources=False)
+    result = inspect_composite_dataset(str(composite), verify_sources=False)
+    result.update({
+        "response_source": str(large),
+        "response_source_sha256": source_sha,
+        "response_source_structures": int(large_summary["structures"]),
+        "response_source_atoms": int(large_summary["atoms"]),
+        "response_source_labels": dict(large_summary["labels"]),
+    })
+    return result
 
 
 def _neo_release_safe_value(value: Any, neo_root: Path) -> Any:

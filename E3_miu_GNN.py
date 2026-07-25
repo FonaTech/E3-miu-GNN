@@ -210,6 +210,11 @@ except Exception:
 ALPHA_VOLUME_TO_EV_PER_FIELD2 = 0.06944615422483141
 COULOMB_EV_ANGSTROM = 14.3996454784255
 MU_B_EV_PER_TESLA = 5.7883817982e-5
+# Exact SI conversion for polarization/strain response: 1 e/Angstrom^2.
+E_PER_ANGSTROM2_TO_C_PER_M2 = 16.02176634
+# MPtrj and VASP publish compressive-positive raw stress in kBar.  The model
+# uses tensile-positive Cauchy stress in eV/Angstrom^3, hence the minus sign.
+VASP_KBAR_TO_EV_PER_ANGSTROM3 = -0.0006241509074460763
 HDF5_SCHEMA_VERSION = "e3mu-hdf5-v1"
 COMPOSITE_HDF5_SCHEMA_VERSION = "e3mu-composite-hdf5-v1"
 OMAT24_BYTE_SHARD_SCHEMA_VERSION = "hdf5-byte-shards-v1"
@@ -234,6 +239,10 @@ HDF5_METADATA_FIELDS: Tuple[str, ...] = (
     "provenance_id",
     "dataset_role",
     "curriculum_role",
+    "response_family_id",
+    "perturbation_id",
+    "stress_method_id",
+    "stress_convention",
 )
 _TORCH_RUNTIME_LOCK = threading.RLock()
 
@@ -1168,6 +1177,7 @@ class AtomicData(_TGData):
 
         has_energy = "energy" in props
         has_forces = "forces" in props
+        has_stress = "stress" in props
         data.energy = torch.tensor(float(props.get("energy", 0.0)), dtype=torch.get_default_dtype())
         data.forces = torch.tensor(
             np.asarray(props.get("forces", np.zeros((int(data.num_nodes), 3))), dtype=float),
@@ -1198,6 +1208,33 @@ class AtomicData(_TGData):
         data.forces_weight = torch.tensor(
             float(wts.get("forces", 1.0 if has_forces else 0.0)), dtype=torch.get_default_dtype()
         )
+        stress = np.asarray(
+            props.get("stress", np.zeros((3, 3))), dtype=float
+        ).reshape(3, 3)
+        stress = 0.5 * (stress + stress.T)
+        cell_volume = abs(float(np.linalg.det(cell_np)))
+        stress_eligible = bool(all(bool(value) for value in cfg.pbc)) and bool(
+            np.isfinite(cell_volume) and cell_volume > 1e-10
+        )
+        data.stress = torch.tensor(
+            stress, dtype=torch.get_default_dtype()
+        ).view(1, 3, 3)
+        data.stress_weight = torch.tensor(
+            float(
+                wts.get("stress", 1.0 if has_stress else 0.0)
+                if stress_eligible
+                else 0.0
+            ),
+            dtype=torch.get_default_dtype(),
+        )
+        # This ColabFit flag is retained as provenance. OMat24 cauchy_stress is
+        # already intensive eV/Angstrom^3 even when the flag is false; dividing
+        # by volume again would corrupt the label.
+        data.stress_volume_normalized = torch.tensor(
+            float(props.get("stress_volume_normalized", 0.0)),
+            dtype=torch.get_default_dtype(),
+        )
+        data.stress_eligible = torch.tensor(stress_eligible, dtype=torch.bool)
         data.dipole_weight = torch.tensor(float(wts.get("dipole", 0.0)), dtype=torch.get_default_dtype()).view(1, 1)
         data.polarizability_weight = torch.tensor(float(wts.get("polarizability", 0.0)), dtype=torch.get_default_dtype())
         per_atom_shapes = {
@@ -1210,6 +1247,7 @@ class AtomicData(_TGData):
             "magnetic_moments": (-1, 3),
             "effective_field": (-1, 3),
             "Di": (-1, 3, 3),
+            "reference_spins": (-1, 3),
         }
         for name, shape in per_atom_shapes.items():
             value = props.get(name)
@@ -1231,6 +1269,9 @@ class AtomicData(_TGData):
             "DMI_effective": (1, 3),
             "Di_effective": (1, 3, 3),
             "spin_mapping_rmse": (),
+            "piezoelectric": (1, 3, 3, 3),
+            "magnetoelastic_stress": (1, 3, 3),
+            "strain": (1, 3, 3),
         }
         for name, shape in structure_shapes.items():
             value = props.get(name)
@@ -1518,11 +1559,21 @@ HDF5_STRUCTURE_LABELS: Dict[str, Tuple[int, ...]] = {
     "spin_mapping_rmse": (),
     "spin_variant": (),
     "soc": (),
-    # OMat24 publishes the symmetric Cauchy stress in eV/Angstrom^3.  The
-    # current optimizer does not attach a stress loss, but canonical storage
-    # retains the source label losslessly for future cell-gradient training.
+    # OMat24 publishes the symmetric Cauchy stress in eV/Angstrom^3. Training
+    # derives it from the homogeneous cell-strain derivative of the same total
+    # energy used for conservative forces.
     "stress": (3, 3),
     "stress_volume_normalized": (),
+    # Clamped-ion e_{i,jk} = dP_i/d(strain_jk), stored as a full tensor in
+    # C/m^2.  The last two axes are symmetric; no engineering-shear factor is
+    # folded into the stored value.
+    "piezoelectric": (3, 3, 3),
+    # Difference in total DFT stress between a spin state and a same-geometry,
+    # same-method reference state.  It is supervised against the derivative of
+    # the corresponding learned spin-energy difference.
+    "magnetoelastic_stress": (3, 3),
+    # Optional provenance state for systematically strained response families.
+    "strain": (3, 3),
 }
 HDF5_ATOM_LABELS: Dict[str, Tuple[int, ...]] = {
     "forces": (3,),
@@ -1537,6 +1588,7 @@ HDF5_ATOM_LABELS: Dict[str, Tuple[int, ...]] = {
     "magnetic_moments": (3,),
     "effective_field": (3,),
     "Di": (3, 3),
+    "reference_spins": (3,),
 }
 HDF5_UNITS = {
     "atomic_numbers": "dimensionless",
@@ -1570,6 +1622,10 @@ HDF5_UNITS = {
     "soc": "boolean",
     "stress": "eV/angstrom^3",
     "stress_volume_normalized": "boolean",
+    "piezoelectric": "C/m^2",
+    "magnetoelastic_stress": "eV/angstrom^3",
+    "strain": "dimensionless",
+    "reference_spins": "dimensionless",
 }
 
 
@@ -1616,6 +1672,7 @@ _DATASET_PREPARATION_EXPORTS = frozenset({
     "select_mptrj_magnetic_candidates",
     "rebuild_mptrj_magnetic_hdf5",
     "rebuild_mptrj_large_hdf5",
+    "enrich_mptrj_stress_hdf5",
     "select_static_mptrj_parquet_rows",
     "rebuild_static_mptrj_hdf5",
     "rebuild_scfnn_from_combined_extxyz",
@@ -4336,12 +4393,55 @@ def _validate_configuration(cfg: Configuration, *, context: str) -> None:
     cell = np.asarray(cfg.cell, dtype=float)
     if cell.shape != (3, 3) or not np.isfinite(cell).all():
         raise ValueError(f"{context}: cell must be finite with shape (3, 3)")
+    pbc = tuple(bool(value) for value in cfg.pbc)
+    fully_periodic = all(pbc)
+    volume = abs(float(np.linalg.det(cell)))
     for name, value in cfg.properties.items():
         if name not in HDF5_STRUCTURE_LABELS and name not in HDF5_ATOM_LABELS:
             continue
         array = np.asarray(value, dtype=float)
         if not np.isfinite(array).all():
             raise ValueError(f"{context}: label {name!r} contains non-finite values")
+        expected = (
+            HDF5_STRUCTURE_LABELS[name]
+            if name in HDF5_STRUCTURE_LABELS
+            else (len(atomic_numbers),) + HDF5_ATOM_LABELS[name]
+        )
+        if array.shape != expected:
+            raise ValueError(
+                f"{context}: label {name!r} has shape {array.shape}, expected {expected}"
+            )
+    active = {
+        name
+        for name in cfg.properties
+        if name in HDF5_STRUCTURE_LABELS or name in HDF5_ATOM_LABELS
+        if float(cfg.property_weights.get(name, 1.0)) > 0.0
+    }
+    strain_response = active & {"stress", "piezoelectric", "magnetoelastic_stress"}
+    if strain_response and (not fully_periodic or not math.isfinite(volume) or volume <= 1e-10):
+        raise ValueError(
+            f"{context}: {sorted(strain_response)} require a fully periodic, "
+            "non-singular 3D cell"
+        )
+    for name in ("stress", "magnetoelastic_stress", "strain"):
+        if name not in active:
+            continue
+        tensor = np.asarray(cfg.properties[name], dtype=float).reshape(3, 3)
+        if not np.allclose(tensor, tensor.T, rtol=0.0, atol=1e-10):
+            raise ValueError(f"{context}: label {name!r} must be symmetric")
+    if "piezoelectric" in active:
+        tensor = np.asarray(cfg.properties["piezoelectric"], dtype=float).reshape(3, 3, 3)
+        if not np.allclose(tensor, tensor.transpose(0, 2, 1), rtol=0.0, atol=1e-10):
+            raise ValueError(
+                f"{context}: piezoelectric strain axes must be symmetric"
+            )
+    if "magnetoelastic_stress" in active:
+        required = {"spins", "reference_spins"}
+        missing = sorted(required - active)
+        if missing:
+            raise ValueError(
+                f"{context}: magnetoelastic_stress requires active {missing} labels"
+            )
 
 
 
@@ -4409,6 +4509,13 @@ def _omat24_configuration_from_row(
         ),
         "dataset_role": "l1-foundation",
         "curriculum_role": "base+joint",
+        "response_family_id": group_id,
+        "perturbation_id": configuration_id,
+        "stress_method_id": f"OMat24:{row.get('method') or 'PBE+U'}",
+        "stress_convention": (
+            "tensile-positive-cauchy:eV/angstrom^3;"
+            "source=OMat24-ColabFit-cauchy_stress"
+        ),
     }
     weights: Dict[str, float] = {"energy": 1.0, "forces": 1.0}
     if row.get("cauchy_stress") is not None:
@@ -4941,11 +5048,12 @@ def architecture_switch_availability(
         labels
         & {
             "charges", "dipole", "polarizability", "atomic_dipoles",
-            "atomic_polarizability", "c6", "bec",
+            "atomic_polarizability", "c6", "bec", "piezoelectric",
         }
     )
     polarization_signal = bool(
-        labels & {"dipole", "polarizability", "atomic_polarizability", "bec"}
+        labels
+        & {"dipole", "polarizability", "atomic_polarizability", "bec", "piezoelectric"}
     )
     dispersion_signal = bool(
         labels & {"energy", "forces", "energy_dispersion", "forces_dispersion", "c6"}
@@ -4954,7 +5062,7 @@ def architecture_switch_availability(
         labels
         & {
             "magnetic_moments", "effective_field", "J_effective", "Di",
-            "Di_effective", "DMI_effective",
+            "Di_effective", "DMI_effective", "magnetoelastic_stress",
         }
     )
     spin_signal = "spins" in labels and (magnetic_targets or "energy" in labels)
@@ -5032,6 +5140,9 @@ ARCHITECTURE_SWITCH_PARAMETERS: Tuple[str, ...] = (
 DATASET_LOSS_LABELS: Dict[str, set] = {
     "w_energy": {"energy"},
     "w_forces": {"forces"},
+    "w_stress": {"stress"},
+    "w_piezoelectric": {"piezoelectric"},
+    "w_magnetoelastic": {"magnetoelastic_stress", "reference_spins"},
     "w_dipole": {"dipole"},
     "w_polarizability": {"polarizability"},
     "w_charges": {"charges"},
@@ -5044,6 +5155,15 @@ DATASET_LOSS_LABELS: Dict[str, set] = {
     "w_j": {"J_effective"},
     "w_di": {"Di", "Di_effective"},
     "w_dmi": {"DMI_effective"},
+    "w_bec_sum_rule": {"bec"},
+    "w_coupling_consistency": {
+        "field", "total_charge", "spins", "charges", "dipole",
+        "atomic_dipoles", "polarizability",
+        "atomic_polarizability", "bec", "magnetic_moments",
+        "effective_field", "J_effective", "Di", "Di_effective",
+        "DMI_effective",
+        "piezoelectric", "magnetoelastic_stress", "reference_spins",
+    },
 }
 
 
@@ -5233,6 +5353,18 @@ def architecture_parameter_relevance(values: Any) -> Dict[str, Tuple[bool, str]]
             "Atomic polarizability supervision requires an electrostatic or DEQ domain.",
         ),
         "w_c6": (d4, "C6 supervision is meaningful only when D4 is enabled."),
+        "w_piezoelectric": (
+            electrostatic or deq,
+            "Piezoelectric supervision requires an electric-response Hamiltonian.",
+        ),
+        "w_magnetoelastic": (
+            spin,
+            "Magnetoelastic supervision requires the spin Hamiltonian.",
+        ),
+        "w_coupling_consistency": (
+            film,
+            "Coupling consistency is defined only for FiLM feedback.",
+        ),
         "w_magnetic_moments": (spin, "Magnetic moments require the spin Hamiltonian."),
         "w_effective_field": (spin, "Effective spin fields require the spin Hamiltonian."),
         "w_j": (spin, "Exchange J requires the spin Hamiltonian."),
@@ -5255,15 +5387,20 @@ def dataset_loss_parameter_availability(
         for name, count in dict(capability.get("labels", {})).items()
         if int(count) > 0
     }
-    return {
-        name: (
-            bool(labels & supported_labels),
+    result: Dict[str, Tuple[bool, str]] = {}
+    for name, supported_labels in DATASET_LOSS_LABELS.items():
+        available = (
+            supported_labels <= labels
+            if name == "w_magnetoelastic"
+            else bool(labels & supported_labels)
+        )
+        result[name] = (
+            bool(available),
             "Supported"
-            if labels & supported_labels
+            if available
             else f"Dataset has no {'/'.join(sorted(supported_labels))} labels.",
         )
-        for name, supported_labels in DATASET_LOSS_LABELS.items()
-    }
+    return result
 
 
 def architecture_locked_search_exclusions(
@@ -5912,7 +6049,7 @@ def _weighted_huber(
     """Weighted Huber loss scaled to match MSE in the quadratic region."""
     threshold = float(delta)
     if not math.isfinite(threshold) or threshold <= 0.0:
-        raise ValueError("force_huber_delta must be finite and greater than zero")
+        raise ValueError("Huber delta must be finite and greater than zero")
     if weight is None:
         absolute = torch.abs(pred - target)
         values = torch.where(
@@ -5957,6 +6094,45 @@ def _configured_force_loss(
             delta=float(getattr(cfg, "force_huber_delta", 1.0)),
         )
     raise ValueError(f"Unsupported force_loss={loss_name!r}; expected 'mse' or 'huber'")
+
+
+def _symmetric_tensor_components(tensor: torch.Tensor) -> torch.Tensor:
+    """Return six independent symmetric components in ASE Voigt order."""
+    value = 0.5 * (tensor + tensor.transpose(-1, -2))
+    return torch.stack(
+        (
+            value[..., 0, 0],
+            value[..., 1, 1],
+            value[..., 2, 2],
+            value[..., 1, 2],
+            value[..., 0, 2],
+            value[..., 0, 1],
+        ),
+        dim=-1,
+    )
+
+
+def _configured_stress_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    cfg: "TrainConfig",
+) -> torch.Tensor:
+    prediction = _symmetric_tensor_components(pred)
+    reference = _symmetric_tensor_components(target)
+    loss_name = str(getattr(cfg, "stress_loss", "huber")).strip().lower()
+    if loss_name == "mse":
+        return _weighted_mse(prediction, reference, weight)
+    if loss_name == "huber":
+        return _weighted_huber(
+            prediction,
+            reference,
+            weight,
+            delta=float(getattr(cfg, "stress_huber_delta", 0.05)),
+        )
+    raise ValueError(
+        f"Unsupported stress_loss={loss_name!r}; expected 'mse' or 'huber'"
+    )
 
 
 def _loss_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -6938,17 +7114,30 @@ class FastEquivariantCoreO3(torch.nn.Module):
         t3 = torch.zeros((n, self.hidden, 7), dtype=pos.dtype, device=pos.device)
 
         film_condition = getattr(batch, "film_condition", None)
+        film_activity = getattr(batch, "film_activity", None)
         if film_condition is not None:
             film_condition = film_condition.to(device=pos.device, dtype=pos.dtype)
             if film_condition.ndim != 2 or film_condition.shape != (n, 4):
                 raise ValueError(
                     f"film_condition must have shape ({n}, 4), got {tuple(film_condition.shape)}"
                 )
+        if film_activity is not None:
+            film_activity = film_activity.to(
+                device=pos.device, dtype=pos.dtype
+            ).reshape(-1, 1)
+            if film_activity.shape != (n, 1):
+                raise ValueError(
+                    f"film_activity must have shape ({n}, 1), got "
+                    f"{tuple(film_activity.shape)}"
+                )
 
         for layer_idx, layer in enumerate(self.layers):
             if self.enable_film and film_condition is not None:
+                film_values = self.film_layers[layer_idx](film_condition)
+                if film_activity is not None:
+                    film_values = film_values * film_activity
                 gamma_s, beta_s, gamma_tensor = torch.chunk(
-                    self.film_layers[layer_idx](film_condition), 3, dim=-1
+                    film_values, 3, dim=-1
                 )
                 gamma_s = 0.25 * torch.tanh(gamma_s)
                 beta_s = _smooth_scalar_bound(beta_s, max_abs=5.0)
@@ -7196,6 +7385,239 @@ def _graph_cell_pbc(batch: Any, graph_index: int, num_graphs: int) -> Tuple[torc
         if pbc.shape[0] == 1 and num_graphs > 1:
             pbc = pbc.expand(num_graphs, 3)
     return cells[graph_index], pbc[graph_index]
+
+
+@dataclass
+class _DifferentiableGeometryState:
+    batch: Any
+    base_positions: torch.Tensor
+    original_cell: torch.Tensor
+    original_shifts: Optional[torch.Tensor]
+    strain: Optional[torch.Tensor]
+    volumes: torch.Tensor
+    stress_eligible: torch.Tensor
+
+    def restore(self, batch: Any) -> None:
+        batch.positions = self.base_positions
+        batch.cell = self.original_cell
+        if self.original_shifts is not None:
+            batch.shifts = self.original_shifts
+
+
+def _prepare_differentiable_geometry(
+    batch: Any,
+    *,
+    compute_forces: bool,
+    compute_bec: bool,
+    compute_stress: bool,
+    compute_piezoelectric: bool = False,
+    compute_stress_components: bool = False,
+) -> _DifferentiableGeometryState:
+    """Attach an infinitesimal homogeneous strain to one batched geometry."""
+    working_batch = copy.copy(batch)
+    base_positions = batch.positions
+    if (compute_forces or compute_bec) and not base_positions.requires_grad:
+        base_positions.requires_grad_(True)
+    graph_count = _batch_num_graphs(batch)
+    original_cell = batch.cell
+    cells = _reshape_batched_cell(original_cell, graph_count).to(
+        device=base_positions.device, dtype=base_positions.dtype
+    )
+    pbc_value = getattr(batch, "pbc", None)
+    if pbc_value is None:
+        pbc = torch.zeros(
+            (graph_count, 3), dtype=torch.bool, device=base_positions.device
+        )
+    else:
+        pbc = torch.as_tensor(
+            pbc_value, dtype=torch.bool, device=base_positions.device
+        ).reshape(-1, 3)
+        if pbc.shape[0] == 1 and graph_count > 1:
+            pbc = pbc.expand(graph_count, 3)
+    volumes = torch.abs(torch.linalg.det(cells))
+    eligible = torch.all(pbc, dim=1) & torch.isfinite(volumes) & (volumes > 1e-10)
+    declared = getattr(batch, "stress_eligible", None)
+    if declared is not None:
+        declared_mask = torch.as_tensor(
+            declared, dtype=torch.bool, device=base_positions.device
+        ).reshape(-1)
+        if declared_mask.numel() == 1 and graph_count > 1:
+            declared_mask = declared_mask.expand(graph_count)
+        if declared_mask.numel() != graph_count:
+            raise ValueError(
+                "stress_eligible must contain one value per graph"
+            )
+        eligible &= declared_mask
+
+    original_shifts = getattr(batch, "shifts", None)
+    strain: Optional[torch.Tensor] = None
+    if compute_stress or compute_piezoelectric or compute_stress_components:
+        strain = torch.zeros(
+            (graph_count, 3, 3),
+            dtype=base_positions.dtype,
+            device=base_positions.device,
+            requires_grad=True,
+        )
+        symmetric_strain = 0.5 * (strain + strain.transpose(-1, -2))
+        identity = torch.eye(
+            3, dtype=base_positions.dtype, device=base_positions.device
+        ).expand(graph_count, 3, 3)
+        deformation = identity + symmetric_strain * eligible.to(
+            dtype=base_positions.dtype
+        ).view(-1, 1, 1)
+        atom_deformation = deformation[batch.batch]
+        working_batch.positions = torch.bmm(
+            base_positions.unsqueeze(1), atom_deformation.transpose(1, 2)
+        ).squeeze(1)
+        working_batch.cell = torch.matmul(cells, deformation.transpose(-1, -2))
+        if original_shifts is not None:
+            edge_graph = batch.batch[batch.edge_index[0]]
+            edge_deformation = deformation[edge_graph]
+            working_batch.shifts = torch.bmm(
+                original_shifts.unsqueeze(1), edge_deformation.transpose(1, 2)
+            ).squeeze(1)
+    return _DifferentiableGeometryState(
+        batch=working_batch,
+        base_positions=base_positions,
+        original_cell=original_cell,
+        original_shifts=original_shifts,
+        strain=strain,
+        volumes=volumes,
+        stress_eligible=eligible,
+    )
+
+
+def _stress_from_energy_component(
+    energy: torch.Tensor,
+    state: _DifferentiableGeometryState,
+    *,
+    training: bool,
+    retain_graph: bool = True,
+) -> torch.Tensor:
+    """Return the conservative stress contribution of one scalar energy term."""
+    graph_count = int(state.volumes.numel())
+    if state.strain is None or not energy.requires_grad:
+        return torch.zeros(
+            (graph_count, 3, 3),
+            dtype=state.base_positions.dtype,
+            device=state.base_positions.device,
+        )
+    gradient = torch.autograd.grad(
+        energy.sum(),
+        state.strain,
+        create_graph=bool(training),
+        retain_graph=bool(retain_graph or training),
+        allow_unused=True,
+    )[0]
+    if gradient is None:
+        return torch.zeros(
+            (graph_count, 3, 3),
+            dtype=state.base_positions.dtype,
+            device=state.base_positions.device,
+        )
+    stress = gradient / state.volumes.clamp(min=1e-10).view(-1, 1, 1)
+    stress = 0.5 * (stress + stress.transpose(-1, -2))
+    return stress * state.stress_eligible.to(stress.dtype).view(-1, 1, 1)
+
+
+def _piezoelectric_from_dipole(
+    dipole: torch.Tensor,
+    state: _DifferentiableGeometryState,
+    *,
+    training: bool,
+) -> torch.Tensor:
+    """Derive VASP-compatible clamped-ion electromechanical response.
+
+    The result has axes ``[graph, polarization_i, strain_j, strain_k]`` and is
+    reported in C/m^2. VASP's ``PIEZOELECTRIC TENSOR for field`` is the mixed
+    electric-enthalpy derivative ``(1 / V0) d(mu_i) / d(strain_jk)``. This is
+    the energy-conjugate (often called improper) clamped-ion tensor, not a
+    finite-strain derivative that additionally differentiates ``1 / V``.
+    """
+    graph_count = int(state.volumes.numel())
+    zero = torch.zeros(
+        (graph_count, 3, 3, 3),
+        dtype=state.base_positions.dtype,
+        device=state.base_positions.device,
+    )
+    if state.strain is None or not dipole.requires_grad:
+        return zero
+    rows: List[torch.Tensor] = []
+    for component in range(3):
+        gradient = torch.autograd.grad(
+            dipole[:, component].sum(),
+            state.strain,
+            create_graph=bool(training),
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+        rows.append(
+            gradient
+            if gradient is not None
+            else torch.zeros_like(state.strain)
+        )
+    tensor = torch.stack(rows, dim=1)
+    tensor = 0.5 * (tensor + tensor.transpose(-1, -2))
+    tensor = tensor / state.volumes.clamp(min=1e-10).view(-1, 1, 1, 1)
+    tensor = tensor * float(E_PER_ANGSTROM2_TO_C_PER_M2)
+    return tensor * state.stress_eligible.to(tensor.dtype).view(-1, 1, 1, 1)
+
+
+def _conservative_geometry_derivatives(
+    energy: torch.Tensor,
+    state: _DifferentiableGeometryState,
+    *,
+    training: bool,
+    compute_forces: bool,
+    compute_stress: bool,
+    retain_graph: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Differentiate one scalar Hamiltonian into force and Cauchy stress."""
+    inputs: List[torch.Tensor] = []
+    if compute_forces:
+        inputs.append(state.base_positions)
+    if compute_stress:
+        if state.strain is None:
+            raise RuntimeError("Stress was requested without a strain variable")
+        inputs.append(state.strain)
+    gradients: List[Optional[torch.Tensor]] = []
+    if inputs:
+        gradients = list(torch.autograd.grad(
+            energy.sum(),
+            inputs,
+            create_graph=bool(training),
+            retain_graph=bool(retain_graph or training),
+            allow_unused=True,
+        ))
+    cursor = 0
+    if compute_forces:
+        position_gradient = gradients[cursor]
+        cursor += 1
+        forces = -position_gradient if position_gradient is not None else torch.zeros_like(
+            state.base_positions
+        )
+    else:
+        forces = torch.zeros_like(state.base_positions)
+    graph_count = int(state.volumes.numel())
+    if compute_stress:
+        strain_gradient = gradients[cursor]
+        if strain_gradient is None:
+            stress = torch.zeros(
+                (graph_count, 3, 3),
+                dtype=state.base_positions.dtype,
+                device=state.base_positions.device,
+            )
+        else:
+            stress = strain_gradient / state.volumes.clamp(min=1e-10).view(-1, 1, 1)
+            stress = 0.5 * (stress + stress.transpose(-1, -2))
+            stress = stress * state.stress_eligible.to(stress.dtype).view(-1, 1, 1)
+    else:
+        stress = torch.zeros(
+            (graph_count, 3, 3),
+            dtype=state.base_positions.dtype,
+            device=state.base_positions.device,
+        )
+    return forces, stress
 
 
 class DifferentiableQEq(torch.nn.Module):
@@ -7974,7 +8396,11 @@ class DualLayerFieldModel(torch.nn.Module):
         *,
         training: Optional[bool] = None,
         compute_forces: bool = True,
+        compute_stress: bool = False,
         compute_bec: bool = False,
+        compute_piezoelectric: bool = False,
+        compute_stress_components: bool = False,
+        compute_magnetoelastic: bool = False,
         use_response_terms: bool = True,
         retain_graph: bool = False,
         use_response: Optional[bool] = None,
@@ -7998,90 +8424,158 @@ class DualLayerFieldModel(torch.nn.Module):
         if use_response is not None:
             use_response_terms = bool(use_response)
 
-        if compute_forces or compute_bec:
-            batch.positions.requires_grad_(True)
-        
-        # Zeroth-order ground-state potential energy term.
-        e_pes, _ = self.ground(batch)
-        num_graphs = int(batch.ptr.numel() - 1)
-        mu = torch.zeros((num_graphs, 3), dtype=batch.positions.dtype, device=batch.positions.device)
-        alpha = torch.zeros((num_graphs, 3, 3), dtype=batch.positions.dtype, device=batch.positions.device)
-
-        if use_response_terms:
-            q, atomic_dipoles, alpha = self.response(batch)
-            
-            # Enforce graph-wise charge neutrality before computing the charge dipole.
-            if hasattr(batch, "total_charge"):
-                Q = batch.total_charge.view(-1)
-                if Q.numel() == 1 and num_graphs > 1: Q = Q.expand(num_graphs)
-            else:
-                Q = torch.zeros((num_graphs,), dtype=q.dtype, device=q.device)
-            
-            n_atoms_g = scatter_sum(torch.ones_like(q), batch.batch, dim_size=num_graphs)
-            q_sum_g = scatter_sum(q, batch.batch, dim_size=num_graphs)
-            corr = (q_sum_g - Q) / n_atoms_g.clamp(min=1.0)
-            q = q - corr[batch.batch]
-
-            # Total dipole = atomic dipoles + charge-displacement contribution.
-            mu_atomic = scatter_sum(atomic_dipoles, batch.batch, dim_size=num_graphs)
-            center = scatter_mean(batch.positions, batch.batch, dim_size=num_graphs)
-            rel = minimal_image_relative_positions(positions=batch.positions, center=center, batch=batch.batch, cell=batch.cell, pbc=getattr(batch, "pbc", None), num_graphs=num_graphs)
-            mu_charge = scatter_sum(rel * q.unsqueeze(-1), batch.batch, dim_size=num_graphs)
-            mu = mu_atomic + mu_charge
-
-        field = batch.field if hasattr(batch, "field") else torch.zeros((num_graphs, 3), dtype=batch.positions.dtype, device=batch.positions.device)
-        field = field * float(self.cfg.field_scale)
-
-        if use_response_terms:
-            # Field-induced response energy from dipole and polarizability terms.
+        geometry = _prepare_differentiable_geometry(
+            batch,
+            compute_forces=bool(compute_forces),
+            compute_bec=bool(compute_bec),
+            compute_stress=bool(compute_stress),
+            compute_piezoelectric=bool(compute_piezoelectric),
+            compute_stress_components=bool(compute_stress_components),
+        )
+        batch = geometry.batch
+        try:
+            e_pes, _ = self.ground(batch)
+            num_graphs = int(batch.ptr.numel() - 1)
+            mu = torch.zeros(
+                (num_graphs, 3), dtype=batch.positions.dtype, device=batch.positions.device
+            )
+            alpha = torch.zeros(
+                (num_graphs, 3, 3),
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
+            )
+            q = torch.zeros(
+                (batch.positions.shape[0],),
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
+            )
+            atomic_dipoles = torch.zeros_like(batch.positions)
+            mu_permanent = torch.zeros_like(mu)
+            field = _batch_field(batch, num_graphs) * float(self.cfg.field_scale)
             alpha_factor = (
                 ALPHA_VOLUME_TO_EV_PER_FIELD2
-                if str(getattr(self.cfg, "polarizability_unit", "angstrom3")).lower() == "angstrom3"
+                if str(getattr(self.cfg, "polarizability_unit", "angstrom3")).lower()
+                == "angstrom3"
                 else 1.0
             )
-            e_resp = -(mu * field).sum(dim=-1) - 0.5 * alpha_factor * torch.einsum(
-                "bi,bij,bj->b", field, alpha, field
+
+            if use_response_terms:
+                q, atomic_dipoles, alpha = self.response(batch)
+                total_charge = _batch_total_charge(
+                    batch, num_graphs, batch.positions.dtype
+                )
+                n_atoms_g = scatter_sum(
+                    torch.ones_like(q), batch.batch, dim_size=num_graphs
+                )
+                q_sum_g = scatter_sum(q, batch.batch, dim_size=num_graphs)
+                q = q - (
+                    (q_sum_g - total_charge) / n_atoms_g.clamp(min=1.0)
+                )[batch.batch]
+                mu_atomic = scatter_sum(
+                    atomic_dipoles, batch.batch, dim_size=num_graphs
+                )
+                center = scatter_mean(
+                    batch.positions, batch.batch, dim_size=num_graphs
+                )
+                rel = minimal_image_relative_positions(
+                    positions=batch.positions,
+                    center=center,
+                    batch=batch.batch,
+                    cell=batch.cell,
+                    pbc=getattr(batch, "pbc", None),
+                    num_graphs=num_graphs,
+                )
+                mu_charge = scatter_sum(
+                    rel * q.unsqueeze(-1), batch.batch, dim_size=num_graphs
+                )
+                mu_permanent = mu_atomic + mu_charge
+                # The reported dipole is -dE/dE_field. The former implementation
+                # used alpha in the energy but omitted the corresponding alpha.E
+                # induced dipole from the observable.
+                mu_induced = alpha_factor * torch.einsum(
+                    "bij,bj->bi", alpha, field
+                )
+                mu = mu_permanent + mu_induced
+                e_resp = -torch.sum(mu_permanent * field, dim=-1)
+                e_resp = e_resp - 0.5 * alpha_factor * torch.einsum(
+                    "bi,bij,bj->b", field, alpha, field
+                )
+            else:
+                e_resp = torch.zeros_like(e_pes)
+
+            e_total = e_pes + e_resp
+            bec = torch.zeros(
+                (batch.positions.shape[0], 3, 3),
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
             )
-        else:
-            e_resp = torch.zeros_like(e_pes)
+            if compute_bec and use_response_terms and mu.requires_grad:
+                bec_rows: List[torch.Tensor] = []
+                for component in range(3):
+                    derivative = torch.autograd.grad(
+                        mu[:, component].sum(),
+                        geometry.base_positions,
+                        create_graph=bool(training),
+                        retain_graph=True,
+                        allow_unused=True,
+                    )[0]
+                    bec_rows.append(
+                        derivative
+                        if derivative is not None
+                        else torch.zeros_like(geometry.base_positions)
+                    )
+                bec = torch.stack(bec_rows, dim=1)
 
-        e_total = e_pes + e_resp
+            piezoelectric = (
+                _piezoelectric_from_dipole(
+                    mu, geometry, training=bool(training)
+                )
+                if compute_piezoelectric
+                else torch.zeros(
+                    (num_graphs, 3, 3, 3),
+                    dtype=batch.positions.dtype,
+                    device=batch.positions.device,
+                )
+            )
 
-        bec = torch.zeros(
-            (batch.positions.shape[0], 3, 3),
-            dtype=batch.positions.dtype,
-            device=batch.positions.device,
-        )
-        if compute_bec and use_response_terms and mu.requires_grad:
-            bec_rows: List[torch.Tensor] = []
-            for component in range(3):
-                derivative = torch.autograd.grad(
-                    mu[:, component].sum(),
-                    batch.positions,
-                    create_graph=bool(training),
-                    retain_graph=True,
-                    allow_unused=True,
-                )[0]
-                bec_rows.append(derivative if derivative is not None else torch.zeros_like(batch.positions))
-            bec = torch.stack(bec_rows, dim=1)
-        
-        if compute_forces:
-            # Forces are derived directly from the total energy to preserve consistency.
-            forces = -torch.autograd.grad(
-                [e_total.sum()],
-                [batch.positions],
-                create_graph=bool(training),
-                retain_graph=bool(retain_graph),
-            )[0]
-        else:
-            forces = torch.zeros_like(batch.positions)
-        return {
-            "energy": e_total,
-            "forces": forces,
-            "dipole": mu,
-            "polarizability": alpha,
-            "bec": bec,
-        }
+            forces, stress = _conservative_geometry_derivatives(
+                e_total,
+                geometry,
+                training=bool(training),
+                compute_forces=bool(compute_forces),
+                compute_stress=bool(compute_stress),
+                retain_graph=bool(retain_graph or compute_stress_components),
+            )
+            zero_stress = torch.zeros_like(stress)
+            if compute_stress_components:
+                stress_l1 = _stress_from_energy_component(
+                    e_pes, geometry, training=bool(training)
+                )
+                stress_l2 = _stress_from_energy_component(
+                    e_resp, geometry, training=bool(training)
+                )
+            else:
+                stress_l1 = zero_stress
+                stress_l2 = zero_stress
+            result = {
+                "energy": e_total,
+                "forces": forces,
+                "stress": stress,
+                "stress_l1": stress_l1,
+                "stress_l2": stress_l2,
+                "stress_l3": zero_stress,
+                "stress_dispersion": zero_stress,
+                "magnetoelastic_stress": zero_stress,
+                "dipole": mu,
+                "polarizability": alpha,
+                "charges": q,
+                "atomic_dipoles": atomic_dipoles,
+                "bec": bec,
+                "piezoelectric": piezoelectric,
+            }
+        finally:
+            geometry.restore(batch)
+        return result
 
 
 def _checkpoint_safe(value: Any) -> Any:
@@ -8378,6 +8872,8 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
         spins: torch.Tensor,
         use_domain: bool,
         use_spin: bool,
+        domain_activity: Optional[torch.Tensor] = None,
+        spin_activity: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         n_graphs = _batch_num_graphs(batch)
         zero_graph = torch.zeros((n_graphs,), dtype=batch.positions.dtype, device=batch.positions.device)
@@ -8419,6 +8915,29 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
                 "DMIij": torch.zeros((0, 3), dtype=batch.positions.dtype, device=batch.positions.device),
                 "magnetic_moments": torch.zeros_like(spins),
             }
+        domain_graph = (
+            torch.ones_like(zero_graph)
+            if domain_activity is None
+            else domain_activity.to(dtype=zero_graph.dtype, device=zero_graph.device)
+        )
+        spin_graph = (
+            torch.ones_like(zero_graph)
+            if spin_activity is None
+            else spin_activity.to(dtype=zero_graph.dtype, device=zero_graph.device)
+        )
+        domain_atom = domain_graph[batch.batch]
+        spin_atom = spin_graph[batch.batch]
+        domain["charges"] = domain["charges"] * domain_atom
+        domain["potential"] = domain["potential"] * domain_atom
+        for name in ("energy_local", "energy_coulomb", "residual", "stability_shift"):
+            domain[name] = domain[name] * domain_graph
+        spin["energy"] = spin["energy"] * spin_graph
+        spin["Di"] = spin["Di"] * spin_atom.view(-1, 1, 1)
+        spin["magnetic_moments"] = spin["magnetic_moments"] * spin_atom.view(-1, 1)
+        if spin["pair_index"].shape[1] > 0:
+            pair_activity = spin_graph[batch.batch[spin["pair_index"][0]]]
+            spin["Jij"] = spin["Jij"] * pair_activity
+            spin["DMIij"] = spin["DMIij"] * pair_activity.view(-1, 1)
         return domain, spin
 
     def forward(
@@ -8427,27 +8946,144 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
         *,
         training: Optional[bool] = None,
         compute_forces: bool = True,
+        compute_stress: bool = False,
         compute_bec: bool = False,
+        compute_piezoelectric: bool = False,
+        compute_stress_components: bool = False,
+        compute_magnetoelastic: bool = False,
         use_response_terms: bool = True,
         retain_graph: bool = False,
         use_response: Optional[bool] = None,
         use_domain_terms: Optional[bool] = None,
+        use_polarization_terms: Optional[bool] = None,
+        use_dispersion_terms: Optional[bool] = None,
         use_spin_terms: Optional[bool] = None,
+        label_aware_coupling: bool = False,
     ) -> Dict[str, torch.Tensor]:
         if training is None:
             training = bool(self.training)
         if use_response is not None:
             use_response_terms = bool(use_response)
+        if not use_response_terms:
+            # L1-only foundation batches should not execute the response core
+            # or attach gradients to sparse L2/L3 branches. The complete output
+            # schema is retained so callers do not need mode-specific handling.
+            result = super().forward(
+                batch,
+                training=bool(training),
+                compute_forces=bool(compute_forces),
+                compute_stress=bool(compute_stress),
+                compute_bec=False,
+                compute_piezoelectric=False,
+                compute_stress_components=bool(compute_stress_components),
+                compute_magnetoelastic=False,
+                use_response_terms=False,
+                retain_graph=bool(retain_graph),
+            )
+            graph_count = _batch_num_graphs(batch)
+            atom_count = int(batch.positions.shape[0])
+            dtype = batch.positions.dtype
+            device = batch.positions.device
+            zero_graph = torch.zeros((graph_count,), dtype=dtype, device=device)
+            zero_atom = torch.zeros((atom_count,), dtype=dtype, device=device)
+            zero_atom_vector = torch.zeros((atom_count, 3), dtype=dtype, device=device)
+            zero_atom_tensor = torch.zeros(
+                (atom_count, 3, 3), dtype=dtype, device=device
+            )
+            result.update({
+                "energy_short": result["energy"],
+                "energy_qeq": zero_graph,
+                "energy_pme": zero_graph,
+                "energy_d4": zero_graph,
+                "energy_spin": zero_graph,
+                "energy_response": zero_graph,
+                "induced_dipoles": zero_atom_vector,
+                "atomic_polarizability": zero_atom_tensor,
+                "c6": zero_atom,
+                "Jij": torch.zeros((0,), dtype=dtype, device=device),
+                "Di": zero_atom_tensor,
+                "DMIij": torch.zeros((0, 3), dtype=dtype, device=device),
+                "spin_pair_index": torch.zeros(
+                    (2, 0), dtype=torch.long, device=device
+                ),
+                "J_effective": zero_graph,
+                "Di_effective": torch.zeros(
+                    (graph_count, 3, 3), dtype=dtype, device=device
+                ),
+                "DMI_effective": torch.zeros(
+                    (graph_count, 3), dtype=dtype, device=device
+                ),
+                "magnetic_moments": zero_atom_vector,
+                "effective_field": zero_atom_vector,
+                "qeq_residual": zero_graph,
+                "qeq_stability_shift": zero_graph,
+                "deq_residual": zero_graph,
+                "deq_iterations": zero_graph,
+                "deq_stability_shift": zero_graph,
+                "coupling_residual": zero_graph,
+                "coupling_residual_electric": zero_graph,
+                "coupling_residual_spin": zero_graph,
+                "domain_activity": zero_graph,
+                "polarization_activity": zero_graph,
+                "dispersion_activity": zero_graph,
+                "spin_activity": zero_graph,
+            })
+            return result
         use_domain = bool(use_response_terms and (self.cfg.enable_qeq or self.cfg.enable_pme))
+        use_polarization = bool(use_response_terms and self.cfg.enable_deq)
+        use_dispersion = bool(use_response_terms and self.cfg.enable_d4)
         use_spin = bool(use_response_terms and self.cfg.enable_spin)
         if use_domain_terms is not None:
-            use_domain = bool(use_domain_terms)
+            use_domain = bool(use_domain and use_domain_terms)
+        if use_polarization_terms is not None:
+            use_polarization = bool(use_polarization and use_polarization_terms)
+        if use_dispersion_terms is not None:
+            use_dispersion = bool(use_dispersion and use_dispersion_terms)
         if use_spin_terms is not None:
-            use_spin = bool(use_spin_terms)
-        if (compute_forces or compute_bec) and not batch.positions.requires_grad:
-            batch.positions.requires_grad_(True)
+            use_spin = bool(use_spin and use_spin_terms)
+
+        geometry = _prepare_differentiable_geometry(
+            batch,
+            compute_forces=bool(compute_forces),
+            compute_bec=bool(compute_bec),
+            compute_stress=bool(compute_stress),
+            compute_piezoelectric=bool(compute_piezoelectric),
+            compute_stress_components=bool(
+                compute_stress_components or compute_magnetoelastic
+            ),
+        )
+        batch = geometry.batch
 
         n_graphs = _batch_num_graphs(batch)
+        one_graph = torch.ones(
+            (n_graphs,), dtype=batch.positions.dtype, device=batch.positions.device
+        )
+        if label_aware_coupling:
+            domain_activity = _graph_label_activity(
+                batch, ELECTRIC_COUPLING_LABELS, dtype=batch.positions.dtype
+            )
+            polarization_activity = _graph_label_activity(
+                batch, POLARIZATION_COUPLING_LABELS, dtype=batch.positions.dtype
+            )
+            dispersion_activity = _graph_label_activity(
+                batch, DISPERSION_COUPLING_LABELS, dtype=batch.positions.dtype
+            )
+            spin_activity = _graph_label_activity(
+                batch, SPIN_COUPLING_LABELS, dtype=batch.positions.dtype
+            )
+            use_domain = bool(use_domain and torch.any(domain_activity > 0.0).item())
+            use_polarization = bool(
+                use_polarization and torch.any(polarization_activity > 0.0).item()
+            )
+            use_dispersion = bool(
+                use_dispersion and torch.any(dispersion_activity > 0.0).item()
+            )
+            use_spin = bool(use_spin and torch.any(spin_activity > 0.0).item())
+        else:
+            domain_activity = one_graph
+            polarization_activity = one_graph
+            dispersion_activity = one_graph
+            spin_activity = one_graph
         field = _batch_field(batch, n_graphs) * float(self.cfg.field_scale)
         total_charge = _batch_total_charge(batch, n_graphs, batch.positions.dtype)
         spin_value = getattr(batch, "spins", None)
@@ -8462,6 +9098,8 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
             batch.film_condition = torch.zeros(
                 (batch.positions.shape[0], 4), dtype=batch.positions.dtype, device=batch.positions.device
             )
+            graph_activity = torch.maximum(domain_activity, spin_activity)
+            batch.film_activity = graph_activity[batch.batch]
         e_pes, _ = self.ground(batch)
         components = self.response.forward_components(batch)
         domain, spin = self._domain_and_spin(
@@ -8472,21 +9110,30 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
             spins=spins,
             use_domain=use_domain,
             use_spin=use_spin,
+            domain_activity=domain_activity,
+            spin_activity=spin_activity,
         )
 
         coupling_residual = torch.zeros((n_graphs,), dtype=field.dtype, device=field.device)
-        if self.cfg.enable_film and use_response_terms:
+        electric_coupling_residual = torch.zeros_like(coupling_residual)
+        spin_coupling_residual = torch.zeros_like(coupling_residual)
+        if self.cfg.enable_film and use_response_terms and (use_domain or use_spin):
             previous_q = domain["charges"]
+            previous_moments = spin["magnetic_moments"]
+            domain_atom_activity = domain_activity[batch.batch]
+            spin_atom_activity = spin_activity[batch.batch]
             n_steps = max(1, int(self.cfg.coupling_iterations))
             for _ in range(n_steps):
-                q_cond = torch.tanh(previous_q)
-                potential_cond = torch.tanh(domain["potential"] / 10.0)
+                q_cond = torch.tanh(previous_q) * domain_atom_activity
+                potential_cond = (
+                    torch.tanh(domain["potential"] / 10.0) * domain_atom_activity
+                )
                 spin_norm2 = _smooth_scalar_bound(
                     torch.sum(spins * spins, dim=-1), max_abs=4.0
-                )
+                ) * spin_atom_activity
                 spin_pair = _smooth_scalar_bound(
                     self._spin_condition(batch, spins), max_abs=4.0
-                )
+                ) * spin_atom_activity
                 batch.film_condition = torch.stack(
                     [q_cond, potential_cond, spin_norm2, spin_pair], dim=-1
                 )
@@ -8500,12 +9147,31 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
                     spins=spins,
                     use_domain=use_domain,
                     use_spin=use_spin,
+                    domain_activity=domain_activity,
+                    spin_activity=spin_activity,
                 )
-                q_delta = torch.abs(domain["charges"] - previous_q)
-                coupling_residual = scatter_mean(q_delta, batch.batch, dim_size=n_graphs)
+                q_delta = (
+                    torch.abs(domain["charges"] - previous_q)
+                    * domain_atom_activity
+                )
+                moment_delta = torch.linalg.vector_norm(
+                    spin["magnetic_moments"] - previous_moments, dim=-1
+                ) * spin_atom_activity
+                electric_coupling_residual = scatter_mean(
+                    q_delta, batch.batch, dim_size=n_graphs
+                )
+                spin_coupling_residual = scatter_mean(
+                    moment_delta, batch.batch, dim_size=n_graphs
+                )
+                coupling_residual = torch.maximum(
+                    electric_coupling_residual, spin_coupling_residual
+                )
                 # Under-relax the feedback state to prevent charge/FiLM
                 # oscillations while retaining the converged physical output.
                 previous_q = 0.5 * previous_q + 0.5 * domain["charges"]
+                previous_moments = (
+                    0.5 * previous_moments + 0.5 * spin["magnetic_moments"]
+                )
                 if float(torch.max(coupling_residual).detach().cpu()) <= float(self.cfg.coupling_tol):
                     break
 
@@ -8515,7 +9181,14 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
         alpha = components["polarizability"]
         zero_graph = torch.zeros((n_graphs,), dtype=field.dtype, device=field.device)
 
-        if use_response_terms and self.polarization_solver is not None:
+        alpha_factor = (
+            ALPHA_VOLUME_TO_EV_PER_FIELD2
+            if str(getattr(self.cfg, "polarizability_unit", "angstrom3")).lower()
+            == "angstrom3"
+            else 1.0
+        )
+        polarization_atom_activity = polarization_activity[batch.batch]
+        if use_polarization and self.polarization_solver is not None:
             polarization = self.polarization_solver(
                 atomic_alpha=atomic_alpha,
                 charges=charges,
@@ -8523,10 +9196,32 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
                 batch=batch,
                 field=field,
             )
+            polarization["induced_dipoles"] = (
+                polarization["induced_dipoles"]
+                * polarization_atom_activity.view(-1, 1)
+            )
+            for name in ("energy", "residual", "iterations", "stability_shift"):
+                polarization[name] = polarization[name] * polarization_activity
         else:
+            direct_induced = alpha_factor * torch.einsum(
+                "nij,nj->ni", atomic_alpha, field[batch.batch]
+            )
+            direct_induced = (
+                direct_induced * polarization_atom_activity.view(-1, 1)
+                if use_response_terms
+                else torch.zeros_like(batch.positions)
+            )
+            direct_energy = -0.5 * alpha_factor * torch.einsum(
+                "bi,bij,bj->b", field, alpha, field
+            )
+            direct_energy = (
+                direct_energy * polarization_activity
+                if use_response_terms
+                else zero_graph
+            )
             polarization = {
-                "induced_dipoles": torch.zeros_like(batch.positions),
-                "energy": zero_graph,
+                "induced_dipoles": direct_induced,
+                "energy": direct_energy,
                 "residual": zero_graph,
                 "iterations": zero_graph,
                 "stability_shift": zero_graph,
@@ -8557,31 +9252,53 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
             for component in range(3):
                 derivative = torch.autograd.grad(
                     mu[:, component].sum(),
-                    batch.positions,
+                    geometry.base_positions,
                     create_graph=bool(training),
                     retain_graph=True,
                     allow_unused=True,
                 )[0]
-                bec_rows.append(derivative if derivative is not None else torch.zeros_like(batch.positions))
+                bec_rows.append(
+                    derivative
+                    if derivative is not None
+                    else torch.zeros_like(geometry.base_positions)
+                )
             bec = torch.stack(bec_rows, dim=1)
+
+        piezoelectric = (
+            _piezoelectric_from_dipole(
+                mu, geometry, training=bool(training)
+            )
+            if compute_piezoelectric and use_response_terms
+            else torch.zeros(
+                (n_graphs, 3, 3, 3),
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
+            )
+        )
 
         e_response = zero_graph
         if use_response_terms:
-            e_response = -torch.sum(mu_permanent * field, dim=-1)
+            electric_activity = torch.maximum(
+                domain_activity, polarization_activity
+            )
+            e_response = (
+                -torch.sum(mu_permanent * field, dim=-1) * electric_activity
+            )
             if self.qeq is None or not use_domain:
                 e_response = e_response - torch.sum(mu_charge * field, dim=-1)
-            if self.polarization_solver is not None:
-                e_response = e_response + polarization["energy"]
-            else:
-                e_response = e_response - 0.5 * ALPHA_VOLUME_TO_EV_PER_FIELD2 * torch.einsum(
-                    "bi,bij,bj->b", field, alpha, field
-                )
+            e_response = e_response + polarization["energy"]
 
-        if use_response_terms and self.d4 is not None:
+        if use_dispersion and self.d4 is not None:
             d4 = self.d4(
                 batch=batch,
                 charges=charges,
                 c6_scale=components.get("c6_scale"),
+            )
+            d4["energy"] = d4["energy"] * dispersion_activity
+            dispersion_atom_activity = dispersion_activity[batch.batch]
+            d4["atomic_c6"] = d4["atomic_c6"] * dispersion_atom_activity
+            d4["atomic_polarizability"] = (
+                d4["atomic_polarizability"] * dispersion_atom_activity
             )
         else:
             d4 = {
@@ -8594,6 +9311,51 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
         e_pme = domain["energy_coulomb"] if use_domain else zero_graph
         e_spin = spin["energy"] if use_spin else zero_graph
         e_total = e_pes + e_qeq + e_pme + d4["energy"] + e_spin + e_response
+
+        magnetoelastic_energy = zero_graph
+        if compute_magnetoelastic and use_spin and self.spin_layer is not None:
+            reference_value = getattr(batch, "reference_spins", None)
+            if reference_value is None:
+                raise ValueError(
+                    "Magnetoelastic response requires same-geometry reference_spins"
+                )
+            reference_spins = torch.as_tensor(
+                reference_value,
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
+            ).reshape_as(spins)
+            magnetoelastic_activity = _graph_label_activity(
+                batch,
+                ("magnetoelastic_stress",),
+                dtype=batch.positions.dtype,
+            )
+            # Re-evaluate the complete coupled Hamiltonian at the reference
+            # spin state. This retains spin-induced FiLM, charge,
+            # polarization, and dispersion relaxation instead of attributing
+            # the DFT stress difference to an isolated spin head.
+            reference_batch = copy.copy(batch)
+            reference_batch.spins = reference_spins
+            reference_output = self.forward(
+                reference_batch,
+                training=bool(training),
+                compute_forces=False,
+                compute_stress=False,
+                compute_bec=False,
+                compute_piezoelectric=False,
+                compute_stress_components=False,
+                compute_magnetoelastic=False,
+                use_response_terms=True,
+                retain_graph=True,
+                use_domain_terms=use_domain,
+                use_polarization_terms=use_polarization,
+                use_dispersion_terms=use_dispersion,
+                use_spin_terms=True,
+                label_aware_coupling=bool(label_aware_coupling),
+            )
+            reference_energy = reference_output["energy"] * magnetoelastic_activity
+            magnetoelastic_energy = (
+                e_total * magnetoelastic_activity - reference_energy
+            )
 
         pair_index = spin["pair_index"]
         if pair_index.shape[1] > 0:
@@ -8617,20 +9379,57 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
         else:
             effective_field = torch.zeros_like(spins)
 
-        if compute_forces:
-            grad_pos = torch.autograd.grad(
-                e_total.sum(),
-                batch.positions,
-                create_graph=bool(training),
-                retain_graph=bool(retain_graph or training),
-            )[0]
-            forces = -grad_pos
+        forces, stress = _conservative_geometry_derivatives(
+            e_total,
+            geometry,
+            training=bool(training),
+            compute_forces=bool(compute_forces),
+            compute_stress=bool(compute_stress),
+            retain_graph=bool(
+                retain_graph or compute_stress_components or compute_magnetoelastic
+            ),
+        )
+
+        zero_stress = torch.zeros_like(stress)
+        if compute_stress_components:
+            stress_l1 = _stress_from_energy_component(
+                e_pes, geometry, training=bool(training)
+            )
+            stress_l2 = _stress_from_energy_component(
+                e_qeq + e_pme + e_response,
+                geometry,
+                training=bool(training),
+            )
+            stress_l3 = _stress_from_energy_component(
+                e_spin, geometry, training=bool(training)
+            )
+            stress_dispersion = _stress_from_energy_component(
+                d4["energy"], geometry, training=bool(training)
+            )
         else:
-            forces = torch.zeros_like(batch.positions)
+            stress_l1 = zero_stress
+            stress_l2 = zero_stress
+            stress_l3 = zero_stress
+            stress_dispersion = zero_stress
+        magnetoelastic_stress = (
+            _stress_from_energy_component(
+                magnetoelastic_energy,
+                geometry,
+                training=bool(training),
+            )
+            if compute_magnetoelastic
+            else zero_stress
+        )
 
         return {
             "energy": e_total,
             "forces": forces,
+            "stress": stress,
+            "stress_l1": stress_l1,
+            "stress_l2": stress_l2,
+            "stress_l3": stress_l3,
+            "stress_dispersion": stress_dispersion,
+            "magnetoelastic_stress": magnetoelastic_stress,
             "energy_short": e_pes,
             "energy_qeq": e_qeq,
             "energy_pme": e_pme,
@@ -8645,6 +9444,7 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
             "atomic_polarizability": atomic_alpha,
             "c6": d4["atomic_c6"],
             "bec": bec,
+            "piezoelectric": piezoelectric,
             "Jij": spin["Jij"],
             "Di": spin["Di"],
             "DMIij": spin["DMIij"],
@@ -8660,6 +9460,12 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
             "deq_iterations": polarization["iterations"],
             "deq_stability_shift": polarization["stability_shift"],
             "coupling_residual": coupling_residual,
+            "coupling_residual_electric": electric_coupling_residual,
+            "coupling_residual_spin": spin_coupling_residual,
+            "domain_activity": domain_activity,
+            "polarization_activity": polarization_activity,
+            "dispersion_activity": dispersion_activity,
+            "spin_activity": spin_activity,
         }
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -8759,9 +9565,8 @@ class _FastEquivariantCoreO3TS(torch.nn.Module):
             [FastEquivariantBlockO3(self.hidden, int(rbf_dim), use_l3=self.use_l3)
              for _ in range(int(num_layers))]
         )
-        # Always materialize one FiLM layer per interaction so TorchScript can
-        # iterate over paired ModuleLists. The branch is constant-folded when
-        # FiLM is disabled, and missing weights are allowed by the exporter.
+        # Retain FiLM parameters for state-dict compatibility. The portable
+        # TorchScript forward is ground-only and deliberately does not use them.
         self.film_layers = torch.nn.ModuleList(
             [torch.nn.Linear(4, 3 * self.hidden) for _ in range(int(num_layers))]
         )
@@ -8791,21 +9596,9 @@ class _FastEquivariantCoreO3TS(torch.nn.Module):
         a  = torch.zeros((n, self.hidden, 3), dtype=positions.dtype, device=positions.device)
         t2 = torch.zeros((n, self.hidden, 5), dtype=positions.dtype, device=positions.device)
         t3 = torch.zeros((n, self.hidden, 7), dtype=positions.dtype, device=positions.device)
-        film_condition = torch.zeros((n, 4), dtype=positions.dtype, device=positions.device)
-        for layer, film_layer in zip(self.layers, self.film_layers):
-            if self.enable_film:
-                gamma_s, beta_s, gamma_tensor = torch.chunk(
-                    film_layer(film_condition), 3, dim=-1
-                )
-                gamma_s = 0.25 * torch.tanh(gamma_s)
-                beta_s = _smooth_scalar_bound(beta_s, max_abs=5.0)
-                gamma_tensor = 0.25 * torch.tanh(gamma_tensor)
-                s = s * (1.0 + gamma_s) + beta_s
-                gate = (1.0 + gamma_tensor).unsqueeze(-1)
-                v = v * gate
-                a = a * gate
-                t2 = t2 * gate
-                t3 = t3 * gate
+        for layer in self.layers:
+            # The portable export is explicitly ground-only, so FiLM is not
+            # evaluated even when its parameters are present in the checkpoint.
             s, v, a, t2, t3 = layer(s=s, v=v, a=a, t2=t2, t3=t3, edge_index=edge_index,
                                      edge_vec=edge_vec, r=r, rbf=rbf, cutoff=cutoff, num_nodes=n)
         return s
@@ -9077,8 +9870,13 @@ class TrainConfig:
     seed: int = 0
     w_energy: float = 1.0
     w_forces: float = 10.0
+    w_stress: float = 0.0
+    w_piezoelectric: float = 0.0
+    w_magnetoelastic: float = 0.0
     force_loss: str = "mse"              # "mse" | "huber"
     force_huber_delta: float = 1.0       # eV/Angstrom; used only by Huber
+    stress_loss: str = "huber"           # "mse" | "huber"
+    stress_huber_delta: float = 0.05     # eV/Angstrom^3; used only by Huber
     w_dipole: float = 0.0
     w_polarizability: float = 0.0
     w_charges: float = 0.0
@@ -9091,6 +9889,11 @@ class TrainConfig:
     w_j: float = 0.0
     w_di: float = 0.0
     w_dmi: float = 0.0
+    w_bec_sum_rule: float = 0.0
+    w_coupling_consistency: float = 0.0
+    # Response/Joint training activates a mechanism only for graphs carrying
+    # its associated labels. Explicit inference remains fully coupled.
+    label_aware_coupling: bool = True
     grad_clip_norm: float = 100.0
     export_sevennet: bool = True
 
@@ -9154,6 +9957,9 @@ class TrainConfig:
 VALIDATION_MAE_SCALES: Dict[str, float] = {
     "energy": 1.0,
     "forces": 1.0,
+    "stress": 0.1,
+    "piezoelectric": 0.5,
+    "magnetoelastic_stress": 0.02,
     "dipole": 1.0,
     "polarizability": 1.0,
     "charges": 0.1,
@@ -9161,12 +9967,14 @@ VALIDATION_MAE_SCALES: Dict[str, float] = {
     "atomic_polarizability": 0.1,
     "c6": 10.0,
     "bec": 0.1,
+    "bec_sum_rule": 0.1,
     "magnetic_moments": 1.0,
     "effective_field": 0.01,
     "J_effective": 0.01,
     "Di_effective": 0.01,
     "Di": 0.01,
     "DMI_effective": 0.01,
+    "coupling_consistency": 0.01,
 }
 
 
@@ -9199,6 +10007,110 @@ def _batch_has_label(batch: Any, name: str) -> bool:
         return False
     weight = torch.as_tensor(raw).detach()
     return bool(torch.any(torch.isfinite(weight) & (weight > 0.0)).cpu())
+
+
+def _batch_has_any_label(batch: Any, names: Sequence[str]) -> bool:
+    return any(_batch_has_label(batch, str(name)) for name in names)
+
+
+ELECTRIC_COUPLING_LABELS: Tuple[str, ...] = (
+    "charges", "dipole", "atomic_dipoles", "polarizability",
+    "atomic_polarizability", "bec", "piezoelectric", "field", "total_charge",
+)
+POLARIZATION_COUPLING_LABELS: Tuple[str, ...] = (
+    "dipole", "atomic_dipoles", "polarizability",
+    "atomic_polarizability", "bec", "piezoelectric",
+)
+DISPERSION_COUPLING_LABELS: Tuple[str, ...] = (
+    "c6", "atomic_polarizability",
+)
+SPIN_COUPLING_LABELS: Tuple[str, ...] = (
+    "spins", "magnetic_moments", "effective_field", "J_effective", "Di",
+    "Di_effective", "DMI_effective",
+    "magnetoelastic_stress", "reference_spins",
+)
+RESPONSE_COUPLING_LABELS: Tuple[str, ...] = tuple(dict.fromkeys(
+    ELECTRIC_COUPLING_LABELS
+    + POLARIZATION_COUPLING_LABELS
+    + DISPERSION_COUPLING_LABELS
+    + SPIN_COUPLING_LABELS
+))
+
+
+def _graph_label_activity(
+    batch: Any,
+    names: Sequence[str],
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a per-graph 0/1 mask for at least one associated active label."""
+    graph_count = _batch_num_graphs(batch)
+    activity = torch.zeros(
+        (graph_count,), dtype=torch.bool, device=batch.positions.device
+    )
+    for name in names:
+        raw = getattr(batch, f"{name}_weight", None)
+        if raw is None:
+            # External field and net charge are physical state variables rather
+            # than regression targets, so legacy/canonical data need no
+            # synthetic label weights for them. Nonzero values still activate
+            # the electric Hamiltonian for energy/force supervision.
+            if name == "field" and hasattr(batch, "field"):
+                value = torch.as_tensor(
+                    batch.field, dtype=dtype, device=batch.positions.device
+                )
+                if value.numel() != graph_count * 3:
+                    raise ValueError(
+                        f"field has {value.numel()} values; expected {graph_count * 3}"
+                    )
+                active = torch.any(
+                    torch.abs(value.reshape(graph_count, 3)) > 0.0, dim=-1
+                )
+                activity |= active
+            elif name == "total_charge" and hasattr(batch, "total_charge"):
+                value = torch.as_tensor(
+                    batch.total_charge, dtype=dtype, device=batch.positions.device
+                ).reshape(-1)
+                if value.numel() == 1:
+                    value = value.expand(graph_count)
+                if value.numel() != graph_count:
+                    raise ValueError(
+                        f"total_charge has {value.numel()} values; expected {graph_count}"
+                    )
+                activity |= torch.isfinite(value) & (torch.abs(value) > 0.0)
+            continue
+        weight = torch.as_tensor(raw, device=batch.positions.device).reshape(-1)
+        active = torch.isfinite(weight) & (weight > 0.0)
+        if active.numel() == 1:
+            activity |= active.expand(graph_count)
+        elif active.numel() == graph_count:
+            activity |= active
+        elif active.numel() == int(batch.positions.shape[0]):
+            counts = scatter_sum(
+                active.to(dtype=dtype), batch.batch, dim_size=graph_count
+            )
+            activity |= counts > 0.0
+        else:
+            raise ValueError(
+                f"{name}_weight has {active.numel()} entries; expected 1, "
+                f"{graph_count}, or {int(batch.positions.shape[0])}"
+            )
+    return activity.to(dtype=dtype)
+
+
+def _batch_has_coupling_activity(batch: Any, names: Sequence[str]) -> bool:
+    """Return whether labels or explicit state activate a physical mechanism."""
+    activity = _graph_label_activity(batch, names, dtype=batch.positions.dtype)
+    return bool(torch.any(activity > 0.0).detach().cpu())
+
+
+def _batch_uses_response_terms(batch: Any, cfg: Any) -> bool:
+    """Select the full Hamiltonian only for supervised Joint/Response batches."""
+    if str(getattr(cfg, "mode", "joint")).strip().lower() == "base":
+        return False
+    if not bool(getattr(cfg, "label_aware_coupling", True)):
+        return True
+    return _batch_has_coupling_activity(batch, RESPONSE_COUPLING_LABELS)
 
 
 def _masked_mae_statistics(
@@ -9293,10 +10205,11 @@ def _atomic_data_is_finite(graph: AtomicData) -> Tuple[bool, List[str]]:
             if not bool(torch.isfinite(value).all().cpu()):
                 invalid.append(name)
     for name in (
-        "energy", "forces", "dipole", "polarizability", "total_charge",
+        "energy", "forces", "stress", "dipole", "polarizability", "total_charge",
         "charges", "atomic_dipoles", "atomic_polarizability", "c6", "bec",
         "spins", "magnetic_moments", "effective_field", "Di",
         "J_effective", "DMI_effective", "Di_effective",
+        "piezoelectric", "magnetoelastic_stress", "reference_spins", "strain",
     ):
         value = getattr(graph, name, None)
         weight = getattr(graph, f"{name}_weight", None)
@@ -9458,6 +10371,13 @@ def _additional_physics_loss(
         ("atomic_polarizability", "atomic_polarizability", float(cfg.w_atomic_polarizability), True),
         ("c6", "c6", float(cfg.w_c6), True),
         ("bec", "bec", float(cfg.w_bec), True),
+        ("piezoelectric", "piezoelectric", float(cfg.w_piezoelectric), False),
+        (
+            "magnetoelastic_stress",
+            "magnetoelastic_stress",
+            float(cfg.w_magnetoelastic),
+            False,
+        ),
         ("magnetic_moments", "magnetic_moments", float(cfg.w_magnetic_moments), True),
         ("effective_field", "effective_field", float(cfg.w_effective_field), True),
         ("J_effective", "J_effective", float(cfg.w_j), False),
@@ -9501,6 +10421,50 @@ def _additional_physics_loss(
             if float(cfg.w_di) > 0.0:
                 total = total + float(cfg.w_di) * _weighted_mse(prediction, target, weight)
             metrics[target_name] = _masked_mae_statistics(prediction, target, weight)
+
+    bec_rule_weight = float(getattr(cfg, "w_bec_sum_rule", 0.0))
+    if bec_rule_weight > 0.0 and "bec" in out and _batch_has_label(batch, "bec"):
+        graph_count = _batch_num_graphs(batch)
+        atom_count = scatter_sum(
+            torch.ones(
+                (batch.positions.shape[0],),
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
+            ),
+            batch.batch,
+            dim_size=graph_count,
+        )
+        bec_sum = scatter_sum(out["bec"], batch.batch, dim_size=graph_count)
+        # Divide by sqrt(N), not N: the exact acoustic sum rule remains zero,
+        # while stochastic component errors retain comparable scale across cells.
+        normalized_sum = bec_sum / torch.sqrt(atom_count.clamp(min=1.0)).view(
+            -1, 1, 1
+        )
+        graph_weight = _graph_label_activity(
+            batch, ("bec",), dtype=normalized_sum.dtype
+        )
+        total = total + bec_rule_weight * _weighted_mse(
+            normalized_sum, torch.zeros_like(normalized_sum), graph_weight
+        )
+        metrics["bec_sum_rule"] = _masked_mae_statistics(
+            normalized_sum, torch.zeros_like(normalized_sum), graph_weight
+        )
+
+    coupling_weight = float(getattr(cfg, "w_coupling_consistency", 0.0))
+    if coupling_weight > 0.0 and "coupling_residual" in out:
+        activity = _graph_label_activity(
+            batch,
+            ELECTRIC_COUPLING_LABELS + SPIN_COUPLING_LABELS,
+            dtype=out["coupling_residual"].dtype,
+        )
+        if bool(torch.any(activity > 0.0).detach().cpu()):
+            residual = out["coupling_residual"]
+            total = total + coupling_weight * _weighted_mse(
+                residual, torch.zeros_like(residual), activity
+            )
+            metrics["coupling_consistency"] = _masked_mae_statistics(
+                residual, torch.zeros_like(residual), activity
+            )
     return total, metrics
 
 
@@ -9943,9 +10907,11 @@ class AutoSearchEngine:
         "backbone_optimizer": (
             "lr", "batch_size", "r_max", "num_channels", "num_interactions",
             "num_radial_basis", "field_scale", "force_loss", "force_huber_delta",
+            "stress_loss", "stress_huber_delta",
         ),
         "objective_balance": (
-            "w_energy", "w_forces", "w_dipole", "w_polarizability",
+            "w_energy", "w_forces", "w_stress", "w_piezoelectric",
+            "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
             "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di",
             "w_dmi",
@@ -9981,6 +10947,9 @@ class AutoSearchEngine:
         # an invalid logarithmic interval with lower bound zero.
         "w_energy":               ("zero_log_uniform", 0.1,   10.0, 0.10),
         "w_forces":               ("zero_log_uniform", 1.0,   100.0, 0.10),
+        "w_stress":               ("zero_log_uniform", 0.1,   100.0, 0.20),
+        "w_piezoelectric":        ("zero_log_uniform", 0.001, 10.0, 0.20),
+        "w_magnetoelastic":       ("zero_log_uniform", 0.1,   100.0, 0.20),
         "w_dipole":               ("zero_log_uniform", 0.001, 1.0, 0.20),
         "w_polarizability":       ("zero_log_uniform", 0.001, 1.0, 0.20),
         "w_charges":               ("zero_log_uniform", 0.001, 10.0, 0.20),
@@ -9998,6 +10967,8 @@ class AutoSearchEngine:
         "batch_size":             ("choice",      [2, 4, 8, 16]),
         "force_loss":             ("choice",      ["mse", "huber"]),
         "force_huber_delta":      ("log_uniform", 0.25, 2.0),
+        "stress_loss":            ("choice",      ["mse", "huber"]),
+        "stress_huber_delta":     ("log_uniform", 0.005, 0.2),
         "r_max":                  ("choice",      [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
         "num_channels":           ("choice",      [32, 48, 64, 96, 128]),
         "num_interactions":       ("choice",      [1, 2, 3, 4]),
@@ -10043,35 +11014,39 @@ class AutoSearchEngine:
     # Parameters searched at each level (cumulative)
     LEVEL_PARAMS: Dict[int, List[str]] = {
         1: [
-            "w_energy", "w_forces", "w_dipole", "w_polarizability",
+            "w_energy", "w_forces", "w_stress", "w_piezoelectric",
+            "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
             "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
         ],
         2: [
-            "w_energy", "w_forces", "w_dipole", "w_polarizability",
+            "w_energy", "w_forces", "w_stress", "w_piezoelectric",
+            "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
             "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
             "lr", "batch_size", "r_max", "num_channels",
             "num_interactions", "num_radial_basis", "field_scale",
-            "force_loss", "force_huber_delta",
+            "force_loss", "force_huber_delta", "stress_loss", "stress_huber_delta",
         ],
         3: [
-            "w_energy", "w_forces", "w_dipole", "w_polarizability",
+            "w_energy", "w_forces", "w_stress", "w_piezoelectric",
+            "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
             "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
             "lr", "batch_size", "r_max", "num_channels",
             "num_interactions", "num_radial_basis", "field_scale",
-            "force_loss", "force_huber_delta",
+            "force_loss", "force_huber_delta", "stress_loss", "stress_huber_delta",
             "joint_stages", "lr_ground_scale", "lr_response_scale",
             "warmup_epochs", "w_dipole_final", "w_alpha_final",
         ],
         4: [
-            "w_energy", "w_forces", "w_dipole", "w_polarizability",
+            "w_energy", "w_forces", "w_stress", "w_piezoelectric",
+            "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
             "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
             "lr", "batch_size", "r_max", "num_channels",
             "num_interactions", "num_radial_basis", "field_scale",
-            "force_loss", "force_huber_delta",
+            "force_loss", "force_huber_delta", "stress_loss", "stress_huber_delta",
             "joint_stages", "lr_ground_scale", "lr_response_scale",
             "warmup_epochs", "w_dipole_final", "w_alpha_final",
             "e3mu_use_parity", "e3mu_use_l3", "rbf_type", "enable_continuous_chem",
@@ -10086,7 +11061,8 @@ class AutoSearchEngine:
 
     LOSS_PARAM_TO_ATTR: Dict[str, str] = {
         name: name for name in (
-            "w_energy", "w_forces", "w_dipole", "w_polarizability", "w_charges",
+            "w_energy", "w_forces", "w_stress", "w_piezoelectric",
+            "w_magnetoelastic", "w_dipole", "w_polarizability", "w_charges",
             "w_atomic_dipoles", "w_atomic_polarizability", "w_c6", "w_bec",
             "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
         )
@@ -10094,6 +11070,9 @@ class AutoSearchEngine:
     LOSS_PARAM_TO_TARGET: Dict[str, str] = {
         "w_energy": "energy",
         "w_forces": "forces",
+        "w_stress": "stress",
+        "w_piezoelectric": "piezoelectric",
+        "w_magnetoelastic": "magnetoelastic_stress",
         "w_dipole": "dipole",
         "w_polarizability": "polarizability",
         "w_charges": "charges",
@@ -10407,7 +11386,11 @@ class AutoSearchEngine:
         elif bool(getattr(auto_cfg, "protect_active_core_targets", True)):
             required_targets = tuple(
                 target
-                for parameter, target in (("w_energy", "energy"), ("w_forces", "forces"))
+                for parameter, target in (
+                    ("w_energy", "energy"),
+                    ("w_forces", "forces"),
+                    ("w_stress", "stress"),
+                )
                 if float(getattr(base_cfg, parameter, 0.0)) > 0.0
             )
         else:
@@ -10497,6 +11480,9 @@ class AutoSearchEngine:
         return {
             "w_energy":            float(cfg.w_energy),
             "w_forces":            float(cfg.w_forces),
+            "w_stress":            float(cfg.w_stress),
+            "w_piezoelectric":     float(cfg.w_piezoelectric),
+            "w_magnetoelastic":    float(cfg.w_magnetoelastic),
             "w_dipole":            float(cfg.w_dipole),
             "w_polarizability":    float(cfg.w_polarizability),
             "w_charges":            float(cfg.w_charges),
@@ -10513,6 +11499,10 @@ class AutoSearchEngine:
             "batch_size":          int(cfg.batch_size),
             "force_loss":          str(getattr(cfg, "force_loss", "mse")),
             "force_huber_delta":   float(getattr(cfg, "force_huber_delta", 1.0)),
+            "stress_loss":         str(getattr(cfg, "stress_loss", "huber")),
+            "stress_huber_delta":  float(
+                getattr(cfg, "stress_huber_delta", 0.05)
+            ),
             "r_max":               float(mc.r_max),
             "num_channels":        int(mc.num_channels),
             "num_interactions":    int(mc.num_interactions),
@@ -10864,7 +11854,7 @@ class AutoSearchEngine:
             # both the objective and the number/composition of optimizer steps.
             _fixed_edge_budget = (
                 12000
-                if bool({"forces", "bec"} & set(self.validation_targets))
+                if bool({"forces", "stress", "bec"} & set(self.validation_targets))
                 else 30000
             )
 
@@ -10890,9 +11880,20 @@ class AutoSearchEngine:
             seed                   = int(self.base_cfg.seed if seed is None else seed),
             w_energy               = float(params.get("w_energy",      self.base_cfg.w_energy)),
             w_forces               = float(params.get("w_forces",      self.base_cfg.w_forces)),
+            w_stress               = float(params.get("w_stress",      self.base_cfg.w_stress)),
+            w_piezoelectric        = float(params.get(
+                "w_piezoelectric", self.base_cfg.w_piezoelectric
+            )),
+            w_magnetoelastic       = float(params.get(
+                "w_magnetoelastic", self.base_cfg.w_magnetoelastic
+            )),
             force_loss             = str(params.get("force_loss", self.base_cfg.force_loss)),
             force_huber_delta      = float(params.get(
                 "force_huber_delta", self.base_cfg.force_huber_delta
+            )),
+            stress_loss            = str(params.get("stress_loss", self.base_cfg.stress_loss)),
+            stress_huber_delta     = float(params.get(
+                "stress_huber_delta", self.base_cfg.stress_huber_delta
             )),
             w_dipole               = float(params.get("w_dipole",      self.base_cfg.w_dipole)),
             w_polarizability       = float(params.get("w_polarizability", self.base_cfg.w_polarizability)),
@@ -10906,6 +11907,9 @@ class AutoSearchEngine:
             w_j                    = float(params.get("w_j", self.base_cfg.w_j)),
             w_di                   = float(params.get("w_di", self.base_cfg.w_di)),
             w_dmi                  = float(params.get("w_dmi", self.base_cfg.w_dmi)),
+            w_bec_sum_rule         = float(self.base_cfg.w_bec_sum_rule),
+            w_coupling_consistency = float(self.base_cfg.w_coupling_consistency),
+            label_aware_coupling   = bool(self.base_cfg.label_aware_coupling),
             grad_clip_norm         = self.base_cfg.grad_clip_norm,
             export_sevennet        = False,    # Skip TorchScript export during search trials.
             save_epoch_artifacts   = False,    # Skip per-epoch checkpoints and plots during search.
@@ -12368,10 +13372,12 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     active_losses = {
         name: float(getattr(cfg, name))
         for name in (
-            "w_energy", "w_forces", "w_dipole", "w_polarizability",
+            "w_energy", "w_forces", "w_stress", "w_piezoelectric",
+            "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability",
             "w_c6", "w_bec", "w_magnetic_moments", "w_effective_field",
-            "w_j", "w_di", "w_dmi",
+            "w_j", "w_di", "w_dmi", "w_bec_sum_rule",
+            "w_coupling_consistency",
         )
         if float(getattr(cfg, name)) > 0.0
     }
@@ -12390,6 +13396,13 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             if str(getattr(cfg, "force_loss", "mse")).lower() == "huber"
             else ""
         )
+        + f" stress_loss={str(getattr(cfg, 'stress_loss', 'huber')).lower()}"
+        + (
+            f"(delta={float(getattr(cfg, 'stress_huber_delta', 0.05)):g})"
+            if str(getattr(cfg, "stress_loss", "huber")).lower() == "huber"
+            else ""
+        )
+        + f" label_aware_coupling={bool(getattr(cfg, 'label_aware_coupling', True))}"
         + f"; loss_weights={json.dumps(active_losses, sort_keys=True)}"
     )
     _validation_targets = {
@@ -13168,7 +14181,13 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             edge_budget = (
                 _configured_edge_budget
                 if _configured_edge_budget is not None
-                else 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
+                else 12000 if (
+                    cfg.w_forces > 0.0
+                    or cfg.w_stress > 0.0
+                    or cfg.w_bec > 0.0
+                    or cfg.w_piezoelectric > 0.0
+                    or cfg.w_magnetoelastic > 0.0
+                ) else 30000
             ) if device.type == "mps" else None
             kwargs["batch_sampler"] = _CompositeCurriculumBatchSampler(
                 ds, _eff_bs, int(cfg.seed), shuffle=shuffle,
@@ -13182,7 +14201,13 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             edge_budget = (
                 _configured_edge_budget
                 if _configured_edge_budget is not None
-                else 12000 if (cfg.w_forces > 0.0 or cfg.w_bec > 0.0) else 30000
+                else 12000 if (
+                    cfg.w_forces > 0.0
+                    or cfg.w_stress > 0.0
+                    or cfg.w_bec > 0.0
+                    or cfg.w_piezoelectric > 0.0
+                    or cfg.w_magnetoelastic > 0.0
+                ) else 30000
             )
             kwargs["batch_sampler"] = _FixedGraphBatchSampler(
                 ds,
@@ -13276,6 +14301,8 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         batch.positions = batch.positions.detach()
         if hasattr(batch, "film_condition"):
             batch.film_condition = None
+        if hasattr(batch, "film_activity"):
+            batch.film_activity = None
 
     _max_nonfinite_recoveries = int(getattr(cfg, "nonfinite_recovery_attempts", 3))
     _last_validated_state: Dict[str, torch.Tensor] = {
@@ -13297,6 +14324,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
     _final_val_loss: float = float("inf")
     _final_val_fmae: float = float("inf")
     _final_val_emae: float = float("inf")
+    _final_val_smae: float = float("inf")
     _best_val_loss: float = float("inf")
     _best_validation_score: float = float("inf")
     _best_epoch: int = 0
@@ -13388,29 +14416,81 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         response_weight_alpha: float,
     ) -> Dict[str, Any]:
         """Run one finite training calculation without mutating optimizer state."""
-        use_response_terms = cfg.mode != "base"
+        use_response_terms = _batch_uses_response_terms(batch, cfg)
         need_energy = bool(cfg.w_energy > 0.0 and _batch_has_label(batch, "energy"))
         need_forces = bool(cfg.w_forces > 0.0 and _batch_has_label(batch, "forces"))
+        need_stress = bool(cfg.w_stress > 0.0 and _batch_has_label(batch, "stress"))
         need_mu = bool(cfg.w_dipole > 0.0 and _batch_has_label(batch, "dipole"))
         need_alpha = bool(
             cfg.w_polarizability > 0.0
             and _batch_has_label(batch, "polarizability")
         )
-        need_bec = bool(cfg.w_bec > 0.0 and _batch_has_label(batch, "bec"))
+        need_bec = bool(
+            (cfg.w_bec > 0.0 or cfg.w_bec_sum_rule > 0.0)
+            and _batch_has_label(batch, "bec")
+        )
+        need_piezoelectric = bool(
+            cfg.w_piezoelectric > 0.0
+            and _batch_has_label(batch, "piezoelectric")
+        )
+        need_magnetoelastic = bool(
+            cfg.w_magnetoelastic > 0.0
+            and _batch_has_label(batch, "magnetoelastic_stress")
+            and _batch_has_label(batch, "reference_spins")
+        )
         batch_use_spin = bool(
             isinstance(model, MixedGranularityE3GNN)
             and cfg.model.enable_spin
             and _batch_has_label(batch, "spins")
+            and _batch_has_coupling_activity(batch, SPIN_COUPLING_LABELS)
+        )
+        label_aware = bool(getattr(cfg, "label_aware_coupling", True))
+        batch_use_domain = bool(
+            isinstance(model, MixedGranularityE3GNN)
+            and (cfg.model.enable_qeq or cfg.model.enable_pme)
+            and (
+                not label_aware
+                or _batch_has_coupling_activity(batch, ELECTRIC_COUPLING_LABELS)
+            )
+        )
+        batch_use_polarization = bool(
+            isinstance(model, MixedGranularityE3GNN)
+            and cfg.model.enable_deq
+            and (
+                not label_aware
+                or _batch_has_coupling_activity(batch, POLARIZATION_COUPLING_LABELS)
+            )
+        )
+        batch_use_dispersion = bool(
+            isinstance(model, MixedGranularityE3GNN)
+            and cfg.model.enable_d4
+            and (
+                not label_aware
+                or _batch_has_coupling_activity(batch, DISPERSION_COUPLING_LABELS)
+            )
         )
         options: Dict[str, Any] = {
             "training": True,
             "compute_forces": need_forces,
+            "compute_stress": need_stress,
             "compute_bec": need_bec,
+            "compute_piezoelectric": need_piezoelectric,
+            "compute_stress_components": False,
+            "compute_magnetoelastic": need_magnetoelastic,
             "use_response_terms": use_response_terms,
-            "retain_graph": need_forces,
+            "retain_graph": bool(
+                need_forces
+                or need_stress
+                or need_piezoelectric
+                or need_magnetoelastic
+            ),
         }
         if isinstance(model, MixedGranularityE3GNN):
+            options["use_domain_terms"] = batch_use_domain
+            options["use_polarization_terms"] = batch_use_polarization
+            options["use_dispersion_terms"] = batch_use_dispersion
             options["use_spin_terms"] = batch_use_spin
+            options["label_aware_coupling"] = label_aware
         _prepare_retry_batch(batch)
         try:
             out = model(batch, **options)
@@ -13430,6 +14510,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         metrics: Dict[str, Any] = {
             "energy": (0.0, 0),
             "forces": (0.0, 0),
+            "stress": (0.0, 0),
             "extra": {},
         }
         try:
@@ -13469,6 +14550,23 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 )
                 metrics["forces"] = _masked_mae_statistics(
                     out["forces"], target_forces, force_weight
+                )
+            if need_stress:
+                target_stress = torch.as_tensor(
+                    batch.stress,
+                    dtype=out["stress"].dtype,
+                    device=out["stress"].device,
+                ).reshape_as(out["stress"])
+                stress_weight = _expanded_property_weight(
+                    batch, "stress", out["stress"], atomwise=False
+                )
+                loss = loss + float(cfg.w_stress) * _configured_stress_loss(
+                    out["stress"], target_stress, stress_weight, cfg
+                )
+                metrics["stress"] = _masked_mae_statistics(
+                    _symmetric_tensor_components(out["stress"]),
+                    _symmetric_tensor_components(target_stress),
+                    stress_weight,
                 )
             if need_mu:
                 target_mu = (
@@ -13540,31 +14638,82 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
     def _validation_batch_is_finite(batch: Any) -> None:
         """Probe validation numerics without changing metric accumulators."""
-        use_response_terms = cfg.mode != "base"
+        use_response_terms = _batch_uses_response_terms(batch, cfg)
         need_forces = bool(
             (cfg.w_forces > 0.0 or "forces" in _validation_targets)
             and _batch_has_label(batch, "forces")
         )
+        need_stress = bool(
+            (cfg.w_stress > 0.0 or "stress" in _validation_targets)
+            and _batch_has_label(batch, "stress")
+        )
         need_bec = bool(
-            (cfg.w_bec > 0.0 or "bec" in _validation_targets)
+            (cfg.w_bec > 0.0 or cfg.w_bec_sum_rule > 0.0 or "bec" in _validation_targets)
             and _batch_has_label(batch, "bec")
+        )
+        need_piezoelectric = bool(
+            (cfg.w_piezoelectric > 0.0 or "piezoelectric" in _validation_targets)
+            and _batch_has_label(batch, "piezoelectric")
+        )
+        need_magnetoelastic = bool(
+            (
+                cfg.w_magnetoelastic > 0.0
+                or "magnetoelastic_stress" in _validation_targets
+            )
+            and _batch_has_label(batch, "magnetoelastic_stress")
+            and _batch_has_label(batch, "reference_spins")
         )
         batch_use_spin = bool(
             isinstance(model, MixedGranularityE3GNN)
             and cfg.model.enable_spin
             and _batch_has_label(batch, "spins")
+            and _batch_has_coupling_activity(batch, SPIN_COUPLING_LABELS)
         )
+        label_aware = bool(getattr(cfg, "label_aware_coupling", True))
         options: Dict[str, Any] = {
             "training": False,
             "compute_forces": need_forces,
+            "compute_stress": need_stress,
             "compute_bec": need_bec,
+            "compute_piezoelectric": need_piezoelectric,
+            "compute_stress_components": False,
+            "compute_magnetoelastic": need_magnetoelastic,
             "use_response_terms": use_response_terms,
             "retain_graph": False,
         }
         if isinstance(model, MixedGranularityE3GNN):
+            options["use_domain_terms"] = bool(
+                (cfg.model.enable_qeq or cfg.model.enable_pme)
+                and (
+                    not label_aware
+                    or _batch_has_coupling_activity(batch, ELECTRIC_COUPLING_LABELS)
+                )
+            )
+            options["use_polarization_terms"] = bool(
+                cfg.model.enable_deq
+                and (
+                    not label_aware
+                    or _batch_has_coupling_activity(batch, POLARIZATION_COUPLING_LABELS)
+                )
+            )
+            options["use_dispersion_terms"] = bool(
+                cfg.model.enable_d4
+                and (
+                    not label_aware
+                    or _batch_has_coupling_activity(batch, DISPERSION_COUPLING_LABELS)
+                )
+            )
             options["use_spin_terms"] = batch_use_spin
+            options["label_aware_coupling"] = label_aware
         try:
-            with torch.set_grad_enabled(need_forces or need_bec or batch_use_spin):
+            with torch.set_grad_enabled(
+                need_forces
+                or need_stress
+                or need_bec
+                or need_piezoelectric
+                or need_magnetoelastic
+                or batch_use_spin
+            ):
                 probe = model(batch, **options)
         except Exception as exc:
             if _is_isolatable_numerical_exception(exc):
@@ -13861,6 +15010,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         model.train()
         train_loss = 0.0
         train_fmae_sum = 0.0;  train_fmae_n = 0
+        train_smae_sum = 0.0;  train_smae_n = 0
         train_emae_sum = 0.0;  train_emae_n = 0
         train_extra_metrics: Dict[str, List[float]] = {}
         n_steps = max(1, len(loader))
@@ -14013,10 +15163,13 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             for result in accepted_results:
                 energy_sum, energy_count = result["energy"]
                 force_sum, force_count = result["forces"]
+                stress_sum, stress_count = result["stress"]
                 train_emae_sum += float(energy_sum)
                 train_emae_n += int(energy_count)
                 train_fmae_sum += float(force_sum)
                 train_fmae_n += int(force_count)
+                train_smae_sum += float(stress_sum)
+                train_smae_n += int(stress_count)
                 for name, (value_sum, value_count) in result["extra"].items():
                     accumulator = train_extra_metrics.setdefault(name, [0.0, 0.0])
                     accumulator[0] += float(value_sum)
@@ -14055,6 +15208,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         val_loss = 0.0
         val_fmae_sum = 0.0;  val_fmae_n = 0
         val_emae_sum = 0.0;  val_emae_n = 0
+        val_smae_sum = 0.0;  val_smae_n = 0
         val_step = 0
         val_e_actual_buf: List[np.ndarray] = []
         val_e_pred_buf:   List[np.ndarray] = []
@@ -14091,7 +15245,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 })
             validation_ids = _batch_structure_ids(batch)
             batch = batch.to(device)
-            use_response_terms = (cfg.mode != "base")
+            use_response_terms = _batch_uses_response_terms(batch, cfg)
             need_energy = bool(
                 (cfg.w_energy > 0.0 or "energy" in _validation_targets)
                 and _batch_has_label(batch, "energy")
@@ -14099,6 +15253,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             need_forces = bool(
                 (cfg.w_forces > 0.0 or "forces" in _validation_targets)
                 and _batch_has_label(batch, "forces")
+            )
+            need_stress = bool(
+                (cfg.w_stress > 0.0 or "stress" in _validation_targets)
+                and _batch_has_label(batch, "stress")
             )
             need_mu = bool(
                 (cfg.w_dipole > 0.0 or "dipole" in _validation_targets)
@@ -14109,30 +15267,84 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 and _batch_has_label(batch, "polarizability")
             )
             need_bec = bool(
-                (cfg.w_bec > 0.0 or "bec" in _validation_targets)
+                (cfg.w_bec > 0.0 or cfg.w_bec_sum_rule > 0.0 or "bec" in _validation_targets)
                 and _batch_has_label(batch, "bec")
+            )
+            need_piezoelectric = bool(
+                (
+                    cfg.w_piezoelectric > 0.0
+                    or "piezoelectric" in _validation_targets
+                )
+                and _batch_has_label(batch, "piezoelectric")
+            )
+            need_magnetoelastic = bool(
+                (
+                    cfg.w_magnetoelastic > 0.0
+                    or "magnetoelastic_stress" in _validation_targets
+                )
+                and _batch_has_label(batch, "magnetoelastic_stress")
+                and _batch_has_label(batch, "reference_spins")
             )
             compute_forces = bool(need_forces)
             batch_use_spin = bool(
                 isinstance(model, MixedGranularityE3GNN)
                 and cfg.model.enable_spin
                 and _batch_has_label(batch, "spins")
+                and _batch_has_coupling_activity(batch, SPIN_COUPLING_LABELS)
             )
             need_internal_grad = bool(
                 compute_forces
+                or need_stress
                 or need_bec
+                or need_piezoelectric
+                or need_magnetoelastic
                 or batch_use_spin
             )
             with torch.set_grad_enabled(need_internal_grad):
                 forward_options = {
                     "training": False,
                     "compute_forces": compute_forces,
+                    "compute_stress": need_stress,
                     "compute_bec": need_bec,
+                    "compute_piezoelectric": need_piezoelectric,
+                    "compute_stress_components": False,
+                    "compute_magnetoelastic": need_magnetoelastic,
                     "use_response_terms": use_response_terms,
                     "retain_graph": False,
                 }
                 if isinstance(model, MixedGranularityE3GNN):
+                    label_aware = bool(
+                        getattr(cfg, "label_aware_coupling", True)
+                    )
+                    forward_options["use_domain_terms"] = bool(
+                        (cfg.model.enable_qeq or cfg.model.enable_pme)
+                        and (
+                            not label_aware
+                            or _batch_has_coupling_activity(
+                                batch, ELECTRIC_COUPLING_LABELS
+                            )
+                        )
+                    )
+                    forward_options["use_polarization_terms"] = bool(
+                        cfg.model.enable_deq
+                        and (
+                            not label_aware
+                            or _batch_has_coupling_activity(
+                                batch, POLARIZATION_COUPLING_LABELS
+                            )
+                        )
+                    )
+                    forward_options["use_dispersion_terms"] = bool(
+                        cfg.model.enable_d4
+                        and (
+                            not label_aware
+                            or _batch_has_coupling_activity(
+                                batch, DISPERSION_COUPLING_LABELS
+                            )
+                        )
+                    )
                     forward_options["use_spin_terms"] = batch_use_spin
+                    forward_options["label_aware_coupling"] = label_aware
                 batch, out = _validation_forward_with_quarantine(
                     batch,
                     options=forward_options,
@@ -14215,6 +15427,26 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                         val_f_pred_buf.append(_f_pred_labeled.cpu().numpy().ravel())
                         val_fn_actual_buf.append(_fn_true.cpu().numpy().ravel())
                         val_fn_pred_buf.append(_fn_pred.cpu().numpy().ravel())
+                if need_stress:
+                    y_s = torch.as_tensor(
+                        batch.stress,
+                        dtype=out["stress"].dtype,
+                        device=out["stress"].device,
+                    ).reshape_as(out["stress"])
+                    w_s = _expanded_property_weight(
+                        batch, "stress", out["stress"], atomwise=False
+                    )
+                    if float(cfg.w_stress) > 0.0:
+                        l = l + float(cfg.w_stress) * _configured_stress_loss(
+                            out["stress"], y_s, w_s, cfg
+                        )
+                    _sum, _count = _masked_mae_statistics(
+                        _symmetric_tensor_components(out["stress"]),
+                        _symmetric_tensor_components(y_s),
+                        w_s,
+                    )
+                    val_smae_sum += _sum
+                    val_smae_n += _count
                 if need_mu:
                     y_mu = batch.dipole.squeeze(1) if batch.dipole.ndim == 3 else batch.dipole
                     w_mu = _expanded_property_weight(batch, "dipole", out["dipole"], atomwise=False)
@@ -14255,6 +15487,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     "qeq_residual", "qeq_stability_shift", "deq_residual",
                     "deq_stability_shift",
                     "deq_iterations", "coupling_residual",
+                    "coupling_residual_electric", "coupling_residual_spin",
                 ):
                     if residual_name in out:
                         value = float(torch.max(torch.abs(out[residual_name].detach())).cpu())
@@ -14281,12 +15514,15 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         _final_val_loss = val_loss / float(val_batches_used)
         _final_val_fmae = (val_fmae_sum / val_fmae_n) if val_fmae_n > 0 else float("nan")
         _final_val_emae = (val_emae_sum / val_emae_n) if val_emae_n > 0 else float("nan")
+        _final_val_smae = (val_smae_sum / val_smae_n) if val_smae_n > 0 else float("nan")
         _final_val_fnorm_mae = (val_fnorm_mae_sum / val_fnorm_mae_n) if val_fnorm_mae_n > 0 else float("nan")
         validation_terms: List[float] = []
         if val_emae_n > 0:
             validation_terms.append(_final_val_emae / VALIDATION_MAE_SCALES["energy"])
         if val_fmae_n > 0:
             validation_terms.append(_final_val_fmae / VALIDATION_MAE_SCALES["forces"])
+        if val_smae_n > 0:
+            validation_terms.append(_final_val_smae / VALIDATION_MAE_SCALES["stress"])
         for metric_name, (metric_sum, metric_count) in val_extra_metrics.items():
             if metric_count > 0:
                 scale = VALIDATION_MAE_SCALES.get(metric_name, 1.0)
@@ -14333,6 +15569,11 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         if val_fmae_n > 0:
             _ep_str += (f"  F-MAE  tr={train_fmae_sum/max(1,train_fmae_n):.4f}"
                         f"  val={_final_val_fmae:.4f}  eV/Å")
+        if val_smae_n > 0:
+            _ep_str += (
+                f"  stress-MAE tr={train_smae_sum/max(1,train_smae_n):.4f}"
+                f" val={_final_val_smae:.4f} eV/Å^3"
+            )
         for metric_name in sorted(val_extra_metrics):
             val_sum, val_count = val_extra_metrics[metric_name]
             train_sum, train_count = train_extra_metrics.get(metric_name, [0.0, 0.0])
@@ -14684,6 +15925,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 "validation_score": float(_epoch_validation_score),
                 "energy_mae": float(_final_val_emae) if val_emae_n > 0 else None,
                 "force_mae": float(_final_val_fmae) if val_fmae_n > 0 else None,
+                "stress_mae": float(_final_val_smae) if val_smae_n > 0 else None,
                 "multitask_mae": {
                     name: float(total / count)
                     for name, (total, count) in val_extra_metrics.items()
@@ -14692,6 +15934,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 "validation_counts": {
                     **({"energy": int(val_emae_n)} if val_emae_n > 0 else {}),
                     **({"forces": int(val_fmae_n)} if val_fmae_n > 0 else {}),
+                    **({"stress": int(val_smae_n)} if val_smae_n > 0 else {}),
                     **{
                         name: int(count)
                         for name, (_total, count) in val_extra_metrics.items()
@@ -14811,10 +16054,12 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             "loss_weights": {
                 name: float(getattr(cfg, name))
                 for name in (
-                    "w_energy", "w_forces", "w_dipole", "w_polarizability",
+                    "w_energy", "w_forces", "w_stress", "w_piezoelectric",
+                    "w_magnetoelastic", "w_dipole", "w_polarizability",
                     "w_charges", "w_atomic_dipoles", "w_atomic_polarizability",
                     "w_c6", "w_bec", "w_magnetic_moments", "w_effective_field",
-                    "w_j", "w_di", "w_dmi",
+                    "w_j", "w_di", "w_dmi", "w_bec_sum_rule",
+                    "w_coupling_consistency",
                 )
             },
         },
@@ -14900,10 +16145,13 @@ def _deep_merge_config(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[st
 _GUI_TRAIN_DIRECT_FIELDS: Tuple[str, ...] = (
     "device", "cpu_threads", "dataset", "static_data", "response_data",
     "base_ckpt", "out_ckpt", "epochs", "lr", "batch_size", "val_fraction",
-    "seed", "w_energy", "w_forces", "force_loss", "force_huber_delta",
+    "seed", "w_energy", "w_forces", "w_stress", "w_piezoelectric",
+    "w_magnetoelastic", "force_loss",
+    "force_huber_delta", "stress_loss", "stress_huber_delta",
     "w_dipole", "w_polarizability", "w_charges", "w_atomic_dipoles",
     "w_atomic_polarizability", "w_c6", "w_bec", "w_magnetic_moments",
-    "w_effective_field", "w_j", "w_di", "w_dmi", "lr_scheduler",
+    "w_effective_field", "w_j", "w_di", "w_dmi", "w_bec_sum_rule",
+    "w_coupling_consistency", "label_aware_coupling", "lr_scheduler",
     "export_sevennet", "save_epoch_artifacts", "stream_hdf5",
     "cache_neighbor_graphs",
 )
@@ -15169,6 +16417,7 @@ def evaluate_checkpoint(
     label_specs = [
         ("energy", "energy", False),
         ("forces", "forces", True),
+        ("stress", "stress", False),
         ("dipole", "dipole", False),
         ("polarizability", "polarizability", False),
         ("charges", "charges", True),
@@ -15189,11 +16438,14 @@ def evaluate_checkpoint(
         "deq_residual": [],
         "deq_stability_shift": [],
         "coupling_residual": [],
+        "coupling_residual_electric": [],
+        "coupling_residual_spin": [],
         "charge_conservation": [],
     }
     for batch in loader:
         batch = batch.to(device)
         batch_has_forces = _batch_has_label(batch, "forces")
+        batch_has_stress = _batch_has_label(batch, "stress")
         batch_has_bec = _batch_has_label(batch, "bec")
         batch_has_spins = bool(
             isinstance(model, MixedGranularityE3GNN)
@@ -15204,6 +16456,7 @@ def evaluate_checkpoint(
             forward_options: Dict[str, Any] = {
                 "training": False,
                 "compute_forces": batch_has_forces,
+                "compute_stress": batch_has_stress,
                 "compute_bec": batch_has_bec,
                 "use_response_terms": True,
                 "retain_graph": False,
@@ -15221,6 +16474,9 @@ def evaluate_checkpoint(
             if target.numel() != prediction.numel():
                 continue
             target = target.reshape_as(prediction)
+            if target_name == "stress":
+                prediction = _symmetric_tensor_components(prediction)
+                target = _symmetric_tensor_components(target)
             weight = _expanded_property_weight(
                 batch, target_name, prediction, atomwise=atomwise
             ).detach()
@@ -15235,7 +16491,8 @@ def evaluate_checkpoint(
             item["count"] += float(torch.count_nonzero(expanded > 0.0).cpu())
         for name in (
             "qeq_residual", "qeq_stability_shift", "deq_residual",
-            "deq_stability_shift", "coupling_residual"
+            "deq_stability_shift", "coupling_residual",
+            "coupling_residual_electric", "coupling_residual_spin",
         ):
             if name in out:
                 residual_values[name].extend(
@@ -15373,6 +16630,64 @@ def run_physics_self_tests(*, seed: int = 7, output_json: Optional[str] = None) 
         finite_difference_force = -(e_plus - e_minus) / (2.0 * epsilon)
         autograd_force = float(base["forces"][0, 0].detach())
         charge_error = float(abs(torch.sum(base["charges"]).detach()))
+
+        periodic_cell = np.diag([6.0, 6.2, 6.4])
+        periodic_config = Configuration(
+            atomic_numbers=config.atomic_numbers,
+            positions=np.asarray([[0.7, 0.8, 0.9], [2.0, 1.6, 1.3]]),
+            properties={"field": np.zeros(3), "total_charge": 0.0},
+            property_weights={},
+            cell=periodic_cell,
+            pbc=(True, True, True),
+        )
+        periodic_graph = AtomicData.from_config(
+            periodic_config, z_table=z_table, cutoff=model_config.r_max
+        )
+        periodic_batch = _TGBatch.from_data_list([periodic_graph])
+        periodic_output = model(
+            periodic_batch,
+            training=False,
+            compute_forces=False,
+            compute_stress=True,
+            use_response_terms=False,
+            retain_graph=False,
+        )
+        predicted_stress = periodic_output["stress"][0].detach()
+
+        def _strained_energy(strain_xx: float) -> float:
+            deformation = np.eye(3)
+            deformation[0, 0] += float(strain_xx)
+            deformed = Configuration(
+                atomic_numbers=periodic_config.atomic_numbers,
+                positions=periodic_config.positions @ deformation.T,
+                properties=dict(periodic_config.properties),
+                property_weights={},
+                cell=periodic_cell @ deformation.T,
+                pbc=(True, True, True),
+            )
+            graph = AtomicData.from_config(
+                deformed,
+                z_table=z_table,
+                cutoff=model_config.r_max,
+                topology=(
+                    periodic_graph.edge_index.detach().cpu().numpy(),
+                    periodic_graph.shifts.detach().cpu().numpy()
+                    @ deformation.T,
+                ),
+            )
+            output = model(
+                _TGBatch.from_data_list([graph]),
+                training=False,
+                compute_forces=False,
+                compute_stress=False,
+                use_response_terms=False,
+            )
+            return float(output["energy"][0].detach())
+
+        strain_step = 2e-5
+        stress_fd_xx = (
+            _strained_energy(strain_step) - _strained_energy(-strain_step)
+        ) / (2.0 * strain_step * abs(float(np.linalg.det(periodic_cell))))
         checks = {
             "rotation_energy": _max_error(rotated["energy"], base["energy"]),
             "rotation_force": _max_error(rotated["forces"], rotation_force_target),
@@ -15388,9 +16703,22 @@ def run_physics_self_tests(*, seed: int = 7, output_json: Optional[str] = None) 
             ),
             "charge_conservation": charge_error,
             "force_finite_difference": abs(finite_difference_force - autograd_force),
+            "stress_finite_difference": abs(
+                stress_fd_xx - float(predicted_stress[0, 0])
+            ),
+            "stress_symmetry": _max_error(
+                predicted_stress, predicted_stress.T
+            ),
             "qeq_residual": float(torch.max(base["qeq_residual"]).detach()),
         }
-        thresholds = {name: (2e-5 if name == "force_finite_difference" else 2e-8) for name in checks}
+        thresholds = {
+            name: (
+                2e-5
+                if name in {"force_finite_difference", "stress_finite_difference"}
+                else 2e-8
+            )
+            for name in checks
+        }
         passed = {name: bool(value <= thresholds[name]) for name, value in checks.items()}
         report = {
             "schema": "e3mu-self-test-v1",
@@ -15673,6 +17001,8 @@ class App(tk.Tk):
         self.var_lr_scheduler = tk.StringVar(value="flat")
         self.var_force_loss = tk.StringVar(value="mse")
         self.var_force_huber_delta = tk.StringVar(value="1.0")
+        self.var_stress_loss = tk.StringVar(value="huber")
+        self.var_stress_huber_delta = tk.StringVar(value="0.05")
         self.var_rmax = tk.StringVar(value="5.0")
         self.var_channels = tk.StringVar(value="64")
         self.var_interactions = tk.StringVar(value="2")
@@ -15681,6 +17011,9 @@ class App(tk.Tk):
         
         self.var_we = tk.StringVar(value="1.0")
         self.var_wf = tk.StringVar(value="10.0")
+        self.var_ws = tk.StringVar(value="0.0")
+        self.var_w_piezoelectric = tk.StringVar(value="0.0")
+        self.var_w_magnetoelastic = tk.StringVar(value="0.0")
         self.var_wmu = tk.StringVar(value="0.0")
         self.var_walpha = tk.StringVar(value="0.0")
         self.var_w_charges = tk.StringVar(value="0.0")
@@ -15693,6 +17026,9 @@ class App(tk.Tk):
         self.var_w_j = tk.StringVar(value="0.0")
         self.var_w_di = tk.StringVar(value="0.0")
         self.var_w_dmi = tk.StringVar(value="0.0")
+        self.var_w_bec_sum_rule = tk.StringVar(value="0.0")
+        self.var_w_coupling_consistency = tk.StringVar(value="0.0")
+        self.var_label_aware_coupling = tk.BooleanVar(value=True)
         
         self.var_export_sevennet = tk.BooleanVar(value=True)
         self.var_save_epoch_artifacts = tk.BooleanVar(value=True)
@@ -16689,7 +18025,9 @@ class App(tk.Tk):
                 ("Learning rate", self.var_lr, "entry", None),
                 ("Schedule", self.var_lr_scheduler, "combo", ["flat", "cosine"]),
                 ("Force loss", self.var_force_loss, "combo", ["mse", "huber"]),
-                ("Huber delta", self.var_force_huber_delta, "entry", None),
+                ("Force Huber delta", self.var_force_huber_delta, "entry", None),
+                ("Stress loss", self.var_stress_loss, "combo", ["mse", "huber"]),
+                ("Stress Huber delta", self.var_stress_huber_delta, "entry", None),
                 ("Device", self.var_device, "combo", ["auto", "cpu", "mps", "cuda"]),
                 (
                     "CPU threads",
@@ -16771,6 +18109,9 @@ class App(tk.Tk):
             [
                 ("Energy", self.var_we, "entry", None),
                 ("Forces", self.var_wf, "entry", None),
+                ("Stress", self.var_ws, "entry", None),
+                ("Piezoelectric", self.var_w_piezoelectric, "entry", None),
+                ("Magnetoelastic", self.var_w_magnetoelastic, "entry", None),
                 ("Dipole", self.var_wmu, "entry", None),
                 ("Polarizability", self.var_walpha, "entry", None),
                 ("Charges", self.var_w_charges, "entry", None),
@@ -16778,6 +18119,8 @@ class App(tk.Tk):
                 ("Atomic polarizability", self.var_w_atomic_polarizability, "entry", None),
                 ("C6", self.var_w_c6, "entry", None),
                 ("BEC", self.var_w_bec, "entry", None),
+                ("BEC sum rule", self.var_w_bec_sum_rule, "entry", None),
+                ("Coupling consistency", self.var_w_coupling_consistency, "entry", None),
                 ("Magnetic moments", self.var_w_magnetic_moments, "entry", None),
                 ("Effective spin field", self.var_w_effective_field, "entry", None),
                 ("J effective", self.var_w_j, "entry", None),
@@ -16857,6 +18200,16 @@ class App(tk.Tk):
                 ("Coupling tolerance", self.var_coupling_tol, "entry", None),
             ],
         )
+        _MacaronToggle(
+            solver_card,
+            text="Label-aware coupling",
+            variable=self.var_label_aware_coupling,
+            width=190,
+            background=palette["lavender"],
+            fill="#fbf9fe",
+            hover_fill="#e2d8f0",
+            selected_fill="#9b86c8",
+        ).pack(anchor="w", pady=(7, 0))
 
         search_root = self._make_page_scroll(self._settings_pages["Search"], palette["bg"])
         search_card = self._make_settings_card(
@@ -17439,6 +18792,7 @@ class App(tk.Tk):
             for key, label, color in (
                 ("energy_mae", "Energy MAE", colors["energy"]),
                 ("force_mae", "Force MAE", colors["forces"]),
+                ("stress_mae", "Stress MAE", colors["residual"]),
                 ("validation_score", "Normalized score", colors["score"]),
             ):
                 x, y = self._finite_history_values(history, key)
@@ -17577,6 +18931,7 @@ class App(tk.Tk):
                 self.var_w_charges,
                 self.var_w_atomic_dipoles,
                 self.var_w_atomic_polarizability,
+                self.var_w_piezoelectric,
             )
         )
         spin_supervised = any(
@@ -17587,6 +18942,7 @@ class App(tk.Tk):
                 self.var_w_j,
                 self.var_w_di,
                 self.var_w_dmi,
+                self.var_w_magnetoelastic,
             )
         )
         required_switches: Dict[str, bool] = {
@@ -17679,8 +19035,13 @@ class App(tk.Tk):
             "seed": int(self.var_seed.get()),
             "w_energy": float(self.var_we.get()),
             "w_forces": float(self.var_wf.get()),
+            "w_stress": float(self.var_ws.get()),
+            "w_piezoelectric": float(self.var_w_piezoelectric.get()),
+            "w_magnetoelastic": float(self.var_w_magnetoelastic.get()),
             "force_loss": str(self.var_force_loss.get()),
             "force_huber_delta": float(self.var_force_huber_delta.get()),
+            "stress_loss": str(self.var_stress_loss.get()),
+            "stress_huber_delta": float(self.var_stress_huber_delta.get()),
             "w_dipole": float(self.var_wmu.get()),
             "w_polarizability": float(self.var_walpha.get()),
             "w_charges": float(self.var_w_charges.get()),
@@ -17693,6 +19054,9 @@ class App(tk.Tk):
             "w_j": float(self.var_w_j.get()),
             "w_di": float(self.var_w_di.get()),
             "w_dmi": float(self.var_w_dmi.get()),
+            "w_bec_sum_rule": float(self.var_w_bec_sum_rule.get()),
+            "w_coupling_consistency": float(self.var_w_coupling_consistency.get()),
+            "label_aware_coupling": bool(self.var_label_aware_coupling.get()),
             "lr_scheduler": str(self.var_lr_scheduler.get()),
             "export_sevennet": bool(self.var_export_sevennet.get()),
             "save_epoch_artifacts": bool(self.var_save_epoch_artifacts.get()),
@@ -17707,6 +19071,7 @@ class App(tk.Tk):
                 "w_dipole", "w_polarizability", "w_charges", "w_atomic_dipoles",
                 "w_atomic_polarizability", "w_c6", "w_bec", "w_magnetic_moments",
                 "w_effective_field", "w_j", "w_di", "w_dmi",
+                "w_bec_sum_rule", "w_coupling_consistency",
             ):
                 values[name] = 0.0
         return values
@@ -17926,8 +19291,13 @@ class App(tk.Tk):
     _PARAM_TO_VAR: Dict[str, str] = {
         "w_energy":            "var_we",
         "w_forces":            "var_wf",
+        "w_stress":            "var_ws",
+        "w_piezoelectric":     "var_w_piezoelectric",
+        "w_magnetoelastic":    "var_w_magnetoelastic",
         "force_loss":          "var_force_loss",
         "force_huber_delta":   "var_force_huber_delta",
+        "stress_loss":         "var_stress_loss",
+        "stress_huber_delta":  "var_stress_huber_delta",
         "w_dipole":            "var_wmu",
         "w_polarizability":    "var_walpha",
         "w_charges":           "var_w_charges",
@@ -17940,6 +19310,9 @@ class App(tk.Tk):
         "w_j":                 "var_w_j",
         "w_di":                "var_w_di",
         "w_dmi":               "var_w_dmi",
+        "w_bec_sum_rule":      "var_w_bec_sum_rule",
+        "w_coupling_consistency": "var_w_coupling_consistency",
+        "label_aware_coupling": "var_label_aware_coupling",
         "lr":                  "var_lr",
         "batch_size":          "var_bs",
         "r_max":               "var_rmax",
@@ -18533,6 +19906,27 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "Forces are -dE/dR and provide three local derivatives per atom.",
         "1-100; start near 10 when energy is weighted 1.",
     ),
+    "w_stress": _p(
+        "Stress loss weight",
+        "Weights conservative periodic Cauchy-stress supervision.",
+        "Stress is the symmetric homogeneous cell-strain derivative of the same energy used for forces, divided by cell volume.",
+        "0 disables it; start around 1-10 for audited eV/Angstrom^3 labels and tune against held-out elastic response.",
+        "Only fully periodic, nonsingular cells with stress labels contribute.",
+    ),
+    "w_piezoelectric": _p(
+        "Piezoelectric loss weight",
+        "Weights the clamped-ion electromechanical tensor in C/m^2.",
+        "The tensor is the mixed strain-field derivative of the same electric enthalpy used for L2 energy and stress, using VASP's XX YY ZZ XY YZ ZX convention expanded to e_i,jk.",
+        "0 disables it; start around 0.01-1 only for same-method periodic DFPT labels.",
+        "Requires a fully periodic cell and an active electric-response mechanism.",
+    ),
+    "w_magnetoelastic": _p(
+        "Magnetoelastic loss weight",
+        "Weights the stress difference between matched target and reference spin states.",
+        "Both states are evaluated with the complete coupled Hamiltonian so spin-induced FiLM, charge, polarization, and dispersion feedback remain in the strain derivative.",
+        "0 disables it; tune only after grouped same-geometry, same-method spin-pair coverage is available.",
+        "Requires spins, reference_spins, and a fully periodic paired DFT stress difference on the same record.",
+    ),
     "force_loss": _p(
         "Force loss",
         "Chooses squared error or an outlier-robust Huber objective for force training.",
@@ -18545,6 +19939,19 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "Errors below delta retain the quadratic MSE curvature; larger errors have bounded slope.",
         "Usually 0.5-2.0 eV/Angstrom; start at 1.0 after inspecting the force distribution.",
         "Available only when Force loss is set to huber.",
+    ),
+    "stress_loss": _p(
+        "Stress loss",
+        "Chooses squared error or an outlier-robust Huber objective over six symmetric stress components.",
+        "Both choices retain energy-force-stress consistency because the predicted tensor is an energy derivative.",
+        "Use Huber while combining heterogeneous periodic sources; use MSE after sign, unit, and tail audits.",
+    ),
+    "stress_huber_delta": _p(
+        "Huber stress delta",
+        "Sets the stress-error threshold where the robust objective becomes linear.",
+        "It is applied in eV/Angstrom^3 to xx, yy, zz, yz, xz, and xy.",
+        "Usually 0.02-0.10 eV/Angstrom^3; default 0.05.",
+        "Available only when Stress loss is set to huber.",
     ),
     "w_dipole": _p(
         "Dipole loss weight",
@@ -18592,6 +19999,20 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "BEC is a mixed field-displacement derivative evaluated by autograd.",
         "1e-3-10; begin near 0.1 after dipole learning is stable.",
         "Requires BEC labels; its second derivatives increase memory cost.",
+    ),
+    "w_bec_sum_rule": _p(
+        "BEC acoustic sum-rule weight",
+        "Penalizes the graph sum of predicted Born effective charges.",
+        "Translational invariance requires the summed BEC tensor to vanish; normalization by sqrt(N) keeps stochastic error scale comparable across cells.",
+        "Start at 0.001-0.1 after direct BEC supervision is stable.",
+        "Requires BEC labels.",
+    ),
+    "w_coupling_consistency": _p(
+        "Coupling consistency weight",
+        "Penalizes residual change across active electric and spin FiLM feedback passes.",
+        "Only mechanisms associated with labels or explicit field, charge, and spin state are active for each graph.",
+        "Start at 1e-4-0.01; keep it auxiliary to observable losses.",
+        "Most useful with FiLM and at least two coupling passes.",
     ),
     "w_magnetic_moments": _p(
         "Magnetic-moment loss weight",
@@ -18822,6 +20243,12 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "1e-7-1e-3; default 1e-5.",
         "Used only by FiLM.",
     ),
+    "label_aware_coupling": _p(
+        "Label-aware L1/L2/L3 coupling",
+        "Activates electric, polarization, dispersion, and spin mechanisms only on graphs carrying associated supervision or explicit physical state.",
+        "This prevents sparse response branches from perturbing L1-only foundation batches and enables a ground-only fast path.",
+        "Keep enabled for mixed Plus/Max training; disable only for controlled fully coupled ablations.",
+    ),
     "auto_level": _p(
         "AutoSearch level",
         "Chooses cumulative loss, backbone, cascade, and active-physics search dimensions.",
@@ -18887,8 +20314,13 @@ GUI_DEFAULTS = {
     "w_alpha_final": "0.0",
     "w_energy": "1.0",
     "w_forces": "10.0",
+    "w_stress": "0.0",
+    "w_piezoelectric": "0.0",
+    "w_magnetoelastic": "0.0",
     "force_loss": "mse",
     "force_huber_delta": "1.0",
+    "stress_loss": "huber",
+    "stress_huber_delta": "0.05",
     "w_dipole": "0.0",
     "w_polarizability": "0.0",
     "w_charges": "0.0",
@@ -18896,6 +20328,9 @@ GUI_DEFAULTS = {
     "w_atomic_polarizability": "0.0",
     "w_c6": "0.0",
     "w_bec": "0.0",
+    "w_bec_sum_rule": "0.0",
+    "w_coupling_consistency": "0.0",
+    "label_aware_coupling": True,
     "w_magnetic_moments": "0.0",
     "w_effective_field": "0.0",
     "w_j": "0.0",
@@ -18974,6 +20409,7 @@ GUI_NUMERIC_RULES: Dict[str, GUINumericRule] = {
     "batch_size": _int_rule(1),
     "lr": _float_rule(0.0, minimum_inclusive=False),
     "force_huber_delta": _float_rule(0.0, minimum_inclusive=False),
+    "stress_huber_delta": _float_rule(0.0, minimum_inclusive=False),
     "r_max": _float_rule(0.0, minimum_inclusive=False),
     "num_channels": _int_rule(1),
     "num_interactions": _int_rule(1),
@@ -18991,6 +20427,9 @@ GUI_NUMERIC_RULES: Dict[str, GUINumericRule] = {
     "w_alpha_final": _float_rule(0.0),
     "w_energy": _float_rule(0.0),
     "w_forces": _float_rule(0.0),
+    "w_stress": _float_rule(0.0),
+    "w_piezoelectric": _float_rule(0.0),
+    "w_magnetoelastic": _float_rule(0.0),
     "w_dipole": _float_rule(0.0),
     "w_polarizability": _float_rule(0.0),
     "w_charges": _float_rule(0.0),
@@ -18998,6 +20437,8 @@ GUI_NUMERIC_RULES: Dict[str, GUINumericRule] = {
     "w_atomic_polarizability": _float_rule(0.0),
     "w_c6": _float_rule(0.0),
     "w_bec": _float_rule(0.0),
+    "w_bec_sum_rule": _float_rule(0.0),
+    "w_coupling_consistency": _float_rule(0.0),
     "w_magnetic_moments": _float_rule(0.0),
     "w_effective_field": _float_rule(0.0),
     "w_j": _float_rule(0.0),
@@ -19093,8 +20534,13 @@ LEGACY_TK_VARIABLES = {
     "w_alpha_final": "var_w_alpha_final",
     "w_energy": "var_we",
     "w_forces": "var_wf",
+    "w_stress": "var_ws",
+    "w_piezoelectric": "var_w_piezoelectric",
+    "w_magnetoelastic": "var_w_magnetoelastic",
     "force_loss": "var_force_loss",
     "force_huber_delta": "var_force_huber_delta",
+    "stress_loss": "var_stress_loss",
+    "stress_huber_delta": "var_stress_huber_delta",
     "w_dipole": "var_wmu",
     "w_polarizability": "var_walpha",
     "w_charges": "var_w_charges",
@@ -19107,6 +20553,9 @@ LEGACY_TK_VARIABLES = {
     "w_j": "var_w_j",
     "w_di": "var_w_di",
     "w_dmi": "var_w_dmi",
+    "w_bec_sum_rule": "var_w_bec_sum_rule",
+    "w_coupling_consistency": "var_w_coupling_consistency",
+    "label_aware_coupling": "var_label_aware_coupling",
     "e3mu_use_parity": "var_e3mu_use_parity",
     "e3mu_use_l3": "var_e3mu_use_l3",
     "rbf_type": "var_rbf_type",
@@ -19146,6 +20595,9 @@ LEGACY_TK_VARIABLES = {
 AUTOSEARCH_TO_GUI = {
     "w_energy": "w_energy",
     "w_forces": "w_forces",
+    "w_stress": "w_stress",
+    "w_piezoelectric": "w_piezoelectric",
+    "w_magnetoelastic": "w_magnetoelastic",
     "w_dipole": "w_dipole",
     "w_polarizability": "w_polarizability",
     "w_charges": "w_charges",
@@ -19162,6 +20614,8 @@ AUTOSEARCH_TO_GUI = {
     "batch_size": "batch_size",
     "force_loss": "force_loss",
     "force_huber_delta": "force_huber_delta",
+    "stress_loss": "stress_loss",
+    "stress_huber_delta": "stress_huber_delta",
     "r_max": "r_max",
     "num_channels": "num_channels",
     "num_interactions": "num_interactions",
@@ -19831,7 +21285,9 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 ("lr", "Learning rate", None),
                 ("lr_scheduler", "Schedule", ("flat", "cosine")),
                 ("force_loss", "Force loss", ("mse", "huber")),
-                ("force_huber_delta", "Huber delta", None),
+                ("force_huber_delta", "Force Huber delta", None),
+                ("stress_loss", "Stress loss", ("mse", "huber")),
+                ("stress_huber_delta", "Stress Huber delta", None),
                 ("device", "Device", ("auto", "cpu", "mps", "cuda")),
                 (
                     "cpu_threads",
@@ -19894,6 +21350,9 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         specs = (
             ("w_energy", "Energy", None),
             ("w_forces", "Forces", None),
+            ("w_stress", "Stress", None),
+            ("w_piezoelectric", "Piezoelectric", None),
+            ("w_magnetoelastic", "Magnetoelastic", None),
             ("w_dipole", "Dipole", None),
             ("w_polarizability", "Polarizability", None),
             ("w_charges", "Charges", None),
@@ -19901,6 +21360,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             ("w_atomic_polarizability", "Atomic polarizability", None),
             ("w_c6", "C6", None),
             ("w_bec", "BEC", None),
+            ("w_bec_sum_rule", "BEC sum rule", None),
+            ("w_coupling_consistency", "Coupling consistency", None),
             ("w_magnetic_moments", "Magnetic moments", None),
             ("w_effective_field", "Effective spin field", None),
             ("w_j", "J effective", None),
@@ -19994,6 +21455,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 ("coupling_iterations", "Coupling iterations", None),
                 ("coupling_tol", "Coupling tolerance", None),
             ),
+        )
+        solver.body_layout.addWidget(
+            self._make_toggle_tile(
+                "label_aware_coupling", "Label-aware L1/L2/L3 coupling"
+            )
         )
         layout.addWidget(solver)
 
@@ -20574,6 +22040,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             search_dependencies = {
                 "r_max", "num_channels", "num_interactions", "num_radial_basis",
                 "field_scale", "lr", "batch_size", "force_loss", "force_huber_delta",
+                "stress_loss", "stress_huber_delta",
                 "qeq_smearing",
                 "qeq_hardness_min", "qeq_pme_smearing",
                 "qeq_pme_lr_wavelength", "qeq_stability_floor",
@@ -20595,6 +22062,20 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     else:
                         self._control_disabled_reasons["force_huber_delta"] = (
                             "Huber delta is used only when Force loss is huber."
+                        )
+                self._refresh_tooltips()
+            if key == "stress_loss":
+                row = self.field_rows.get("stress_huber_delta")
+                if row is not None:
+                    enabled = str(self.value("stress_loss")).lower() == "huber"
+                    row.setEnabled(enabled)
+                    if enabled:
+                        self._control_disabled_reasons.pop(
+                            "stress_huber_delta", None
+                        )
+                    else:
+                        self._control_disabled_reasons["stress_huber_delta"] = (
+                            "Stress Huber delta is used only when Stress loss is huber."
                         )
                 self._refresh_tooltips()
             if key == "live_plot":
@@ -20792,6 +22273,17 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             else:
                 self._control_disabled_reasons["force_huber_delta"] = (
                     "Huber delta is used only when Force loss is huber."
+                )
+
+        stress_delta_row = self.field_rows.get("stress_huber_delta")
+        if stress_delta_row is not None:
+            huber_enabled = str(self.value("stress_loss")).lower() == "huber"
+            stress_delta_row.setEnabled(huber_enabled)
+            if huber_enabled:
+                self._control_disabled_reasons.pop("stress_huber_delta", None)
+            else:
+                self._control_disabled_reasons["stress_huber_delta"] = (
+                    "Stress Huber delta is used only when Stress loss is huber."
                 )
 
         active = [
@@ -21039,8 +22531,13 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             "seed": int(values["seed"]),
             "w_energy": float(values["w_energy"]),
             "w_forces": float(values["w_forces"]),
+            "w_stress": float(values["w_stress"]),
+            "w_piezoelectric": float(values["w_piezoelectric"]),
+            "w_magnetoelastic": float(values["w_magnetoelastic"]),
             "force_loss": str(values["force_loss"]),
             "force_huber_delta": float(values["force_huber_delta"]),
+            "stress_loss": str(values["stress_loss"]),
+            "stress_huber_delta": float(values["stress_huber_delta"]),
             "w_dipole": float(values["w_dipole"]),
             "w_polarizability": float(values["w_polarizability"]),
             "w_charges": float(values["w_charges"]),
@@ -21053,6 +22550,9 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             "w_j": float(values["w_j"]),
             "w_di": float(values["w_di"]),
             "w_dmi": float(values["w_dmi"]),
+            "w_bec_sum_rule": float(values["w_bec_sum_rule"]),
+            "w_coupling_consistency": float(values["w_coupling_consistency"]),
+            "label_aware_coupling": bool(values["label_aware_coupling"]),
             "lr_scheduler": str(values["lr_scheduler"]),
             "export_sevennet": bool(values["export_sevennet"]),
             "save_epoch_artifacts": bool(values["save_epoch_artifacts"]),
@@ -21067,6 +22567,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 "w_dipole", "w_polarizability", "w_charges", "w_atomic_dipoles",
                 "w_atomic_polarizability", "w_c6", "w_bec", "w_magnetic_moments",
                 "w_effective_field", "w_j", "w_di", "w_dmi",
+                "w_bec_sum_rule", "w_coupling_consistency",
             ):
                 result[key] = 0.0
         return result
@@ -22320,6 +23821,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             metric_styles = (
                 ("energy_mae", "E-MAE", "-"),
                 ("force_mae", "F-MAE", "--"),
+                ("stress_mae", "Stress-MAE", "-."),
                 ("validation_score", "Score", ":"),
             )
             for index, (stage_id, stage_history) in enumerate(stage_groups):
@@ -22692,6 +24194,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--lr", type=float)
     train_parser.add_argument("--force-loss", choices=("mse", "huber"))
     train_parser.add_argument("--force-huber-delta", type=float)
+    train_parser.add_argument("--stress-loss", choices=("mse", "huber"))
+    train_parser.add_argument("--stress-huber-delta", type=float)
     train_parser.add_argument("--val-fraction", type=float)
     train_parser.add_argument("--seed", type=int)
     train_parser.add_argument("--r-max", type=float)
@@ -22699,14 +24203,21 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--interactions", type=int)
     train_parser.add_argument("--radial-basis", type=int)
     for name in (
-        "energy", "forces", "dipole", "polarizability", "charges",
+        "energy", "forces", "stress", "piezoelectric", "magnetoelastic",
+        "dipole", "polarizability", "charges",
         "atomic-dipoles", "atomic-polarizability", "c6", "bec",
         "magnetic-moments", "effective-field", "j", "di", "dmi",
+        "bec-sum-rule", "coupling-consistency",
     ):
         train_parser.add_argument(f"--w-{name}", type=float)
     for name in ("qeq", "pme", "deq", "d4", "spin", "film", "dmi"):
         train_parser.add_argument(f"--enable-{name}", action="store_true")
     train_parser.add_argument("--enable-all-physics", action="store_true")
+    train_parser.add_argument(
+        "--no-label-aware-coupling",
+        action="store_true",
+        help="Run every configured response mechanism on every Response/Joint graph",
+    )
     train_parser.add_argument("--no-epoch-artifacts", action="store_true")
     train_parser.add_argument("--no-sevennet", action="store_true")
     train_parser.add_argument(
@@ -22753,7 +24264,8 @@ def _cli_train(args: argparse.Namespace) -> Dict[str, Any]:
     direct_names = (
         "dataset", "static_data", "response_data", "mode", "base_ckpt", "out_ckpt",
         "device", "cpu_threads", "epochs", "batch_size", "lr", "force_loss",
-        "force_huber_delta", "val_fraction", "seed",
+        "force_huber_delta", "stress_loss", "stress_huber_delta",
+        "val_fraction", "seed",
     )
     for name in direct_names:
         value = getattr(args, name, None)
@@ -22781,6 +24293,9 @@ def _cli_train(args: argparse.Namespace) -> Dict[str, Any]:
     weight_mapping = {
         "energy": "w_energy",
         "forces": "w_forces",
+        "stress": "w_stress",
+        "piezoelectric": "w_piezoelectric",
+        "magnetoelastic": "w_magnetoelastic",
         "dipole": "w_dipole",
         "polarizability": "w_polarizability",
         "charges": "w_charges",
@@ -22793,11 +24308,15 @@ def _cli_train(args: argparse.Namespace) -> Dict[str, Any]:
         "j": "w_j",
         "di": "w_di",
         "dmi": "w_dmi",
+        "bec_sum_rule": "w_bec_sum_rule",
+        "coupling_consistency": "w_coupling_consistency",
     }
     for argument_name, config_name in weight_mapping.items():
         value = getattr(args, f"w_{argument_name}", None)
         if value is not None:
             payload[config_name] = value
+    if args.no_label_aware_coupling:
+        payload["label_aware_coupling"] = False
     if args.no_epoch_artifacts:
         payload["save_epoch_artifacts"] = False
     if args.no_sevennet:
