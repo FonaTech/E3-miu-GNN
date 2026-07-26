@@ -16,6 +16,7 @@ classDiagram
     class SelfConsistentPolarization
     class D4DispersionLayer
     class TimeReversalSpinHamiltonian
+    class WavefunctionHamiltonianHead
     class DualLayerFieldModel
     class MixedGranularityE3GNN
 
@@ -24,6 +25,7 @@ classDiagram
     BackupResponseModel *-- FastEquivariantCoreO3
     DualLayerFieldModel *-- BackupGroundModel
     DualLayerFieldModel *-- BackupResponseModel
+    DualLayerFieldModel *-- WavefunctionHamiltonianHead
     MixedGranularityE3GNN --|> DualLayerFieldModel
     MixedGranularityE3GNN *-- DifferentiableQEq
     MixedGranularityE3GNN *-- SelfConsistentPolarization
@@ -42,6 +44,7 @@ classDiagram
 | Induced-dipole equilibrium | `SelfConsistentPolarization` |
 | Molecular dispersion | `D4DispersionLayer` |
 | Magnetic Hamiltonian | `TimeReversalSpinHamiltonian` |
+| Aligned electronic Hamiltonian auxiliary head | `WavefunctionHamiltonianHead` |
 | Two-branch baseline | `DualLayerFieldModel` |
 | Complete L1-L3 coupled model | `MixedGranularityE3GNN` |
 
@@ -76,6 +79,7 @@ flowchart TB
         RH --> Q[QEq / Ewald]
         RH --> P[Polarization]
         RH --> D4[D4]
+        RH --> WH[Electronic WALoss head]
     end
 
     subgraph L3[Layer 3: spin]
@@ -94,6 +98,7 @@ flowchart TB
     SH --> H
     E --> H
     H --> O[Energy and derivative observables]
+    WH --> WO[Fixed-basis orbital Hamiltonian]
 ```
 
 ## Layer 1 representation
@@ -188,6 +193,19 @@ typed:
 - polar features produce permanent atomic dipoles;
 - $`L=2`$ features produce the anisotropic polarizability tensor; and
 - axial features condition DMI in the spin layer.
+
+An optional `WavefunctionHamiltonianHead` pools shared Response scalar features
+per graph and predicts the lower-triangular degrees of freedom of a fixed
+$`K\times K`$ matrix. A fixed symmetric basis mirrors the off-diagonal entries,
+so `orbital_hamiltonian` is exactly real symmetric by construction. WALoss then
+uses reference eigenvectors only for the training-space basis transformation;
+the forward model does not run an eigensolver.
+
+This electronic auxiliary matrix is intentionally separate from
+`TimeReversalSpinHamiltonian`. The former represents a user-defined aligned
+orbital/Wannier subspace; the latter parameterizes $`J`$, single-ion anisotropy,
+and optional DMI for classical spins. Enabling WALoss never reinterprets spin
+labels as orbital labels.
 
 The branch separation permits base-only training, frozen-ground response
 training, and joint fine-tuning without conflating field-free energy with

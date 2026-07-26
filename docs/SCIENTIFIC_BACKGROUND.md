@@ -55,6 +55,33 @@ flowchart LR
     H --> O[Energy and derivative observables]
 ```
 
+## From Hamiltonian error to orbital-state error
+
+Learning a Hamiltonian is not identical to fitting unrelated scalar labels. Its
+eigenvalues and eigenspaces are collective properties of the whole matrix. If
+$`\widehat H=H^*+\Delta H`$, eigenvalue errors are bounded by the spectral norm
+of $`\Delta H`$, while first-order mixing between two nondegenerate reference
+states is proportional to
+
+```math
+\frac{\langle u_j^*|\Delta H|u_i^*\rangle}
+{\epsilon_i^*-\epsilon_j^*}.
+```
+
+Thus many small entry errors can accumulate in the matrix norm, and a small
+off-diagonal error can rotate states strongly near a narrow gap. The implemented
+wavefunction alignment loss (WALoss) addresses this by transforming the
+predicted electronic Hamiltonian into the *reference* eigenspace. Diagonal
+residuals then measure orbital-energy errors, while off-diagonal residuals
+measure undesired mixing of reference states.
+
+This is a physics-informed auxiliary objective, not an electronic-structure
+solver. It requires upstream Hamiltonians and eigenvectors in one consistently
+ordered and gauge-aligned orbital or Wannier subspace. The existing Neo release
+does not contain those optional labels, so the mechanism is code-complete but
+awaits a compatible electronic dataset for scientific calibration. The full
+derivation and limitations are in [Physical mechanisms](PHYSICS.md#wavefunction-alignment-and-electronic-hamiltonian).
+
 ## Local machine-learning interatomic potentials
 
 A conventional local potential decomposes the energy into atomic

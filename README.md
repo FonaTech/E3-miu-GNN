@@ -1,8 +1,9 @@
 # Mixed-Granularity E(3)-mu-GNN
 
 An E(3)-equivariant atomistic graph neural network that couples local chemical
-interactions, differentiable electrostatic and polarization physics, and a
-time-reversal-aware spin Hamiltonian in one trainable model.
+interactions, differentiable electrostatic and polarization physics, a
+time-reversal-aware spin Hamiltonian, and optional wavefunction-aligned
+electronic Hamiltonian supervision in one trainable model.
 
 > **Research status.** The three-layer architecture, canonical data pipeline,
 > training system, PyQt6 interface, and deterministic physics tests are
@@ -22,7 +23,9 @@ architecture.*
 - **Layer 2 - domain response:** constrained differentiable QEq, periodic
   Ewald/PME through `torch-pme`, Thole-damped self-consistent polarization,
   molecular DFT-D4, dipoles, polarizabilities, charges, C6, and Born effective
-  charges.
+  charges. An optional fixed-dimension real-symmetric electronic Hamiltonian
+  head supports wavefunction alignment loss (WALoss) in a declared
+  orbital/Wannier subspace.
 - **Layer 3 - magnetic response:** geometry-conditioned Heisenberg exchange,
   traceless single-ion anisotropy, optional Dzyaloshinskii-Moriya interaction,
   magnetic moments, and effective spin fields.
@@ -32,12 +35,13 @@ architecture.*
 - **Training and evaluation:** mask-aware mixed-label losses, group-safe fixed
   splits, staged base/response/joint training, normalized multi-task model
   selection, conservative cell-strain stress, BEC sum-rule and coupling
-  constraints, live plots, memory diagnostics, safe checkpoints, and a
+  constraints, diagonal/off-diagonal WALoss diagnostics, live plots, memory
+  diagnostics, safe checkpoints, and a
   dataset-aware Auto Research workflow with paired one-factor sensitivity
   screening, physical-group local refinement, and independent confirmation.
 - **Data tooling:** canonical ragged HDF5, deterministic tier construction,
   strict validation, provenance records, source-specific masking, and
-  rights-aware Hugging Face staging.
+  rights-aware Hugging Face staging with supported Dataset Viewer tables.
 
 ## Effective Hamiltonian
 
@@ -71,6 +75,75 @@ Forces and spin fields remain derivatives of the same energy:
 Z^{*}_{i,\alpha\beta}=\frac{\partial \mu_\alpha}{\partial R_{i\beta}}.
 ```
 
+## Wavefunction alignment loss
+
+Entry-wise Hamiltonian fitting in an arbitrary raw orbital basis does not state
+which errors perturb orbital energies and which errors mix reference states.
+This matters because a matrix can contain many individually small errors, while
+their collective spectral norm grows with subspace size; near a small energy
+gap, even a modest off-diagonal perturbation can strongly rotate the associated
+eigenspace. WALoss makes those two physical effects explicit.
+
+For a reference Hamiltonian $`H_g^*`$ with orthonormal eigenvectors $`U_g^*`$
+and a predicted Hamiltonian $`\widehat H_g`$, both matrices are expressed in the
+reference eigenspace:
+
+```math
+\widetilde H_g=(U_g^*)^\dagger\widehat H_gU_g^*,
+\qquad
+\widetilde H_g^*=(U_g^*)^\dagger H_g^*U_g^*
+=\mathrm{diag}(\epsilon_{g,1}^*,\ldots,\epsilon_{g,K}^*).
+```
+
+The diagonal residual directly penalizes orbital-energy error. The strict upper
+triangle penalizes unwanted coupling between reference eigenstates without
+counting a symmetric pair twice. The two populations are normalized
+independently before applying their weights:
+
+```math
+\mathcal L_{\mathrm{WA}}
+=\lambda_{\mathrm d}\mathcal L_{\mathrm{diag}}
++\lambda_{\mathrm o}\mathcal L_{\mathrm{off}}.
+```
+
+This is a physics-informed auxiliary objective: it encodes the reference
+eigenproblem in the feature-space loss, but it is not a Kohn-Sham solver and it
+does not reconstruct a real-space many-electron wavefunction. The prediction
+path never diagonalizes $`\widehat H_g`$; gradients pass only through fixed
+basis products and the symmetric Hamiltonian head. The head is graph-level,
+real, and fixed $`K\times K`$, is separate from the $`J/D_i`$/DMI spin
+Hamiltonian, and does not enter $`E_{\mathrm{tot}}`$.
+
+Scientific use requires every labelled row to share the same ordered
+orbital/Wannier subspace, gauge or degenerate-subspace convention, energy zero,
+spin channel, k-point convention, and electronic-structure method. The current
+Neo release files contain neither `orbital_hamiltonian` nor
+`orbital_eigenvectors` (the absent optional dimension resolves to $`K=0`$), so
+WALoss is implemented in the code but is not trained by any published Neo tier.
+A compatible custom dataset can enable it in Response or Joint mode with:
+
+```json
+{
+  "mode": "response",
+  "model": {"enable_waloss": true, "waloss_dim": 0},
+  "w_waloss": 1.0,
+  "waloss_diagonal_weight": 1.0,
+  "waloss_off_diagonal_weight": 1.0
+}
+```
+
+`waloss_dim = 0` requests inference from the paired HDF5 labels. See the
+[physics derivation](docs/PHYSICS.md#wavefunction-alignment-and-electronic-hamiltonian),
+[training contract](docs/TRAINING_AND_VALIDATION.md#wavefunction-alignment-objective),
+and [dataset contract](docs/DATASETS.md#optional-waloss-data-contract).
+
+The change is backward compatible at the current loader boundary. Legacy Neo
+data and pre-WALoss checkpoints continue to train and infer their original
+targets; a WALoss-enabled warm start reuses the matching ground/response
+weights and initializes only the new electronic head. This does not grant an
+old checkpoint electronic-Hamiltonian validity, and a new WALoss checkpoint is
+not promised to load in source versions that predate the head.
+
 ## Execution graph
 
 ```mermaid
@@ -79,6 +152,8 @@ flowchart LR
     G --> L1["Layer 1: parity-aware O(3) message passing"]
     L1 --> PES[Short-range energy]
     L1 --> R[Response tensor heads]
+    R --> W[Aligned electronic Hamiltonian head]
+    W --> WA[WALoss, training only]
     R --> Q[Layer 2: QEq and PME]
     R --> P[Layer 2: polarization and D4]
     R --> S[Layer 3: J, Di, and DMI]
@@ -143,7 +218,7 @@ python E3_miu_GNN.py evaluate \
 Canonical HDF5 training and evaluation stream structures and labels by
 default. Exact neighbor topology is cached once in a read-only, memory-mapped
 layout, CPU assembly is bounded to a two-batch prefetch window, and only the
-current batch is transferred to the accelerator. Plus and Max use lossless
+current batch is transferred to the accelerator. SE, Plus, and Max use lossless
 packed HDF5 arrays; contiguous rows are fetched as a batch and Composite caches
 use the same source-, selection-, cutoff-, and backend-keyed exact topology
 format. Use `--no-stream-hdf5` only for materialized debug comparisons; legacy
@@ -165,6 +240,14 @@ training-optimized packed layout without overwriting the source:
 python Datasets_Preparation.py dataset-composite-pack-omat \
   neo_plus_l1_l2_l3.h5 \
   --output neo_plus_l1_l2_l3_packed.h5
+```
+
+Build and locally verify the Hugging Face Dataset Viewer tables without
+duplicating the complete HDF5 training rows:
+
+```bash
+python Datasets_Preparation.py dataset-viewer-build \
+  Datasets/Neo --verify-hf-datasets --overwrite
 ```
 
 Run `python E3_miu_GNN.py --help` for training, evaluation, self-test, and GUI
@@ -222,32 +305,47 @@ device selection. SevenNet TorchScript exports remain ground-only by design.
 The GitHub repository includes the Tiny file for a quick start. Small,
 Standard, Large, and release metadata are hosted in the
 [FonaTech/E3-miu-GNN Hugging Face dataset](https://huggingface.co/datasets/FonaTech/E3-miu-GNN).
-Neo uses the `e3mu-hdf5-v1` schema with explicit label masks, units, provenance,
-physical parent groups, and fixed train/validation/test splits. Missing labels
-are never fabricated, and incompatible absolute energy references are not
-silently mixed.
+Neo uses two self-contained HDF5 layouts. Canonical Tiny, Small, Standard, and
+Large files use `e3mu-hdf5-v1` with root groups `structures/`, `labels/`,
+`masks/`, and `metadata/`. Composite SE, Plus, and Max files use
+`e3mu-composite-hdf5-v1`: the same four groups embed the complete Neo response
+payload, while `selection/`, `sources/omat24/packed/`, and
+`atomic_reference/` store a deterministic OMat24 foundation and its exact
+provenance. Missing labels are never fabricated, and incompatible absolute
+energy references are not silently mixed.
 
-| Neo tier | Structures | Approximate size | Intended use | Download |
-| --- | ---: | ---: | --- | --- |
-| Tiny | 5,780 | 21.0 MB | Fast functional checks | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
-| Small | 16,703 | 53.7 MB | Intermediate experiments | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
-| Standard | 46,414 | 129.7 MB | Portable mixed-granularity training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
-| Large | 613,267 | 1.31 GB | Trajectory-rich training | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
-| Plus | 25,819,271 | 41.06 GB portable single-file HDF5 | 25% material-family OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
-| Max | 101,283,549 | 138.04 GB portable single-file HDF5 | Full deduplicated OMat24 foundation + complete Large response corpus | Hugging Face release candidate |
+The Hugging Face repository also exposes bounded real-structure previews and
+complete tier, label, and source summary tables. These Parquet views support
+browser inspection; the self-contained HDF5 files remain authoritative for
+training.
 
-Plus uses schema `e3mu-composite-hdf5-v1`. Its complete Large geometry,
-labels, masks, and provenance are embedded in the Plus HDF5 itself. The selected
-rows from the 635 declared OMat24 source shards are stored as ragged packed HDF5
-arrays under `sources/omat24/packed`. Geometry and labels retain their source
-float64 values without quantization. Copying the single `.h5` file to another
-machine does not require the original OMat24 tree, and the original row number
-remains in `selection/source_row_index`.
+| File/tier | Schema | Embedded Neo response | OMat24 foundation | Total structures | Total atoms | On-disk size | Status / intended use |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Tiny | canonical | 5,780 | 0 | 5,780 | 394,755 | 20.011 MiB | Fast functional checks; [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5) |
+| Small | canonical | 16,703 | 0 | 16,703 | 1,069,318 | 51.218 MiB | Development experiments; [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
+| Standard | canonical | 46,414 | 0 | 46,414 | 2,316,736 | 0.120772 GiB | Portable mixed-granularity training; [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
+| SE | composite | Standard: 46,414 | 559,279 | 605,693 | 12,767,209 | 0.690297 GiB | Compact foundation; exact `1/180` Max selector |
+| Large | canonical | 613,267 | 0 | 613,267 | 17,760,024 | 1.219244 GiB | Trajectory-rich response training; [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
+| Plus | composite | Large: 613,267 | 25,206,004 | 25,819,271 | 488,227,614 | 38.237181 GiB | Quarter-scale material-family foundation |
+| Max | composite | Large: 613,267 | 100,670,282 | 101,283,549 | 1,899,323,661 | 128.559024 GiB | Full deduplicated OMat24 foundation |
 
-Max contains 100,670,282 unique OMat24 configurations after removing 154,252
-duplicate configuration IDs, plus all 613,267 Large records. It uses the same
-self-contained packed storage and staged Base -> Response -> Joint
-curriculum as Plus.
+These are the seven supported tiers. Tiny $`\subset`$ Small $`\subset`$
+Standard; Large follows a separate, trajectory-rich construction policy rather
+than being a simple next nested sample.
+
+All Composite variants preserve source float64 geometry and labels without
+quantization. `selection/source_order`, `row_index`, `source_row_index`,
+`split_code`, and `atom_count` map each foundation record to the packed arrays.
+Copying one Composite `.h5` is sufficient for training; the original OMat24
+Parquet tree is not required. Plus and Max embed complete Large, whereas SE
+embeds complete Standard. Max removes 154,252 duplicate
+configuration IDs before selecting its 100,670,282 OMat24 records.
+
+Every one of these seven files omits the optional `wavefunction_dim` attribute
+(interpreted as no WALoss payload) and has no `orbital_hamiltonian` or
+`orbital_eigenvectors` dataset. Their existing energy, force, stress, response,
+and spin labels remain fully usable, but none can activate WALoss without
+separately collected and gauge-aligned electronic labels.
 
 The 2026-07-25 Tiny-Large revision adds raw non-OMat24 stress supervision from
 MPtrj and JARVIS-DFPT. Standard contains 22,873 stress records, including 112
@@ -271,8 +369,8 @@ the archive-level redistribution terms for the transformed `BEC/H2O`,
 
 ## Verified behavior
 
-The current source tree passes 166 regression tests and the deterministic
-physics self-test. The checked invariants include:
+The current source tree passes its regression suite and deterministic physics
+self-test. The checked invariants include:
 
 - rotation and reflection behavior of energy, force, dipole, and
   polarizability;
@@ -284,6 +382,9 @@ physics self-test. The checked invariants include:
   closure, and full-coupled magnetoelastic response against affine finite
   differences;
 - differentiable QEq, PME, polarization, D4, FiLM, and Layer-3 losses;
+- WALoss reference-basis invariance, separate diagonal/off-diagonal
+  normalization, differentiability without a predicted eigensolver, paired
+  masks, and separation from the classical-spin Hamiltonian;
 - HDF5 mask semantics, group-safe splits, checkpoint round trips, and VASP
   magnetic mapping.
 

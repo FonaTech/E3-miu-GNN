@@ -69,7 +69,7 @@ should reproduce the invariance and finite-difference errors within ordinary
 numerical variation. Different PyTorch, BLAS, or device backends may change the
 last few digits.
 
-## Canonical dataset validation
+## Dataset validation
 
 The Tiny file is available from the GitHub repository. Download the larger
 tiers from the Hugging Face dataset before validation or training:
@@ -83,7 +83,7 @@ hf download FonaTech/E3-miu-GNN \
   --repo-type dataset --local-dir Datasets/Neo
 ```
 
-Then validate the canonical file used by the chosen config:
+Then validate the exact HDF5 file used by the chosen config:
 
 ```bash
 python Datasets_Preparation.py dataset-summary \
@@ -106,6 +106,21 @@ python Datasets_Preparation.py dataset-tier-audit \
 
 Use canonical sample IDs, source checksums, and fixed splits from the Neo
 manifest. Do not regenerate a split for a published benchmark.
+
+Tiny, Small, Standard, and Large use canonical `e3mu-hdf5-v1`. SE, Plus, and
+Max use self-contained `e3mu-composite-hdf5-v1`, which embeds a complete
+Standard or Large response payload plus selected packed OMat24 arrays. The same
+summary/validation entry point dispatches by `schema_version`; do not flatten a
+Composite file into a fabricated canonical row set. The complete seven-tier
+structure and counts are recorded in [Datasets](DATASETS.md).
+
+For WALoss experiments, archive more than matrix shapes. Record the fixed
+orbital/Wannier subspace definition, orbital order, phase or
+degenerate-subspace alignment method, energy zero, spin channel, k-point
+convention, electronic-structure method, and `wavefunction_dim`. Both paired
+masks must be active together in train and validation. None of the current Neo
+tiers contains these labels, so a published WALoss experiment must identify and
+checksum its separate electronic dataset.
 
 ## Minimal training checks
 
@@ -224,6 +239,12 @@ references, and state dictionaries in a weights-only-compatible structure.
 Legacy full-object pickle loading requires an explicit unsafe opt-in and should
 not be used for untrusted artifacts.
 
+Pre-WALoss native checkpoints remain valid for their original outputs. A
+WALoss-enabled warm start loads matching legacy tensors and initializes the new
+electronic head, which must then be trained on paired labels before its output
+is recommended. Conversely, source versions predating that head are not a
+supported reader for new WALoss checkpoints.
+
 When epoch artifacts are enabled, output is written under
 `<checkpoint parent>/train/<checkpoint stem>/`. Keep the final config, metric
 JSON, plots, memory history, dataset hash, and selected checkpoint together.
@@ -249,7 +270,9 @@ retain an unresolved archive-level rights review.
 5. Record normalized checkpoint selection and all raw held-out metrics.
 6. Inspect QEq, polarization, FiLM, and memory histories.
 7. State unsupported or unsupervised outputs explicitly.
-8. Verify source-level dataset licenses before distributing binaries.
-9. Scan tracked text for credentials, absolute workstation paths, and concrete
+8. For WALoss, archive the basis/gauge contract and verify paired masks in both
+   train and validation; do not claim it from the current Neo tiers.
+9. Verify source-level dataset licenses before distributing binaries.
+10. Scan tracked text for credentials, absolute workstation paths, and concrete
    proxy endpoints.
-10. Archive the source commit and environment with the final result.
+11. Archive the source commit and environment with the final result.

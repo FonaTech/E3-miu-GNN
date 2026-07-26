@@ -6,14 +6,17 @@ claim of a converged universal interatomic potential.
 
 ## Training contract
 
-The trainer consumes either one canonical `e3mu-hdf5-v1` file or the retained
-legacy static/response extXYZ pair. Canonical HDF5 is preferred because it
-preserves target masks, source identity, physical groups, units, and fixed
-splits explicitly.
+The trainer consumes either a canonical `e3mu-hdf5-v1` file, a self-contained
+SE/Plus/Max `e3mu-composite-hdf5-v1` file, or the retained legacy
+static/response extXYZ pair. HDF5 is preferred because it preserves target
+masks, source identity, physical groups, units, and fixed splits explicitly.
+Composite files keep the complete Standard or Large response payload at the
+root and stream their selected OMat24 foundation from
+`sources/omat24/packed/`; no external Parquet tree is required.
 
 ```mermaid
 flowchart LR
-    D[Canonical data and masks] --> B[Neighbor graphs and batches]
+    D[Canonical or Composite data and masks] --> B[Neighbor graphs and batches]
     B --> M[MixedGranularityE3GNN]
     M --> H[Total Hamiltonian]
     H --> O[Predictions and derivatives]
@@ -51,12 +54,41 @@ Energy errors are normalized per atom before aggregation so that large cells
 do not dominate solely through atom count. Expensive derivative outputs are
 constructed only when their active mask and loss weight require them.
 
+### Wavefunction alignment objective
+
+When `model.enable_waloss=True`, a separate electronic Hamiltonian head reads
+the shared Response scalar features and predicts a fixed $`K\times K`$
+real-symmetric matrix. For paired `orbital_hamiltonian` and
+`orbital_eigenvectors` labels, the trainer transforms prediction and reference
+with the reference eigenvectors and adds
+
+```math
+\mathcal L_{\mathrm{WALoss}}
+=w_{\mathrm{waloss}}
+\left(
+\lambda_{\mathrm d}\mathcal L_{\mathrm{orbital\ energy}}
++\lambda_{\mathrm o}\mathcal L_{\mathrm{orbital\ coupling}}
+\right).
+```
+
+Diagonal and strict-upper-triangle terms have separate element-count
+normalization. `waloss_diagonal_weight` and `waloss_off_diagonal_weight` control
+their internal balance; `w_waloss` controls the contribution to the complete
+training objective. The prediction side is never diagonalized during training,
+so no gradient crosses an eigensolver.
+
+WALoss is accepted only in Response or Joint training (and the corresponding
+Full Chain stages). `waloss_dim=0` means infer $`K`$ from canonical data; a
+positive configured value must match the file. Train and validation splits must
+both contain paired active labels. The GUI and Auto Research hide or reject the
+controls when the data capability scan finds no such pair.
+
 ## Training modes
 
 | Mode | Trainable scope | Intended use |
 | --- | --- | --- |
 | `base` | ground-state Layer-1 branch | establish local energy and force representation |
-| `response` | response branch above a base checkpoint | train electric response while retaining a frozen ground model |
+| `response` | response branch and optional electronic WALoss head above a base checkpoint | train electric/electronic response while retaining a frozen ground model |
 | `joint` | active Layer-1, Layer-2, Layer-3, and FiLM parameters | coupled fine-tuning under a shared objective |
 
 The full-chain GUI workflow can freeze the ground branch during response
@@ -86,7 +118,16 @@ flowchart TD
 The current D4 backend is molecular, so periodic datasets disable D4. PME is
 meaningful only for periodic records and requires QEq. Direct $`J`$, $`D_i`$, or
 DMI losses remain unavailable for the current portable Neo tiers because their
-masks are false.
+masks are false. WALoss likewise remains unavailable until paired aligned
+Hamiltonian/eigenvector labels are supplied.
+
+The checkpoint loader preserves pre-WALoss behavior. A legacy native checkpoint
+can continue training or inference with the head disabled. When a compatible
+WALoss configuration deliberately warm-starts from it, matching tensors are
+reused and only the new electronic-head parameters are initialized; this leaves
+the legacy ground energy and force path unchanged before further training. An
+initialized head is not a trained physical output, and source versions that
+predate the head are not guaranteed to read new WALoss checkpoints.
 
 ## Stable optimization safeguards
 
@@ -116,8 +157,9 @@ S_{\mathrm{val}}=
 where $`s_t`$ is a fixed characteristic scale. Current scales are 1 for energy,
 force, dipole, polarizability, and magnetic moment; 0.1 for charge, atomic
 dipole, atomic polarizability, BEC, and stress in eV/Angstrom$^3$; 10 for C6;
-and 0.01 eV for effective spin field and Hamiltonian parameters. A candidate
-cannot appear better by reducing its own loss coefficient.
+and 0.01 eV for effective spin field and spin-Hamiltonian parameters. WALoss
+orbital-energy and orbital-coupling MAEs use a separate 0.1 eV characteristic
+scale. A candidate cannot appear better by reducing its own loss coefficient.
 
 The electromechanical scale is 0.5 C/m$^2$ and the paired magnetoelastic scale
 is 0.02 eV/Angstrom$^3$. `w_piezoelectric` and `w_magnetoelastic` remain zero
@@ -180,7 +222,8 @@ With epoch artifacts enabled, training writes under
 - full and clipped energy/force parity plots plus stress MAE history;
 - force-norm plots;
 - loss and MAE histories;
-- active auxiliary-task MAEs;
+- active auxiliary-task MAEs, including orbital-energy and orbital-coupling MAE
+  when WALoss labels are present;
 - QEq, polarization, and separate electric/spin FiLM residual histories;
 - memory histories and machine-readable JSON; and
 - the best validated checkpoint at the requested output path.
@@ -215,7 +258,8 @@ The regression suite covers affine-strain stress finite differences, stress
 rotation covariance and nonperiodic masking, O(3) channels, QEq on Apple MPS,
 PME and D4 reference behavior, polarization gradients, label-aware L1/L2/L3
 routing, spin losses, checkpoint safety, HDF5 masks and splits, dataset-aware
-GUI state, and VASP magnetic mapping.
+GUI state, WALoss basis invariance and differentiability, and VASP magnetic
+mapping.
 
 ## Short held-out benchmarks
 

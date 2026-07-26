@@ -147,6 +147,9 @@ cannot provide the requested spin Hamiltonian.
   `virial` remains unsupported. Variable-cell optimization is not exposed by
   the fixed-cell `e3mu relax` command.
 - Do not treat initialized but unsupervised heads in a base checkpoint as predictions.
+- Request `orbital_hamiltonian` only from a full-coupled WALoss checkpoint whose
+  manifest recommends it. Preserve the checkpoint's fixed orbital/Wannier basis
+  contract; this electronic matrix is not the spin Hamiltonian.
 - Do not use `allow_unsafe_legacy` for downloaded or untrusted files.
 - Do not describe the SevenNet export as a full mixed-granularity checkpoint.
 - Reject element mismatches instead of remapping unknown species.

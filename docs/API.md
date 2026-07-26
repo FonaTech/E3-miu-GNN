@@ -135,11 +135,50 @@ Supported result names include:
 - enabled domain layers: `charges`, `atomic_dipoles`,
   `atomic_polarizability`, `c6`;
 - enabled spin layer: `Jij`, `Di`, `DMIij`, `magnetic_moments`,
-  `effective_field`, and paired `magnetoelastic_stress`.
+  `effective_field`, and paired `magnetoelastic_stress`;
+- optional electronic WALoss head: `orbital_hamiltonian`, a real-symmetric
+  `(K, K)` matrix in the checkpoint's fixed aligned orbital/Wannier basis.
 
 The manifest's `recommended` list is authoritative for scientific use. A base
 checkpoint may contain initialized response modules without having trained
 them; those outputs remain technically computable but are not recommended.
+
+`orbital_hamiltonian` is exposed only by a checkpoint with
+`enable_waloss=True` in `full_coupled` mode. Inspection recommends it only when
+training metadata records `w_waloss > 0`. It is an electronic auxiliary matrix,
+not the `Jij`/`Di`/`DMIij` spin Hamiltonian. Its unit is eV; the basis definition,
+orbital order, energy zero, spin channel, and any k-point convention belong to
+the checkpoint's data/model card.
+
+## WALoss Primitive
+
+The same differentiable loss used by training is public for custom workflows:
+
+```python
+from e3mu import wavefunction_alignment_loss
+
+terms = wavefunction_alignment_loss(
+    predicted_hamiltonian,
+    reference_hamiltonian,
+    reference_eigenvectors,  # eigenvectors are columns
+    diagonal_weight=1.0,
+    off_diagonal_weight=1.0,
+    sample_weight=mask,
+)
+loss = terms["loss"]
+```
+
+The returned mapping includes total, diagonal, and off-diagonal losses and MAE
+components, aligned prediction/reference tensors, and the effective sample
+weight. Reference validation checks Hermiticity, orthonormality, and that the
+provided basis diagonalizes the reference Hamiltonian. Training uses the same
+operation after validating canonical input once, but deliberately applies no
+eigensolver to the prediction graph.
+
+This primitive can be used with a separately prepared compatible dataset. The
+current Neo Tiny, Small, Standard, SE, Large, Plus, and Max files do not contain
+the paired orbital arrays and therefore cannot supply this API's training
+targets.
 
 ## Fixed-Cell Relaxation
 
