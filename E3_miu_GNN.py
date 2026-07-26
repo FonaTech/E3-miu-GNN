@@ -628,6 +628,35 @@ def parse_matrix3x3(v: Any, *, name: str = "matrix") -> np.ndarray:
     raise ValueError(f"Could not parse {name} as 3x3 from: {v!r}")
 
 
+def parse_square_matrix(v: Any, *, name: str = "matrix") -> np.ndarray:
+    """Parse a finite real square matrix with dimension inferred from the value."""
+    if v is None:
+        raise ValueError(f"{name} is None")
+    value = v
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            value = ast.literal_eval(text)
+        except Exception:
+            value = [float(item) for item in text.replace(",", " ").split()]
+    try:
+        array = np.asarray(value, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Could not parse {name} as a numerical matrix") from exc
+    if array.ndim == 1:
+        dimension = int(round(math.sqrt(int(array.size))))
+        if dimension <= 0 or dimension * dimension != int(array.size):
+            raise ValueError(
+                f"{name} has {array.size} values, which is not a square matrix"
+            )
+        array = array.reshape(dimension, dimension)
+    if array.ndim != 2 or array.shape[0] != array.shape[1] or array.shape[0] <= 0:
+        raise ValueError(f"{name} must be a non-empty square matrix, got {array.shape}")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} contains non-finite values")
+    return np.asarray(array, dtype=np.float64)
+
+
 def _parse_pbc(v: Any) -> Tuple[bool, bool, bool]:
     """Parse periodic boundary condition flags into a 3-bool tuple.
 
@@ -722,6 +751,14 @@ class DatasetKeys:
         polarizability_key:  Key for polarizability tensor alpha (Angstrom^3).
         total_charge_key:    Key for total system charge Q (e), used for charge-centre
                              correction when computing the dipole from partial charges.
+        orbital_hamiltonian_key:
+                             Optional graph-level K x K electronic Hamiltonian in eV.
+                             K and the ordered orbital/Wannier gauge must be common to
+                             the complete WALoss dataset.
+        orbital_eigenvectors_key:
+                             Optional K x K reference eigenvectors stored by columns.
+                             These are constant supervision, not a model prediction and
+                             not the classical-spin eigenvectors of J/Di/DMI.
     """
     energy_key: str = "energy"                       # E_PES (0th order)
     forces_key: str = "forces"                       # F (total atomic force)
@@ -737,6 +774,8 @@ class DatasetKeys:
     spins_key: str = "spins"
     magnetic_moments_key: str = "magmoms"
     effective_field_key: str = "effective_field"
+    orbital_hamiltonian_key: str = "orbital_hamiltonian"
+    orbital_eigenvectors_key: str = "orbital_eigenvectors"
     source_key: str = "source"
     method_key: str = "method_id"
     system_key: str = "system_id"
@@ -770,6 +809,10 @@ class ExtXYZFrame:
         forces_weight:           1.0 if force labels present, else 0.0.
         dipole_weight:           1.0 if dipole label present, else 0.0.
         polarizability_weight:   1.0 if polarizability label present, else 0.0.
+        orbital_hamiltonian:     Optional real-symmetric K x K electronic matrix (eV).
+        orbital_eigenvectors:    Optional orthonormal reference eigenvectors, columns.
+                                 Both fields must be present together. They describe a
+                                 finite aligned subspace, not a real-space wavefunction.
     """
     atomic_numbers: np.ndarray
     positions: np.ndarray
@@ -794,6 +837,8 @@ class ExtXYZFrame:
     spins: Optional[np.ndarray] = None
     magnetic_moments: Optional[np.ndarray] = None
     effective_field: Optional[np.ndarray] = None
+    orbital_hamiltonian: Optional[np.ndarray] = None
+    orbital_eigenvectors: Optional[np.ndarray] = None
     source: str = "unknown"
     method_id: str = "unknown"
     system_id: str = "unknown"
@@ -975,6 +1020,59 @@ def load_extxyz_frames(
 
             total_charge = float(info.get(keys.total_charge_key, 0.0))
 
+            hamiltonian_value = next(
+                (
+                    info[name]
+                    for name in (
+                        keys.orbital_hamiltonian_key,
+                        "orbital_hamiltonian",
+                        "hamiltonian",
+                    )
+                    if name in info
+                ),
+                None,
+            )
+            eigenvector_value = next(
+                (
+                    info[name]
+                    for name in (
+                        keys.orbital_eigenvectors_key,
+                        "orbital_eigenvectors",
+                        "wavefunctions",
+                    )
+                    if name in info
+                ),
+                None,
+            )
+            if (hamiltonian_value is None) != (eigenvector_value is None):
+                raise ValueError(
+                    "Wavefunction supervision requires both orbital_hamiltonian "
+                    "and orbital_eigenvectors in each labeled frame"
+                )
+            orbital_hamiltonian = (
+                None
+                if hamiltonian_value is None
+                else parse_square_matrix(
+                    hamiltonian_value, name=keys.orbital_hamiltonian_key
+                )
+            )
+            orbital_eigenvectors = (
+                None
+                if eigenvector_value is None
+                else parse_square_matrix(
+                    eigenvector_value, name=keys.orbital_eigenvectors_key
+                )
+            )
+            if (
+                orbital_hamiltonian is not None
+                and orbital_eigenvectors is not None
+                and orbital_hamiltonian.shape != orbital_eigenvectors.shape
+            ):
+                raise ValueError(
+                    "orbital_hamiltonian and orbital_eigenvectors must have the "
+                    "same square shape"
+                )
+
             atomic_polar = per_atom.get("atomic_polarizability")
             if atomic_polar is not None and atomic_polar.shape[1] == 9:
                 atomic_polar = atomic_polar.reshape(nat, 3, 3)
@@ -1000,6 +1098,8 @@ def load_extxyz_frames(
                 spins=per_atom.get("spins"),
                 magnetic_moments=magmoms,
                 effective_field=per_atom.get("effective_field"),
+                orbital_hamiltonian=orbital_hamiltonian,
+                orbital_eigenvectors=orbital_eigenvectors,
                 source=str(info.get(keys.source_key, "unknown")),
                 method_id=str(info.get(keys.method_key, "unknown")),
                 system_id=str(info.get(keys.system_key, "unknown")),
@@ -1248,6 +1348,70 @@ class AtomicData(_TGData):
         data.stress_eligible = torch.tensor(stress_eligible, dtype=torch.bool)
         data.dipole_weight = torch.tensor(float(wts.get("dipole", 0.0)), dtype=torch.get_default_dtype()).view(1, 1)
         data.polarizability_weight = torch.tensor(float(wts.get("polarizability", 0.0)), dtype=torch.get_default_dtype())
+        # WALoss is graph-level supervision.  PyG batches require every graph to
+        # carry tensors of the same shape, so an unlabeled graph receives K x K
+        # zero *padding* and a zero weight.  The padding is never a physical zero
+        # Hamiltonian: the paired masks below are the sole validity authority.
+        #
+        # The two labels are inseparable because H_ref defines the reference
+        # operator while U_ref defines the eigenspace in which its diagonal
+        # (orbital energies) and off-diagonal (mixing/coupling) errors are read.
+        hamiltonian_value = props.get("orbital_hamiltonian")
+        eigenvector_value = props.get("orbital_eigenvectors")
+        if (hamiltonian_value is None) != (eigenvector_value is None):
+            raise ValueError(
+                "WALoss AtomicData requires paired orbital_hamiltonian and "
+                "orbital_eigenvectors labels"
+            )
+        inferred_wavefunction_dim = (
+            int(np.asarray(hamiltonian_value).shape[0])
+            if hamiltonian_value is not None
+            else 0
+        )
+        wavefunction_dim = int(
+            props.get("wavefunction_dim", inferred_wavefunction_dim) or 0
+        )
+        if wavefunction_dim < 0:
+            raise ValueError("wavefunction_dim cannot be negative")
+        if hamiltonian_value is not None:
+            hamiltonian_array = np.asarray(hamiltonian_value, dtype=float)
+            eigenvector_array = np.asarray(eigenvector_value, dtype=float)
+            expected_wavefunction_shape = (wavefunction_dim, wavefunction_dim)
+            if (
+                hamiltonian_array.shape != expected_wavefunction_shape
+                or eigenvector_array.shape != expected_wavefunction_shape
+            ):
+                raise ValueError(
+                    "WALoss labels do not match wavefunction_dim="
+                    f"{wavefunction_dim}: H={hamiltonian_array.shape}, "
+                    f"U={eigenvector_array.shape}"
+                )
+            _validate_reference_eigensystem_numpy(
+                hamiltonian_array,
+                eigenvector_array,
+                context="WALoss AtomicData",
+            )
+            wavefunction_present = 1.0
+        else:
+            hamiltonian_array = np.zeros(
+                (wavefunction_dim, wavefunction_dim), dtype=float
+            )
+            eigenvector_array = np.zeros_like(hamiltonian_array)
+            wavefunction_present = 0.0
+        data.orbital_hamiltonian = torch.tensor(
+            hamiltonian_array, dtype=torch.get_default_dtype()
+        ).view(1, wavefunction_dim, wavefunction_dim)
+        data.orbital_eigenvectors = torch.tensor(
+            eigenvector_array, dtype=torch.get_default_dtype()
+        ).view(1, wavefunction_dim, wavefunction_dim)
+        data.orbital_hamiltonian_weight = torch.tensor(
+            float(wts.get("orbital_hamiltonian", wavefunction_present)),
+            dtype=torch.get_default_dtype(),
+        )
+        data.orbital_eigenvectors_weight = torch.tensor(
+            float(wts.get("orbital_eigenvectors", wavefunction_present)),
+            dtype=torch.get_default_dtype(),
+        )
         per_atom_shapes = {
             "charges": (-1,),
             "atomic_dipoles": (-1, 3),
@@ -1391,6 +1555,17 @@ def load_extxyz_configurations(
         sample_fraction=sample_fraction,
         sample_seed=sample_seed,
     )
+    wavefunction_dimensions = {
+        int(frame.orbital_hamiltonian.shape[0])
+        for frame in frames
+        if frame.orbital_hamiltonian is not None
+    }
+    if len(wavefunction_dimensions) > 1:
+        raise ValueError(
+            "WALoss requires one fixed aligned orbital subspace per dataset; "
+            f"found dimensions {sorted(wavefunction_dimensions)}"
+        )
+    wavefunction_dimension = next(iter(wavefunction_dimensions), 0)
     configs: List[Configuration] = []
     fields: List[np.ndarray] = []
     for fr in frames:
@@ -1415,6 +1590,17 @@ def load_extxyz_configurations(
             props["polarizability"] = np.asarray(fr.polarizability, dtype=float).reshape(3, 3)
             wts["polarizability"] = float(fr.polarizability_weight)
         props["total_charge"] = float(fr.total_charge)
+        if wavefunction_dimension > 0:
+            props["wavefunction_dim"] = int(wavefunction_dimension)
+        if fr.orbital_hamiltonian is not None:
+            props["orbital_hamiltonian"] = np.asarray(
+                fr.orbital_hamiltonian, dtype=float
+            )
+            props["orbital_eigenvectors"] = np.asarray(
+                fr.orbital_eigenvectors, dtype=float
+            )
+            wts["orbital_hamiltonian"] = 1.0
+            wts["orbital_eigenvectors"] = 1.0
         for name in (
             "charges", "atomic_dipoles", "atomic_polarizability", "c6", "bec",
             "spins", "magnetic_moments", "effective_field",
@@ -1601,6 +1787,91 @@ HDF5_ATOM_LABELS: Dict[str, Tuple[int, ...]] = {
     "Di": (3, 3),
     "reference_spins": (3,),
 }
+# ---------------------------------------------------------------------------
+# WALoss physical and data contract (proposal V5.1, pp. 21-22, Formula 19)
+# ---------------------------------------------------------------------------
+#
+# Physical motivation
+# ~~~~~~~~~~~~~~~~~~~
+# An electronic Hamiltonian is an operator, whereas its individual matrix
+# entries depend on the chosen orbital gauge.  Element-wise MSE therefore mixes
+# two physically different errors: displacement of eigenvalues (orbital
+# energies) and rotation/mixing of eigenvectors (wavefunctions in the selected
+# finite subspace).  Many small entry errors can combine into a significant
+# operator perturbation; eigenvectors are especially sensitive when spectral
+# gaps are small.  The proposal calls for a wavefunction-alignment loss (WALoss)
+# that measures those two effects after a differentiable basis transformation.
+#
+# Stable realization used here
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Every labeled graph supplies a reference Hamiltonian H_ref and a matrix U_ref
+# whose columns are reference eigenvectors.  The network predicts H_pred in the
+# same *raw, ordered* orbital/Wannier basis.  The loss forms
+#
+#     H_pred_aligned = U_ref^H @ H_pred @ U_ref
+#     H_ref_aligned  = U_ref^H @ H_ref  @ U_ref = diag(epsilon_ref).
+#
+# The diagonal residual directly supervises orbital energies.  The strict
+# upper-triangle residual supervises residual orbital mixing/coupling without
+# counting both H_ij and H_ji.  Each population is normalized independently;
+# otherwise K(K-1)/2 coupling entries would dominate K diagonal entries simply
+# because there are more of them.  For a non-degenerate reference spectrum,
+# driving the aligned off-diagonal block to zero makes H_pred share the
+# reference eigendirections.  The code never differentiates an eigensolver:
+# U_ref is fixed data, so gradients follow only
+#
+#     loss -> basis products -> H_pred -> Hamiltonian head -> Response features.
+#
+# The proposal prose mentions both predicted and reference eigenvectors but does
+# not provide a closed equation, while explicitly requiring avoidance of
+# eigensolver backpropagation.  This implementation resolves that ambiguity by
+# treating U_ref as the alignment frame and predicting H only.  Adding a future
+# U_pred head would require its own orthogonality, phase/permutation, and
+# degenerate-subspace contract; it must not be inserted as an unconstrained
+# matrix or obtained from a differentiable eigensolver in this training path.
+#
+# The proposal describes this as PINN-based.  In this implementation,
+# "physics-informed" means enforcing Hermiticity/symmetry, eigenpair
+# consistency, and observable-level spectral/mixing residuals.  It is not a
+# real-space Schrodinger-equation residual and does not solve Kohn-Sham DFT.
+# Reference matrices will normally come from fixed-nuclei electronic-structure
+# calculations under a Born-Oppenheimer model, so the learned R -> H map inherits
+# that method's validity domain.  WALoss cannot by itself repair a failed BO
+# approximation or create Mott/Hubbard physics absent from the reference method
+# and chosen subspace; such claims require correlated labels and independent
+# spectral validation.
+#
+# Dataset assumptions and validity domain
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# - H_ref and U_ref are an inseparable pair; missing labels are masked, never
+#   interpreted as zero observations.
+# - One HDF5 file has one positive fixed K so graphs can share a model head and
+#   batch tensor shape.  These labels are kept outside HDF5_STRUCTURE_LABELS,
+#   whose shapes are compile-time constants such as (3, 3).
+# - All rows must use the same subspace, orbital order, gauge, spin channel,
+#   k-point convention, energy zero, and electronic-structure method.  Shape
+#   validation cannot establish this scientific provenance.
+# - A per-row arbitrary unitary gauge is not learnable because that gauge is not
+#   an input to the network.  Rotate/project upstream data into a common basis.
+# - Exactly or nearly degenerate states need a stable subspace gauge.  The
+#   current vector-wise loss selects the supplied U_ref; a future gauge-free
+#   treatment should use projector/block losses rather than silently mixing
+#   inconsistent eigenvectors.
+# - The canonical writer and model head are real-symmetric.  The standalone
+#   mathematical primitive supports complex-Hermitian tensors, but complex SOC,
+#   variable-band, and k-resolved production heads are not implemented here.
+# - This graph-level auxiliary Hamiltonian is distinct from the classical-spin
+#   J/Di/DMI Hamiltonian and is not currently added to the PES energy assembly.
+#   It regularizes shared Response features and is available as its own output.
+HDF5_WAVEFUNCTION_LABELS: Tuple[str, ...] = (
+    "orbital_hamiltonian",
+    "orbital_eigenvectors",
+)
+HDF5_ALL_STRUCTURE_LABELS: Tuple[str, ...] = (
+    *HDF5_STRUCTURE_LABELS,
+    *HDF5_WAVEFUNCTION_LABELS,
+)
+WALOSS_MATRIX_ATOL = 1e-6
 HDF5_UNITS = {
     "atomic_numbers": "dimensionless",
     "cell": "angstrom",
@@ -1637,7 +1908,159 @@ HDF5_UNITS = {
     "magnetoelastic_stress": "eV/angstrom^3",
     "strain": "dimensionless",
     "reference_spins": "dimensionless",
+    "orbital_hamiltonian": "eV",
+    "orbital_eigenvectors": "dimensionless",
 }
+
+
+def _validate_reference_eigensystem_numpy(
+    hamiltonian: Any,
+    eigenvectors: Any,
+    *,
+    context: str,
+    matrix_atol: float = WALOSS_MATRIX_ATOL,
+) -> int:
+    """Validate the real reference eigensystem used by canonical WALoss data.
+
+    This is the ingestion boundary for the physical identities assumed by the
+    differentiable loss:
+
+    ``H_ref = H_ref.T``, ``U_ref.T @ U_ref = I``, and
+    ``offdiag(U_ref.T @ H_ref @ U_ref) = 0``.
+
+    Orthogonality alone is insufficient: an arbitrary orthogonal matrix can
+    satisfy ``U.T @ U = I`` while defining the wrong eigenspace.  The final
+    residual test therefore checks that the supplied columns are eigenvectors
+    of their paired Hamiltonian.  The threshold scales with ``max(1, |H|)`` so
+    the same tolerance remains meaningful for different energy magnitudes.
+
+    This routine intentionally cannot validate cross-record orbital ordering,
+    phase/gauge continuity, DFT method, k point, spin channel, or energy zero;
+    those are provenance requirements of the dataset producer.
+
+    Returns:
+        The positive common matrix dimension K after successful validation.
+    """
+    reference = np.asarray(hamiltonian, dtype=np.float64)
+    basis = np.asarray(eigenvectors, dtype=np.float64)
+    if (
+        reference.ndim != 2
+        or reference.shape[0] <= 0
+        or reference.shape[0] != reference.shape[1]
+        or basis.shape != reference.shape
+    ):
+        raise ValueError(
+            f"{context}: WALoss matrices must share a non-empty square shape, "
+            f"got H={reference.shape}, U={basis.shape}"
+        )
+    if not np.isfinite(reference).all() or not np.isfinite(basis).all():
+        raise ValueError(f"{context}: WALoss matrices must contain only finite values")
+    tolerance = float(matrix_atol)
+    if not math.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("WALoss matrix_atol must be finite and greater than zero")
+    if not np.allclose(
+        reference, reference.T, rtol=0.0, atol=tolerance
+    ):
+        raise ValueError(f"{context}: orbital_hamiltonian must be real symmetric")
+    identity = np.eye(reference.shape[0], dtype=np.float64)
+    if not np.allclose(
+        basis.T @ basis, identity, rtol=0.0, atol=tolerance
+    ):
+        raise ValueError(
+            f"{context}: orbital_eigenvectors columns must be orthonormal"
+        )
+    # If U_ref contains the eigenvectors of H_ref by columns, this similarity
+    # transform is diagonal.  A nonzero off-diagonal residual is evidence of a
+    # mismatched H/U pair, not a physical coupling target for WALoss.
+    aligned = basis.T @ reference @ basis
+    off_diagonal = aligned - np.diag(np.diag(aligned))
+    scale = max(1.0, float(np.max(np.abs(reference))))
+    residual = float(np.max(np.abs(off_diagonal)))
+    if residual > tolerance * scale:
+        raise ValueError(
+            f"{context}: orbital_eigenvectors do not diagonalize "
+            "orbital_hamiltonian "
+            f"(max aligned off-diagonal={residual:.6g}, "
+            f"limit={tolerance * scale:.6g})"
+        )
+    return int(reference.shape[0])
+
+
+def _wavefunction_dimension_from_hdf5_labels(labels: Any) -> int:
+    """Validate the optional fixed orbital subspace declared by an HDF5 file."""
+    present = [name for name in HDF5_WAVEFUNCTION_LABELS if name in labels]
+    if not present:
+        return 0
+    if len(present) != len(HDF5_WAVEFUNCTION_LABELS):
+        missing = sorted(set(HDF5_WAVEFUNCTION_LABELS) - set(present))
+        raise ValueError(f"Canonical WALoss payload is missing labels {missing}")
+    shapes = {
+        name: tuple(int(value) for value in labels[name].shape[1:])
+        for name in HDF5_WAVEFUNCTION_LABELS
+    }
+    unique_shapes = set(shapes.values())
+    if len(unique_shapes) != 1:
+        raise ValueError(f"Canonical WALoss label shapes differ: {shapes}")
+    shape = next(iter(unique_shapes))
+    if len(shape) != 2 or shape[0] <= 0 or shape[0] != shape[1]:
+        raise ValueError(f"Canonical WALoss labels must have shape (N, K, K): {shapes}")
+    return int(shape[0])
+
+
+def _wavefunction_dimension_from_configurations(
+    configurations: Sequence[Configuration],
+) -> int:
+    """Infer and validate one fixed aligned orbital dimension in memory."""
+    dimensions: set[int] = set()
+    for index, configuration in enumerate(configurations):
+        props = dict(configuration.properties or {})
+        active = {
+            name
+            for name in HDF5_WAVEFUNCTION_LABELS
+            if name in props
+            and float(configuration.property_weights.get(name, 1.0)) > 0.0
+        }
+        if active and active != set(HDF5_WAVEFUNCTION_LABELS):
+            missing = sorted(set(HDF5_WAVEFUNCTION_LABELS) - active)
+            raise ValueError(
+                f"Configuration {index}: WALoss supervision is missing {missing}"
+            )
+        declared = int(props.get("wavefunction_dim", 0) or 0)
+        if declared < 0:
+            raise ValueError(f"Configuration {index}: wavefunction_dim is negative")
+        if active:
+            hamiltonian = np.asarray(props["orbital_hamiltonian"], dtype=float)
+            eigenvectors = np.asarray(props["orbital_eigenvectors"], dtype=float)
+            inferred = _validate_reference_eigensystem_numpy(
+                hamiltonian,
+                eigenvectors,
+                context=f"Configuration {index}",
+            )
+            if declared not in (0, inferred):
+                raise ValueError(
+                    f"Configuration {index}: wavefunction_dim={declared} does not "
+                    f"match matrix dimension {inferred}"
+                )
+            declared = inferred
+        if declared > 0:
+            dimensions.add(declared)
+    if len(dimensions) > 1:
+        raise ValueError(
+            "WALoss requires one fixed aligned orbital subspace; found "
+            f"dimensions {sorted(dimensions)}"
+        )
+    return next(iter(dimensions), 0)
+
+
+def _propagate_wavefunction_dimension(
+    configurations: Sequence[Configuration], dimension: int
+) -> None:
+    """Attach a shared dimension so unlabeled records collate with labeled ones."""
+    size = int(dimension)
+    if size <= 0:
+        return
+    for configuration in configurations:
+        configuration.properties["wavefunction_dim"] = size
 
 
 def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
@@ -1778,6 +2201,7 @@ def iter_hdf5_configurations(
         structures, labels, masks, metadata_group = (
             handle["structures"], handle["labels"], handle["masks"], handle["metadata"]
         )
+        wavefunction_dim = _wavefunction_dimension_from_hdf5_labels(labels)
         atom_ptr = np.asarray(structures["atom_ptr"], dtype=np.int64)
         split_values = (
             [str(x) for x in metadata_group["split"].asstr()[:]]
@@ -1838,8 +2262,10 @@ def iter_hdf5_configurations(
                 continue
             start, end = int(atom_ptr[index]), int(atom_ptr[index + 1])
             props: Dict[str, Any] = {}
+            if wavefunction_dim > 0:
+                props["wavefunction_dim"] = int(wavefunction_dim)
             weights: Dict[str, float] = {}
-            for name in HDF5_STRUCTURE_LABELS:
+            for name in HDF5_ALL_STRUCTURE_LABELS:
                 if name not in masks or name not in labels:
                     continue
                 if bool(masks[name][index]):
@@ -1951,6 +2377,7 @@ class HDF5StreamPlan:
     split_info: Dict[str, Any]
     source_size: int
     source_mtime_ns: int
+    label_shapes: Dict[str, Tuple[int, ...]] = field(default_factory=dict)
 
     @property
     def selected_indices(self) -> np.ndarray:
@@ -2097,8 +2524,10 @@ def prepare_hdf5_stream_plan(
                 + ", ".join(missing_groups)
             )
         structures = handle["structures"]
+        labels = handle["labels"]
         metadata = handle["metadata"]
         masks = handle["masks"]
+        _wavefunction_dimension_from_hdf5_labels(labels)
         atom_ptr = np.asarray(structures["atom_ptr"][:], dtype=np.int64)
         n_structures = len(atom_ptr) - 1
         group_ids = tuple(
@@ -2184,8 +2613,12 @@ def prepare_hdf5_stream_plan(
 
         label_masks = {
             name: np.asarray(masks[name][:], dtype=np.bool_)
-            for name in itertools.chain(HDF5_STRUCTURE_LABELS, HDF5_ATOM_LABELS)
+            for name in itertools.chain(HDF5_ALL_STRUCTURE_LABELS, HDF5_ATOM_LABELS)
             if name in masks
+        }
+        label_shapes = {
+            str(name): tuple(int(value) for value in labels[name].shape[1:])
+            for name in labels
         }
         elements: set = set()
         atomic_numbers_dataset = structures["atomic_numbers"]
@@ -2225,6 +2658,7 @@ def prepare_hdf5_stream_plan(
         split_info=split_info,
         source_size=int(source_stat.st_size),
         source_mtime_ns=int(source_stat.st_mtime_ns),
+        label_shapes=label_shapes,
     )
 
 
@@ -2273,10 +2707,13 @@ def _read_hdf5_configuration_at(
     end = int(plan.atom_ptr[structure_index + 1])
     structures = handle["structures"]
     props: Dict[str, Any] = {"group_id": plan.group_ids[structure_index]}
+    wavefunction_shape = plan.label_shapes.get("orbital_hamiltonian", ())
+    if wavefunction_shape:
+        props["wavefunction_dim"] = int(wavefunction_shape[0])
     weights: Dict[str, float] = {}
     if include_labels:
         labels = handle["labels"]
-        for name in HDF5_STRUCTURE_LABELS:
+        for name in HDF5_ALL_STRUCTURE_LABELS:
             mask = plan.label_masks.get(name)
             if mask is None or not bool(mask[structure_index]) or name not in labels:
                 continue
@@ -2351,14 +2788,23 @@ def _read_hdf5_configurations_at(
     positions = ragged_rows(structures["positions"], all_unique_positions)
     cells = np.asarray(structures["cell"][unique.tolist()], dtype=float)
     pbc_values = np.asarray(structures["pbc"][unique.tolist()], dtype=bool)
+    wavefunction_shape = plan.label_shapes.get("orbital_hamiltonian", ())
     properties: List[Dict[str, Any]] = [
-        {"group_id": plan.group_ids[int(index)]} for index in unique
+        {
+            "group_id": plan.group_ids[int(index)],
+            **(
+                {"wavefunction_dim": int(wavefunction_shape[0])}
+                if wavefunction_shape
+                else {}
+            ),
+        }
+        for index in unique
     ]
     weights: List[Dict[str, float]] = [{} for _index in unique]
 
     if include_labels:
         labels = handle["labels"]
-        for name in HDF5_STRUCTURE_LABELS:
+        for name in HDF5_ALL_STRUCTURE_LABELS:
             mask = plan.label_masks.get(name)
             if mask is None or name not in labels:
                 continue
@@ -4742,16 +5188,27 @@ def _validate_configuration(cfg: Configuration, *, context: str) -> None:
     fully_periodic = all(pbc)
     volume = abs(float(np.linalg.det(cell)))
     for name, value in cfg.properties.items():
-        if name not in HDF5_STRUCTURE_LABELS and name not in HDF5_ATOM_LABELS:
+        if (
+            name not in HDF5_STRUCTURE_LABELS
+            and name not in HDF5_ATOM_LABELS
+            and name not in HDF5_WAVEFUNCTION_LABELS
+        ):
             continue
         array = np.asarray(value, dtype=float)
         if not np.isfinite(array).all():
             raise ValueError(f"{context}: label {name!r} contains non-finite values")
-        expected = (
-            HDF5_STRUCTURE_LABELS[name]
-            if name in HDF5_STRUCTURE_LABELS
-            else (len(atomic_numbers),) + HDF5_ATOM_LABELS[name]
-        )
+        if name in HDF5_WAVEFUNCTION_LABELS:
+            if array.ndim != 2 or array.shape[0] != array.shape[1] or not array.size:
+                raise ValueError(
+                    f"{context}: label {name!r} must be a non-empty square matrix"
+                )
+            expected = array.shape
+        else:
+            expected = (
+                HDF5_STRUCTURE_LABELS[name]
+                if name in HDF5_STRUCTURE_LABELS
+                else (len(atomic_numbers),) + HDF5_ATOM_LABELS[name]
+            )
         if array.shape != expected:
             raise ValueError(
                 f"{context}: label {name!r} has shape {array.shape}, expected {expected}"
@@ -4759,7 +5216,11 @@ def _validate_configuration(cfg: Configuration, *, context: str) -> None:
     active = {
         name
         for name in cfg.properties
-        if name in HDF5_STRUCTURE_LABELS or name in HDF5_ATOM_LABELS
+        if (
+            name in HDF5_STRUCTURE_LABELS
+            or name in HDF5_ATOM_LABELS
+            or name in HDF5_WAVEFUNCTION_LABELS
+        )
         if float(cfg.property_weights.get(name, 1.0)) > 0.0
     }
     strain_response = active & {"stress", "piezoelectric", "magnetoelastic_stress"}
@@ -4787,6 +5248,24 @@ def _validate_configuration(cfg: Configuration, *, context: str) -> None:
             raise ValueError(
                 f"{context}: magnetoelastic_stress requires active {missing} labels"
             )
+    active_wavefunction = active & set(HDF5_WAVEFUNCTION_LABELS)
+    if active_wavefunction:
+        missing = sorted(set(HDF5_WAVEFUNCTION_LABELS) - active_wavefunction)
+        if missing:
+            raise ValueError(
+                f"{context}: WALoss supervision requires active {missing} labels"
+            )
+        hamiltonian = np.asarray(
+            cfg.properties["orbital_hamiltonian"], dtype=float
+        )
+        eigenvectors = np.asarray(
+            cfg.properties["orbital_eigenvectors"], dtype=float
+        )
+        _validate_reference_eigensystem_numpy(
+            hamiltonian,
+            eigenvectors,
+            context=context,
+        )
 
 
 
@@ -4940,6 +5419,7 @@ def inspect_composite_dataset(
         missing: List[str] = []
         mismatched: List[str] = []
         embedded_errors: List[str] = []
+        wavefunction_dim = 0
         selection = handle["selection"]
         selection_lengths = {
             name: int(selection[name].shape[0])
@@ -5092,6 +5572,9 @@ def inspect_composite_dataset(
                     "missing embedded groups: " + ", ".join(absent)
                 )
             else:
+                wavefunction_dim = _wavefunction_dimension_from_hdf5_labels(
+                    handle["labels"]
+                )
                 atom_ptr = handle["structures/atom_ptr"]
                 embedded_structures = max(0, int(atom_ptr.shape[0]) - 1)
                 embedded_atoms = int(atom_ptr[-1]) if atom_ptr.shape[0] else 0
@@ -5128,6 +5611,12 @@ def inspect_composite_dataset(
         else:
             raw_path = str(large_group.attrs.get("path", ""))
             large = _resolve_composite_source(composite, raw_path)
+            if large.is_file():
+                with h5py.File(large, "r") as large_handle:
+                    if "labels" in large_handle:
+                        wavefunction_dim = _wavefunction_dimension_from_hdf5_labels(
+                            large_handle["labels"]
+                        )
             if verify_sources:
                 if not large.is_file():
                     missing.append(str(large))
@@ -5169,6 +5658,7 @@ def inspect_composite_dataset(
             "periodic_structures": int(handle.attrs["omat24_structures"])
                 + int(large_info.get("periodic_structures", 0)),
             "labels": labels,
+            "wavefunction_dim": int(wavefunction_dim),
             "splits": dict(sorted(splits.items())),
             "sources": {
                 **{f"OMat24/{item['name']}": int(item["selected_unique"])
@@ -5200,6 +5690,8 @@ _CAPABILITY_STRUCTURE_ALIASES: Dict[str, set] = {
     "DMI_effective": {"DMI_effective", "dmi_effective"},
     "Di_effective": {"Di_effective", "di_effective"},
     "soc": {"soc"},
+    "orbital_hamiltonian": {"orbital_hamiltonian", "hamiltonian"},
+    "orbital_eigenvectors": {"orbital_eigenvectors", "wavefunctions"},
 }
 _CAPABILITY_ATOM_ALIASES: Dict[str, set] = {
     "forces": {"forces", "force", "F"},
@@ -5225,6 +5717,7 @@ def inspect_dataset_capabilities(path: str) -> Dict[str, Any]:
     elements: set = set()
     structures = 0
     periodic_structures = 0
+    wavefunction_dim = 0
 
     if _is_hdf5_path(str(dataset)):
         if not HAS_H5PY:
@@ -5243,6 +5736,9 @@ def inspect_dataset_capabilities(path: str) -> Dict[str, Any]:
                     str(name): int(np.count_nonzero(handle["masks"][name][:]))
                     for name in handle["masks"].keys()
                 }
+            wavefunction_dim = _wavefunction_dimension_from_hdf5_labels(
+                handle["labels"]
+            )
             if "structures/pbc" in handle:
                 pbc = np.asarray(handle["structures/pbc"], dtype=bool).reshape(-1, 3)
                 periodic_structures = int(np.count_nonzero(np.any(pbc, axis=1)))
@@ -5283,6 +5779,23 @@ def inspect_dataset_capabilities(path: str) -> Dict[str, Any]:
                 )
                 for label in frame_labels:
                     labels[label] = labels.get(label, 0) + 1
+                if set(HDF5_WAVEFUNCTION_LABELS) <= frame_labels:
+                    raw_hamiltonian = next(
+                        info[name]
+                        for name in ("orbital_hamiltonian", "hamiltonian")
+                        if name in info
+                    )
+                    frame_wavefunction_dim = int(
+                        parse_square_matrix(
+                            raw_hamiltonian, name="orbital_hamiltonian"
+                        ).shape[0]
+                    )
+                    if wavefunction_dim not in (0, frame_wavefunction_dim):
+                        raise ValueError(
+                            "Legacy extXYZ WALoss orbital dimension changes from "
+                            f"{wavefunction_dim} to {frame_wavefunction_dim}"
+                        )
+                    wavefunction_dim = frame_wavefunction_dim
 
                 has_lattice = "Lattice" in info
                 pbc = (
@@ -5333,6 +5846,7 @@ def inspect_dataset_capabilities(path: str) -> Dict[str, Any]:
         "periodic_structures": int(periodic_structures),
         "elements": sorted(int(value) for value in elements),
         "labels": {str(name): int(count) for name, count in labels.items()},
+        "wavefunction_dim": int(wavefunction_dim),
     }
 
 
@@ -5348,6 +5862,16 @@ def merge_dataset_capabilities(capabilities: Sequence[Dict[str, Any]]) -> Dict[s
             "labels": {},
         }
     labels: Dict[str, int] = {}
+    wavefunction_dimensions = {
+        int(report.get("wavefunction_dim", 0) or 0)
+        for report in reports
+        if int(report.get("wavefunction_dim", 0) or 0) > 0
+    }
+    if len(wavefunction_dimensions) > 1:
+        raise ValueError(
+            "Selected datasets use incompatible WALoss orbital dimensions: "
+            f"{sorted(wavefunction_dimensions)}"
+        )
     for report in reports:
         for name, count in dict(report.get("labels", {})).items():
             labels[str(name)] = labels.get(str(name), 0) + int(count)
@@ -5363,6 +5887,7 @@ def merge_dataset_capabilities(capabilities: Sequence[Dict[str, Any]]) -> Dict[s
             set().union(*(set(report.get("elements", [])) for report in reports))
         ),
         "labels": labels,
+        "wavefunction_dim": next(iter(wavefunction_dimensions), 0),
     }
 
 
@@ -5376,7 +5901,7 @@ def architecture_switch_availability(
     keys = (
         "e3mu_use_parity", "e3mu_use_l3", "enable_continuous_chem",
         "enable_qeq", "enable_pme", "enable_deq", "enable_d4",
-        "enable_spin", "enable_film", "enable_dmi",
+        "enable_spin", "enable_film", "enable_dmi", "enable_waloss",
     )
     if not bool(capability.get("ready")):
         return {key: (True, "Select a dataset to evaluate this switch") for key in keys}
@@ -5414,6 +5939,7 @@ def architecture_switch_availability(
     dmi_signal = spin_signal and (
         "DMI_effective" in labels or ("soc" in labels and "energy" in labels)
     )
+    waloss_signal = set(HDF5_WAVEFUNCTION_LABELS) <= labels
 
     availability: Dict[str, Tuple[bool, str]] = {
         "e3mu_use_parity": (True, "Core symmetry option; independent of labels"),
@@ -5465,6 +5991,11 @@ def architecture_switch_availability(
             "Requires DMI labels or SOC spin-energy configurations"
             if not dmi_signal else "Supported",
         ),
+        "enable_waloss": (
+            waloss_signal,
+            "Requires paired orbital_hamiltonian and orbital_eigenvectors labels"
+            if not waloss_signal else "Supported",
+        ),
     }
     return availability
 
@@ -5480,6 +6011,7 @@ ARCHITECTURE_SWITCH_PARAMETERS: Tuple[str, ...] = (
     "enable_spin",
     "enable_film",
     "enable_dmi",
+    "enable_waloss",
 )
 
 DATASET_LOSS_LABELS: Dict[str, set] = {
@@ -5500,6 +6032,10 @@ DATASET_LOSS_LABELS: Dict[str, set] = {
     "w_j": {"J_effective"},
     "w_di": {"Di", "Di_effective"},
     "w_dmi": {"DMI_effective"},
+    # WALoss is identifiable only from the paired operator/eigenspace payload.
+    # Capability gating uses this set as an AND requirement; neither matrix on
+    # its own is treated as sufficient electronic supervision.
+    "w_waloss": {"orbital_hamiltonian", "orbital_eigenvectors"},
     "w_bec_sum_rule": {"bec"},
     "w_coupling_consistency": {
         "field", "total_charge", "spins", "charges", "dipole",
@@ -5682,6 +6218,7 @@ def architecture_parameter_relevance(values: Any) -> Dict[str, Tuple[bool, str]]
     deq = _architecture_value(values, "enable_deq")
     d4 = _architecture_value(values, "enable_d4")
     spin = _architecture_value(values, "enable_spin")
+    waloss = _architecture_value(values, "enable_waloss")
     film = _architecture_value(values, "enable_film")
     dmi = _architecture_value(values, "enable_dmi")
     continuous_chem = _architecture_value(values, "enable_continuous_chem")
@@ -5772,6 +6309,22 @@ def architecture_parameter_relevance(values: Any) -> Dict[str, Tuple[bool, str]]
         "w_j": (spin, "Exchange J requires the spin Hamiltonian."),
         "w_di": (spin, "Single-ion anisotropy Di requires the spin Hamiltonian."),
         "w_dmi": (spin and dmi, "DMI supervision requires both Spin and DMI."),
+        "waloss_dim": (
+            waloss,
+            "The aligned orbital dimension is used only by the WALoss head.",
+        ),
+        "w_waloss": (
+            waloss,
+            "Wavefunction alignment supervision requires the WALoss head.",
+        ),
+        "waloss_diagonal_weight": (
+            waloss,
+            "The diagonal orbital-energy term is used only by WALoss.",
+        ),
+        "waloss_off_diagonal_weight": (
+            waloss,
+            "The off-diagonal orbital-coupling term is used only by WALoss.",
+        ),
     }
 
 
@@ -5793,7 +6346,7 @@ def dataset_loss_parameter_availability(
     for name, supported_labels in DATASET_LOSS_LABELS.items():
         available = (
             supported_labels <= labels
-            if name == "w_magnetoelastic"
+            if name in {"w_magnetoelastic", "w_waloss"}
             else bool(labels & supported_labels)
         )
         result[name] = (
@@ -5856,7 +6409,7 @@ def dynamic_parameter_reference_ranges(
         int(_architecture_value(values, name))
         for name in (
             "enable_qeq", "enable_pme", "enable_deq", "enable_d4",
-            "enable_spin", "enable_film",
+            "enable_spin", "enable_film", "enable_waloss",
         )
     )
     r_low, r_high = ((5.0, 10.0) if periodic else (4.0, 8.0))
@@ -6014,7 +6567,7 @@ def estimate_model_parameter_count(
             bool(getattr(cfg, name, False))
             for name in (
                 "enable_qeq", "enable_pme", "enable_deq", "enable_d4",
-                "enable_spin", "enable_film",
+                "enable_spin", "enable_film", "enable_waloss",
             )
         )
         else DualLayerFieldModel
@@ -6441,6 +6994,265 @@ def _weighted_mse(pred: torch.Tensor, target: torch.Tensor, weight: Optional[tor
     ).clamp(min=1e-12)
 
 
+def wavefunction_alignment_loss(
+    predicted_hamiltonian: torch.Tensor,
+    reference_hamiltonian: torch.Tensor,
+    reference_eigenvectors: torch.Tensor,
+    *,
+    diagonal_weight: float = 1.0,
+    off_diagonal_weight: float = 1.0,
+    sample_weight: Optional[torch.Tensor] = None,
+    validate_reference: bool = True,
+    matrix_atol: float = WALOSS_MATRIX_ATOL,
+) -> Dict[str, torch.Tensor]:
+    """Evaluate the proposal's wavefunction-alignment loss (WALoss).
+
+    Physical problem
+    ----------------
+    Matrix entries of an electronic Hamiltonian are gauge-dependent.  A direct
+    element-wise MSE does not distinguish an orbital-energy shift from a change
+    in orbital mixing, and near-degenerate eigenvectors may rotate strongly
+    under a small operator perturbation.  WALoss evaluates the prediction in a
+    physically identified reference eigenspace instead.
+
+    Definition
+    ----------
+    ``reference_eigenvectors`` stores ``U_ref`` by columns.  For every graph,
+
+    ``H_pred_aligned = U_ref^H @ H_pred @ U_ref``
+
+    ``H_ref_aligned  = U_ref^H @ H_ref  @ U_ref``.
+
+    A valid reference eigensystem makes ``H_ref_aligned`` diagonal.  The
+    diagonal loss measures orbital-energy error.  The strict upper triangle
+    measures residual mixing/coupling in the reference eigenspace and avoids
+    double-counting Hermitian pairs.  Both components are divided by their own
+    number of active entries, so the O(K^2) coupling population cannot dominate
+    the O(K) energy population merely through multiplicity.
+
+    Gradient and PINN interpretation
+    --------------------------------
+    The predicted matrix is symmetrized and transformed with *fixed reference
+    data*.  No eigensolver is applied to ``H_pred`` and no gradient passes
+    through ``U_ref``.  The differentiable path is therefore the two basis
+    products followed by the Hamiltonian readout and shared Response features.
+    This is the physics-informed constraint meant by the proposal: operator
+    symmetry, a valid reference eigenproblem, and losses on spectral/mixing
+    quantities.  It is not a real-space Schrodinger or Kohn-Sham PDE residual.
+
+    Gauge and model limits
+    ----------------------
+    A common unitary rotation of ``H_pred``, ``H_ref``, and ``U_ref`` leaves the
+    scalar loss unchanged.  That invariance does not repair unrelated per-row
+    gauges: the dataset must already share one ordered orbital/Wannier subspace,
+    energy reference, spin/k-point convention, and electronic-structure method.
+    Degenerate manifolds require an upstream stable subspace gauge because this
+    implementation compares supplied vectors rather than gauge-free projectors.
+    The primitive accepts complex-Hermitian tensors; the current canonical data
+    writer and model head are restricted to real-symmetric matrices.
+
+    Args:
+        predicted_hamiltonian: ``(B, K, K)`` learned electronic matrices.
+        reference_hamiltonian: Paired reference matrices in the same raw basis.
+        reference_eigenvectors: Reference eigenvectors by columns.
+        diagonal_weight: Internal weight for orbital-energy MSE.
+        off_diagonal_weight: Internal weight for orbital-mixing/coupling MSE.
+        sample_weight: Optional non-negative graph mask/weight of shape ``(B,)``.
+        validate_reference: Recheck Hermiticity, orthonormality, and the
+            reference eigenproblem.  Training disables this only after ingestion
+            has applied the same checks once.
+        matrix_atol: Absolute base tolerance for reference validation.
+
+    Returns:
+        Total/component losses, component MAEs, aligned values used by validation
+        plots (magnitudes for complex tensors), and the effective per-graph
+        mask.  ``loss`` is multiplied by the outer ``w_waloss`` only in the
+        multi-task trainer.
+    """
+    predicted = torch.as_tensor(predicted_hamiltonian)
+    reference = torch.as_tensor(
+        reference_hamiltonian, device=predicted.device, dtype=predicted.dtype
+    )
+    eigenvectors = torch.as_tensor(
+        reference_eigenvectors, device=predicted.device, dtype=predicted.dtype
+    )
+    if predicted.ndim == 2:
+        predicted = predicted.unsqueeze(0)
+    if reference.ndim == 2:
+        reference = reference.unsqueeze(0)
+    if eigenvectors.ndim == 2:
+        eigenvectors = eigenvectors.unsqueeze(0)
+    if (
+        predicted.ndim != 3
+        or predicted.shape[-1] != predicted.shape[-2]
+        or predicted.shape[-1] <= 0
+    ):
+        raise ValueError(
+            "predicted_hamiltonian must have shape (batch, K, K), got "
+            f"{tuple(predicted.shape)}"
+        )
+    if reference.shape != predicted.shape or eigenvectors.shape != predicted.shape:
+        raise ValueError(
+            "WALoss tensors must share shape (batch, K, K): "
+            f"pred={tuple(predicted.shape)} H_ref={tuple(reference.shape)} "
+            f"U_ref={tuple(eigenvectors.shape)}"
+        )
+    if not bool(torch.isfinite(reference).all().detach().cpu()):
+        raise ValueError("reference_hamiltonian contains NaN or Inf")
+    if not bool(torch.isfinite(eigenvectors).all().detach().cpu()):
+        raise ValueError("reference_eigenvectors contains NaN or Inf")
+    if not math.isfinite(float(diagonal_weight)) or float(diagonal_weight) < 0.0:
+        raise ValueError("WALoss diagonal_weight must be finite and non-negative")
+    if not math.isfinite(float(off_diagonal_weight)) or float(off_diagonal_weight) < 0.0:
+        raise ValueError("WALoss off_diagonal_weight must be finite and non-negative")
+    if float(diagonal_weight) == 0.0 and float(off_diagonal_weight) == 0.0:
+        raise ValueError("At least one WALoss component weight must be positive")
+
+    # U_ref is fixed supervision.  Computing the reference transform outside
+    # the learned path makes the exact physical target explicit and auditable.
+    adjoint = reference.mH
+    aligned_reference = eigenvectors.mH @ reference @ eigenvectors
+    if validate_reference:
+        tolerance = float(matrix_atol)
+        if not math.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("matrix_atol must be finite and greater than zero")
+        hermitian_residual = torch.max(torch.abs(reference - adjoint)).detach()
+        identity = torch.eye(
+            predicted.shape[-1], dtype=predicted.dtype, device=predicted.device
+        ).expand(predicted.shape[0], -1, -1)
+        orthogonality_residual = torch.max(
+            torch.abs(eigenvectors.mH @ eigenvectors - identity)
+        ).detach()
+        if float(hermitian_residual.cpu()) > tolerance:
+            raise ValueError(
+                "reference_hamiltonian is not Hermitian within "
+                f"atol={tolerance:g}"
+            )
+        if float(orthogonality_residual.cpu()) > tolerance:
+            raise ValueError(
+                "reference_eigenvectors are not orthonormal within "
+                f"atol={tolerance:g}"
+            )
+        aligned_diagonal = torch.diag_embed(
+            torch.diagonal(aligned_reference, dim1=-2, dim2=-1)
+        )
+        diagonalization_residual = torch.max(
+            torch.abs(aligned_reference - aligned_diagonal)
+        ).detach()
+        reference_scale = max(
+            1.0, float(torch.max(torch.abs(reference)).detach().cpu())
+        )
+        if float(diagonalization_residual.cpu()) > tolerance * reference_scale:
+            raise ValueError(
+                "reference_eigenvectors do not diagonalize "
+                "reference_hamiltonian within "
+                f"atol={tolerance:g} (scaled limit="
+                f"{tolerance * reference_scale:.6g})"
+            )
+
+    # Enforce the Hermitian operator class by construction of the loss.  The
+    # current head is already exactly symmetric, but this projection keeps the
+    # public primitive safe for custom differentiable predictors.
+    predicted = 0.5 * (predicted + predicted.mH)
+    aligned_prediction = eigenvectors.mH @ predicted @ eigenvectors
+    diagonal_prediction = torch.diagonal(
+        aligned_prediction, dim1=-2, dim2=-1
+    )
+    diagonal_reference = torch.diagonal(
+        aligned_reference, dim1=-2, dim2=-1
+    )
+    dimension = int(predicted.shape[-1])
+    # Use i < j only.  For a Hermitian matrix H_ji is the conjugate of H_ij, so
+    # including both triangles would count every physical coupling twice.
+    upper = torch.triu_indices(
+        dimension, dimension, offset=1, device=predicted.device
+    )
+    off_prediction = aligned_prediction[:, upper[0], upper[1]]
+    off_reference = aligned_reference[:, upper[0], upper[1]]
+
+    if sample_weight is None:
+        graph_weight = torch.ones(
+            (predicted.shape[0],),
+            dtype=predicted.real.dtype,
+            device=predicted.device,
+        )
+    else:
+        graph_weight = torch.as_tensor(
+            sample_weight,
+            dtype=predicted.real.dtype,
+            device=predicted.device,
+        ).reshape(-1)
+        if graph_weight.shape[0] != predicted.shape[0]:
+            raise ValueError(
+                "sample_weight must have one value per Hamiltonian, got "
+                f"{tuple(graph_weight.shape)} for batch={predicted.shape[0]}"
+            )
+    if not bool(torch.isfinite(graph_weight).all().detach().cpu()):
+        raise ValueError("WALoss sample weights must be finite")
+    if bool(torch.any(graph_weight < 0.0).detach().cpu()):
+        raise ValueError("WALoss sample weights cannot be negative")
+
+    def weighted_component(
+        prediction: torch.Tensor, target: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Expanding the graph mask over only this component population makes the
+        # denominator sum_g m_g*d_component.  Diagonal and coupling losses are
+        # therefore comparable across K and across partially labeled batches.
+        if prediction.shape[-1] == 0:
+            zero = torch.zeros(
+                (), dtype=predicted.real.dtype, device=predicted.device
+            )
+            return zero, zero
+        expanded = graph_weight.view(-1, 1).expand_as(prediction.real)
+        denominator = torch.sum(expanded).clamp(min=1e-12)
+        difference = prediction - target
+        squared = torch.abs(difference) ** 2
+        absolute = torch.abs(difference)
+        return (
+            torch.sum(squared * expanded) / denominator,
+            torch.sum(absolute * expanded) / denominator,
+        )
+
+    diagonal_loss, diagonal_mae = weighted_component(
+        diagonal_prediction, diagonal_reference
+    )
+    off_diagonal_loss, off_diagonal_mae = weighted_component(
+        off_prediction, off_reference
+    )
+    total = (
+        float(diagonal_weight) * diagonal_loss
+        + float(off_diagonal_weight) * off_diagonal_loss
+    )
+    metric_diagonal_prediction = (
+        torch.abs(diagonal_prediction)
+        if torch.is_complex(diagonal_prediction)
+        else diagonal_prediction
+    )
+    metric_diagonal_reference = (
+        torch.abs(diagonal_reference)
+        if torch.is_complex(diagonal_reference)
+        else diagonal_reference
+    )
+    metric_off_prediction = (
+        torch.abs(off_prediction) if torch.is_complex(off_prediction) else off_prediction
+    )
+    metric_off_reference = (
+        torch.abs(off_reference) if torch.is_complex(off_reference) else off_reference
+    )
+    return {
+        "loss": total,
+        "diagonal_loss": diagonal_loss,
+        "off_diagonal_loss": off_diagonal_loss,
+        "diagonal_mae": diagonal_mae,
+        "off_diagonal_mae": off_diagonal_mae,
+        "diagonal_prediction": metric_diagonal_prediction,
+        "diagonal_reference": metric_diagonal_reference,
+        "off_diagonal_prediction": metric_off_prediction,
+        "off_diagonal_reference": metric_off_reference,
+        "sample_weight": graph_weight,
+    }
+
+
 def _weighted_huber(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -6592,6 +7404,17 @@ class ModelConfig:
     enable_d4: bool = False
     enable_spin: bool = False
     enable_film: bool = False
+    # Optional graph-level electronic Hamiltonian auxiliary head.  It belongs to
+    # the WALoss Response supervision path and is deliberately independent of
+    # the classical-spin J/Di/DMI Hamiltonian.  It does not enter E_total, force,
+    # or stress assembly; its gradient regularizes the shared Response features.
+    #
+    # waloss_dim is the fixed K of one already aligned orbital/Wannier subspace.
+    # Zero means "infer K from paired dataset labels before model construction".
+    # A positive value must match every labeled row.  Fixed K is a batching and
+    # readout contract, not a claim that arbitrary materials have equal bands.
+    enable_waloss: bool = False
+    waloss_dim: int = 0
     qeq_smearing: float = 0.35
     qeq_hardness_min: float = 0.25
     qeq_pme_smearing: float = 1.0
@@ -6615,6 +7438,9 @@ class ModelConfig:
         # former 6 Angstrom magnetic default with the 5 Angstrom local cutoff.
         self.r_max = float(self.r_max)
         self.spin_cutoff = _compatible_spin_cutoff(self.r_max, self.spin_cutoff)
+        self.waloss_dim = int(self.waloss_dim)
+        if self.waloss_dim < 0:
+            raise ValueError("waloss_dim cannot be negative")
 
 # ══════════════════════════════════════════════════════════════════════════
 # SECTION: E(3)-mu-GNN Core
@@ -8601,6 +9427,86 @@ class TimeReversalSpinHamiltonian(torch.nn.Module):
         }
 
 
+class WavefunctionHamiltonianHead(torch.nn.Module):
+    """Predict an auxiliary electronic Hamiltonian in one fixed aligned basis.
+
+    The head maps graph-pooled scalar Response features to the K(K+1)/2 unique
+    entries of a real-symmetric K x K matrix.  Expanding those entries with a
+    fixed symmetric basis makes ``H_pred == H_pred.T`` exact, rather than asking
+    the loss to learn Hermiticity statistically.
+
+    Physical scope:
+        * The output represents the finite orbital/Wannier subspace declared by
+          the dataset, not a real-space many-electron wavefunction or a complete
+          Kohn-Sham operator.
+        * It is not ``TimeReversalSpinHamiltonian``: no spin J, Di, or DMI label
+          is accepted as orbital supervision.
+        * It is an auxiliary Response output.  WALoss gradients update this head
+          and shared Response features, but this matrix is not added to the PES
+          energy used for conservative forces and stress.
+        * Graph-pooled scalar features are rotation invariant.  Consequently the
+          target orbital basis must be canonical under global rotation.  A
+          lab-frame p/d-orbital matrix requires upstream co-rotation/alignment or
+          a future equivariant orbital head; arbitrary oriented matrices must not
+          be fed to this scalar readout.
+
+    The head predicts only H.  U_ref comes from training data and is used by the
+    loss as a constant basis transform, which removes predicted-eigensolver
+    backpropagation from the optimization graph.
+    """
+
+    def __init__(self, hidden: int, dimension: int):
+        super().__init__()
+        self.hidden = int(hidden)
+        self.dimension = int(dimension)
+        if self.hidden <= 0:
+            raise ValueError("WavefunctionHamiltonianHead hidden size must be positive")
+        if self.dimension <= 0:
+            raise ValueError(
+                "WALoss requires waloss_dim > 0 (the aligned orbital subspace size)"
+            )
+        packed_size = self.dimension * (self.dimension + 1) // 2
+        self.readout = torch.nn.Sequential(
+            torch.nn.Linear(self.hidden, self.hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(self.hidden, packed_size),
+        )
+        # Pack one lower triangle, then mirror every off-diagonal coefficient.
+        # This fixed linear expansion has no learned symmetry-breaking degree of
+        # freedom and avoids averaging two independently predicted H_ij/H_ji.
+        row, column = torch.tril_indices(self.dimension, self.dimension)
+        basis = torch.zeros(
+            (packed_size, self.dimension, self.dimension),
+            dtype=torch.get_default_dtype(),
+        )
+        basis[torch.arange(packed_size), row, column] = 1.0
+        off_diagonal = row != column
+        basis[
+            torch.arange(packed_size)[off_diagonal],
+            column[off_diagonal],
+            row[off_diagonal],
+        ] = 1.0
+        self.register_buffer("symmetric_basis", basis, persistent=False)
+
+    def forward(
+        self,
+        scalar_features: torch.Tensor,
+        batch_index: torch.Tensor,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        # WALoss labels are graph-level matrices.  Mean pooling removes the
+        # trivial dependence on atom count while retaining the learned chemical
+        # environment in the invariant scalar Response channels.
+        pooled = scatter_mean(
+            scalar_features,
+            batch_index,
+            dim_size=int(num_graphs),
+        )
+        packed = self.readout(pooled)
+        basis = self.symmetric_basis.to(dtype=packed.dtype, device=packed.device)
+        return torch.einsum("bp,pij->bij", packed, basis)
+
+
 class DualLayerFieldModel(torch.nn.Module):
     """Full dual-layer model combining the ground and response branches.
 
@@ -8614,6 +9520,16 @@ class DualLayerFieldModel(torch.nn.Module):
         self.z_table_zs = list(z_table.zs)
         self.ground = BackupGroundModel(z_table=z_table, atomic_energies_1d=atomic_energies_1d, cfg=cfg)
         self.response = BackupResponseModel(z_table=z_table, cfg=cfg)
+        # K must already be inferred/validated before construction.  Keeping the
+        # head optional preserves exact legacy checkpoint behavior and prevents
+        # an untrained electronic matrix from appearing in ordinary models.
+        self.wavefunction_head = (
+            WavefunctionHamiltonianHead(
+                hidden=int(cfg.num_channels), dimension=int(cfg.waloss_dim)
+            )
+            if bool(getattr(cfg, "enable_waloss", False))
+            else None
+        )
 
     def freeze_ground(self) -> None:
         self.ground.eval()
@@ -8629,11 +9545,19 @@ class DualLayerFieldModel(torch.nn.Module):
         self.response.eval()
         for p in self.response.parameters():
             p.requires_grad_(False)
+        if self.wavefunction_head is not None:
+            self.wavefunction_head.eval()
+            for parameter in self.wavefunction_head.parameters():
+                parameter.requires_grad_(False)
 
     def unfreeze_response(self) -> None:
         self.response.train()
         for p in self.response.parameters():
             p.requires_grad_(True)
+        if self.wavefunction_head is not None:
+            self.wavefunction_head.train()
+            for parameter in self.wavefunction_head.parameters():
+                parameter.requires_grad_(True)
 
     def save(self, path, extra=None):
         ckpt = {
@@ -8644,6 +9568,14 @@ class DualLayerFieldModel(torch.nn.Module):
             "atomic_energies": self.ground.atomic_energies.detach().cpu(),
             "ground_state_dict": self.ground.state_dict(),
             "response_state_dict": self.response.state_dict(),
+            # Store the auxiliary readout explicitly in dual-layer bundles.  A
+            # loader must reject enable_waloss=True when this state is absent;
+            # silently reinitializing it would produce finite but meaningless H.
+            "wavefunction_state_dict": (
+                self.wavefunction_head.state_dict()
+                if self.wavefunction_head is not None
+                else None
+            ),
         }
         if extra:
             safe_extra = _checkpoint_safe(extra)
@@ -8742,6 +9674,14 @@ class DualLayerFieldModel(torch.nn.Module):
             model = cls(z_table=z_table, atomic_energies_1d=ae, cfg=cfg)
             model.ground.load_state_dict(obj["ground_state_dict"])
             model.response.load_state_dict(obj["response_state_dict"])
+            wavefunction_state = obj.get("wavefunction_state_dict")
+            if model.wavefunction_head is not None:
+                if not isinstance(wavefunction_state, dict):
+                    raise ValueError(
+                        "WALoss checkpoint enables the electronic Hamiltonian "
+                        "head but has no wavefunction_state_dict"
+                    )
+                model.wavefunction_head.load_state_dict(wavefunction_state)
             return _finalize_loaded_model(model)
 
         # 2) Backup .pth fallback: state_dict bundle
@@ -8770,7 +9710,7 @@ class DualLayerFieldModel(torch.nn.Module):
                 raise ValueError("state_dict bundle missing ground.atomic_energies; cannot reconstruct model.")
             ae = np.asarray(torch.as_tensor(ae_t).detach().cpu().numpy(), dtype=float).reshape(-1)
             mixed_state_prefixes = (
-                "qeq.", "polarization_solver.", "d4.", "spin_layer."
+                "qeq.", "polarization_solver.", "d4.", "spin_layer.",
             )
             model_class = (
                 MixedGranularityE3GNN
@@ -8781,7 +9721,15 @@ class DualLayerFieldModel(torch.nn.Module):
             model = model_class(
                 z_table=AtomicNumberTable(zs), atomic_energies_1d=ae, cfg=cfg
             )
-            model.load_state_dict(sd, strict=False)
+            incompatible = model.load_state_dict(sd, strict=False)
+            if bool(getattr(cfg, "enable_waloss", False)) and any(
+                str(name).startswith("wavefunction_head.")
+                for name in incompatible.missing_keys
+            ):
+                raise ValueError(
+                    "state_dict bundle enables WALoss but is missing electronic "
+                    "Hamiltonian-head parameters"
+                )
             return _finalize_loaded_model(model)
 
         # 3) Pickled full model object (.pth): return directly
@@ -8819,7 +9767,9 @@ class DualLayerFieldModel(torch.nn.Module):
 
         Returns:
             Dictionary containing total energy, forces, dipole, and
-            polarizability for each graph in the batch.
+            polarizability for each graph in the batch.  When configured, it
+            also contains an auxiliary ``orbital_hamiltonian``; that matrix is
+            supervised by WALoss but is not a term in ``e_total``.
         """
         if training is None:
             training = bool(self.training)
@@ -8858,6 +9808,16 @@ class DualLayerFieldModel(torch.nn.Module):
                 device=batch.positions.device,
             )
             mu_permanent = torch.zeros_like(mu)
+            # Keep a stable output schema even when Base/label-aware routing
+            # disables Response terms.  This tensor is padding, not a prediction;
+            # WALoss masks are zero on such graphs and public ground-only
+            # inference refuses requests for this property.
+            orbital_hamiltonian = torch.zeros(
+                (num_graphs, int(getattr(self.cfg, "waloss_dim", 0)),
+                 int(getattr(self.cfg, "waloss_dim", 0))),
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
+            )
             field = _batch_field(batch, num_graphs) * float(self.cfg.field_scale)
             alpha_factor = (
                 ALPHA_VOLUME_TO_EV_PER_FIELD2
@@ -8868,6 +9828,15 @@ class DualLayerFieldModel(torch.nn.Module):
 
             if use_response_terms:
                 response_components = self.response.forward_components(batch)
+                if self.wavefunction_head is not None:
+                    # H_pred depends on shared Response features, but it is not
+                    # inserted into e_total.  Its only training route is the
+                    # observable-level WALoss evaluated after this forward pass.
+                    orbital_hamiltonian = self.wavefunction_head(
+                        response_components["scalar_features"],
+                        batch.batch,
+                        num_graphs,
+                    )
                 q = response_components["raw_charges"]
                 atomic_dipoles = response_components["atomic_dipoles"]
                 atomic_polarizability = response_components[
@@ -8986,6 +9955,7 @@ class DualLayerFieldModel(torch.nn.Module):
                 "atomic_polarizability": atomic_polarizability,
                 "bec": bec,
                 "piezoelectric": piezoelectric,
+                "orbital_hamiltonian": orbital_hamiltonian,
             }
         finally:
             geometry.restore(batch)
@@ -9589,6 +10559,23 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
                 if float(torch.max(coupling_residual).detach().cpu()) <= float(self.cfg.coupling_tol):
                     break
 
+        # The mixed-granularity model uses the same auxiliary electronic head as
+        # DualLayerFieldModel.  It remains separate from `spin`, whose Jij/Di/DMI
+        # terms contribute to e_spin and have a different physical/data contract.
+        if self.wavefunction_head is not None and use_response_terms:
+            orbital_hamiltonian = self.wavefunction_head(
+                components["scalar_features"], batch.batch, n_graphs
+            )
+        else:
+            orbital_hamiltonian = torch.zeros(
+                (
+                    n_graphs,
+                    int(getattr(self.cfg, "waloss_dim", 0)),
+                    int(getattr(self.cfg, "waloss_dim", 0)),
+                ),
+                dtype=batch.positions.dtype,
+                device=batch.positions.device,
+            )
         charges = domain["charges"]
         atomic_dipoles = components["atomic_dipoles"]
         atomic_alpha = components["atomic_polarizability"]
@@ -9859,6 +10846,7 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
             "c6": d4["atomic_c6"],
             "bec": bec,
             "piezoelectric": piezoelectric,
+            "orbital_hamiltonian": orbital_hamiltonian,
             "Jij": spin["Jij"],
             "Di": spin["Di"],
             "DMIij": spin["DMIij"],
@@ -10303,6 +11291,18 @@ class TrainConfig:
     w_j: float = 0.0
     w_di: float = 0.0
     w_dmi: float = 0.0
+    # WALoss has two weighting levels.  w_waloss balances the complete aligned
+    # electronic objective against energy/force/response tasks.  The diagonal
+    # and off-diagonal weights balance orbital-energy shifts against residual
+    # orbital mixing *inside* WALoss after each population is independently
+    # normalized.  They are not duplicate global loss coefficients.
+    #
+    # Base mode rejects w_waloss > 0.  Response mode trains the head with a
+    # frozen ground branch; Joint/Full Chain can also propagate the auxiliary
+    # gradient through the shared Response representation.
+    w_waloss: float = 0.0
+    waloss_diagonal_weight: float = 1.0
+    waloss_off_diagonal_weight: float = 1.0
     w_bec_sum_rule: float = 0.0
     w_coupling_consistency: float = 0.0
     # Response/Joint training activates a mechanism only for graphs carrying
@@ -10389,6 +11389,11 @@ VALIDATION_MAE_SCALES: Dict[str, float] = {
     "Di_effective": 0.01,
     "Di": 0.01,
     "DMI_effective": 0.01,
+    # These are MAEs of the aligned diagonal and strict upper triangle.  They
+    # are not raw H-matrix MAEs and do not invoke an eigensolver at validation.
+    # A fixed 0.1 eV scale keeps checkpoint ranking independent of w_waloss.
+    "orbital_energies": 0.1,
+    "orbital_couplings": 0.1,
     "coupling_consistency": 0.01,
 }
 
@@ -10398,6 +11403,7 @@ RESPONSE_VALIDATION_TARGETS: Tuple[str, ...] = (
     "atomic_polarizability", "c6", "bec", "piezoelectric",
     "magnetoelastic_stress", "magnetic_moments", "effective_field",
     "J_effective", "Di", "Di_effective", "DMI_effective",
+    "orbital_energies", "orbital_couplings",
 )
 VALIDATION_METRIC_UNITS: Dict[str, str] = {
     **{name: str(unit) for name, unit in HDF5_UNITS.items()},
@@ -10406,12 +11412,16 @@ VALIDATION_METRIC_UNITS: Dict[str, str] = {
     "stress": "eV/angstrom^3",
     "bec_sum_rule": "e",
     "coupling_consistency": "dimensionless",
+    "orbital_energies": "eV",
+    "orbital_couplings": "eV",
 }
 VALIDATION_METRIC_LABELS: Dict[str, str] = {
     "energy": "E-MAE",
     "forces": "F-MAE",
     "stress": "Stress-MAE",
     "total_charge": "Charge-conservation MAE",
+    "orbital_energies": "Orbital-energy MAE",
+    "orbital_couplings": "Orbital-coupling MAE",
 }
 # Charge conservation is enforced explicitly by the response model, so its
 # residual is useful as a diagnostic but is not an independent learned target.
@@ -10884,6 +11894,8 @@ def _supported_response_validation_targets(model_cfg: ModelConfig) -> set[str]:
         })
         if bool(getattr(model_cfg, "enable_dmi", False)):
             supported.add("DMI_effective")
+    if bool(getattr(model_cfg, "enable_waloss", False)):
+        supported.update({"orbital_energies", "orbital_couplings"})
     return supported
 
 
@@ -10900,12 +11912,17 @@ def _stage_default_validation_targets(
         requested.update(CORE_VALIDATION_TARGETS)
     if selected_mode in {"response", "joint"}:
         requested.update(_supported_response_validation_targets(model_cfg))
+    waloss_available = set(HDF5_WAVEFUNCTION_LABELS) <= available
     if "magnetoelastic_stress" in requested and "reference_spins" not in available:
         requested.discard("magnetoelastic_stress")
     return tuple(
         name
         for name in CORE_VALIDATION_TARGETS + RESPONSE_VALIDATION_TARGETS
-        if name in requested and name in available
+        if name in requested
+        and (
+            name in available
+            or (name in {"orbital_energies", "orbital_couplings"} and waloss_available)
+        )
     )
 
 
@@ -10960,11 +11977,13 @@ SPIN_COUPLING_LABELS: Tuple[str, ...] = (
     "Di_effective", "DMI_effective",
     "magnetoelastic_stress", "reference_spins",
 )
+WAVEFUNCTION_COUPLING_LABELS: Tuple[str, ...] = HDF5_WAVEFUNCTION_LABELS
 RESPONSE_COUPLING_LABELS: Tuple[str, ...] = tuple(dict.fromkeys(
     ELECTRIC_COUPLING_LABELS
     + POLARIZATION_COUPLING_LABELS
     + DISPERSION_COUPLING_LABELS
     + SPIN_COUPLING_LABELS
+    + WAVEFUNCTION_COUPLING_LABELS
 ))
 
 
@@ -11286,6 +12305,55 @@ def _nonfinite_output_names(outputs: Dict[str, Any]) -> List[str]:
     return failures
 
 
+def _waloss_terms_for_batch(
+    out: Dict[str, Any], batch: Any, cfg: TrainConfig
+) -> Dict[str, torch.Tensor]:
+    """Bind collated WALoss labels/masks to the mathematical primitive.
+
+    PyG stores the two graph masks independently for general label handling, but
+    WALoss is defined only for a paired (H_ref, U_ref).  Taking their minimum is
+    the differentiable equivalent of a logical AND and prevents either padded
+    tensor from becoming supervision.  Reference validation is disabled in the
+    hot epoch loop because extXYZ/HDF5 ingestion has already checked symmetry,
+    orthogonality, and diagonalization; repeating the O(K^3) test in every epoch
+    would add synchronization and cubic work without new information.
+    """
+    if "orbital_hamiltonian" not in out:
+        raise ValueError("The selected model does not provide an orbital Hamiltonian")
+    prediction = out["orbital_hamiltonian"]
+    reference = torch.as_tensor(
+        batch.orbital_hamiltonian,
+        dtype=prediction.dtype,
+        device=prediction.device,
+    ).reshape_as(prediction)
+    eigenvectors = torch.as_tensor(
+        batch.orbital_eigenvectors,
+        dtype=prediction.dtype,
+        device=prediction.device,
+    ).reshape_as(prediction)
+    hamiltonian_weight = _expanded_property_weight(
+        batch, "orbital_hamiltonian", prediction, atomwise=False
+    )
+    eigenvector_weight = _expanded_property_weight(
+        batch, "orbital_eigenvectors", prediction, atomwise=False
+    )
+    # A row is valid only where both physical objects exist.  This also supports
+    # non-binary confidence weights without allowing the weaker member of the
+    # pair to be overridden by the stronger one.
+    graph_weight = torch.minimum(hamiltonian_weight, eigenvector_weight)
+    return wavefunction_alignment_loss(
+        prediction,
+        reference,
+        eigenvectors,
+        diagonal_weight=float(cfg.waloss_diagonal_weight),
+        off_diagonal_weight=float(cfg.waloss_off_diagonal_weight),
+        sample_weight=graph_weight,
+        # Canonical/extXYZ ingestion has already performed the expensive data
+        # contract check. Avoid a second O(K^3) orthogonality test every epoch.
+        validate_reference=False,
+    )
+
+
 def _additional_physics_loss(
     out: Dict[str, torch.Tensor],
     batch: Any,
@@ -11333,6 +12401,34 @@ def _additional_physics_loss(
         if coefficient > 0.0:
             total = total + coefficient * _weighted_mse(prediction, target, weight)
         metrics[target_name] = _masked_mae_statistics(prediction, target, weight)
+
+    waloss_requested = bool(
+        float(getattr(cfg, "w_waloss", 0.0)) > 0.0
+        or {"orbital_energies", "orbital_couplings"} & requested_metrics
+    )
+    if (
+        waloss_requested
+        and _batch_has_label(batch, "orbital_hamiltonian")
+        and _batch_has_label(batch, "orbital_eigenvectors")
+    ):
+        terms = _waloss_terms_for_batch(out, batch, cfg)
+        # Cache the decomposed terms for diagnostics/plots.  Only `terms["loss"]`
+        # enters optimization; the orbital MAEs remain independent validation
+        # observables and cannot be improved by lowering w_waloss itself.
+        out["_waloss_terms"] = terms
+        if float(getattr(cfg, "w_waloss", 0.0)) > 0.0:
+            total = total + float(cfg.w_waloss) * terms["loss"]
+        graph_weight = terms["sample_weight"]
+        metrics["orbital_energies"] = _masked_mae_statistics(
+            terms["diagonal_prediction"],
+            terms["diagonal_reference"],
+            graph_weight,
+        )
+        metrics["orbital_couplings"] = _masked_mae_statistics(
+            terms["off_diagonal_prediction"],
+            terms["off_diagonal_reference"],
+            graph_weight,
+        )
 
     if "total_charge" in requested_metrics:
         if "charges" not in out:
@@ -11863,7 +12959,7 @@ class AutoSearchEngine:
             "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
             "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di",
-            "w_dmi",
+            "w_dmi", "w_waloss",
         ),
         "qeq_pme": (
             "qeq_smearing", "qeq_hardness_min", "qeq_pme_smearing",
@@ -11883,7 +12979,7 @@ class AutoSearchEngine:
         "architecture": (
             "e3mu_use_parity", "e3mu_use_l3", "rbf_type", "enable_continuous_chem",
             "enable_qeq", "enable_pme", "enable_deq", "enable_d4", "enable_spin",
-            "enable_film", "enable_dmi",
+            "enable_film", "enable_dmi", "enable_waloss",
         ),
     }
     GROUP_ORDER: Tuple[str, ...] = tuple(PARAMETER_GROUPS)
@@ -11911,6 +13007,7 @@ class AutoSearchEngine:
         "w_j":                     ("zero_log_uniform", 0.001, 10.0, 0.20),
         "w_di":                    ("zero_log_uniform", 0.001, 10.0, 0.20),
         "w_dmi":                   ("zero_log_uniform", 0.001, 10.0, 0.20),
+        "w_waloss":                ("zero_log_uniform", 0.001, 10.0, 0.20),
         # ── Level 2: training hyperparams ────────────────────────────────────
         "lr":                     ("log_uniform", 1e-4,  5e-3),
         "batch_size":             ("choice",      [2, 4, 8, 16]),
@@ -11942,6 +13039,7 @@ class AutoSearchEngine:
         "enable_spin":            ("bool",),
         "enable_film":            ("bool",),
         "enable_dmi":             ("bool",),
+        "enable_waloss":          ("bool",),
         "qeq_smearing":           ("uniform", 0.15, 0.8),
         "qeq_hardness_min":       ("log_uniform", 0.05, 2.0),
         "qeq_pme_smearing":       ("uniform", 0.5, 2.0),
@@ -11966,13 +13064,13 @@ class AutoSearchEngine:
             "w_energy", "w_forces", "w_stress", "w_piezoelectric",
             "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
-            "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
+            "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi", "w_waloss",
         ],
         2: [
             "w_energy", "w_forces", "w_stress", "w_piezoelectric",
             "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
-            "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
+            "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi", "w_waloss",
             "lr", "batch_size", "r_max", "num_channels",
             "num_interactions", "num_radial_basis", "field_scale",
             "force_loss", "force_huber_delta", "stress_loss", "stress_huber_delta",
@@ -11981,7 +13079,7 @@ class AutoSearchEngine:
             "w_energy", "w_forces", "w_stress", "w_piezoelectric",
             "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
-            "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
+            "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi", "w_waloss",
             "lr", "batch_size", "r_max", "num_channels",
             "num_interactions", "num_radial_basis", "field_scale",
             "force_loss", "force_huber_delta", "stress_loss", "stress_huber_delta",
@@ -11992,7 +13090,7 @@ class AutoSearchEngine:
             "w_energy", "w_forces", "w_stress", "w_piezoelectric",
             "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability", "w_c6",
-            "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
+            "w_bec", "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi", "w_waloss",
             "lr", "batch_size", "r_max", "num_channels",
             "num_interactions", "num_radial_basis", "field_scale",
             "force_loss", "force_huber_delta", "stress_loss", "stress_huber_delta",
@@ -12000,7 +13098,7 @@ class AutoSearchEngine:
             "warmup_epochs", "w_dipole_final", "w_alpha_final",
             "e3mu_use_parity", "e3mu_use_l3", "rbf_type", "enable_continuous_chem",
             "enable_qeq", "enable_pme", "enable_deq", "enable_d4", "enable_spin",
-            "enable_film", "enable_dmi", "qeq_smearing", "qeq_hardness_min",
+            "enable_film", "enable_dmi", "enable_waloss", "qeq_smearing", "qeq_hardness_min",
             "qeq_pme_smearing", "qeq_pme_lr_wavelength", "qeq_stability_floor",
             "deq_damping", "deq_alpha_max",
             "d4_functional", "spin_cutoff", "coupling_iterations", "coupling_tol",
@@ -12013,7 +13111,7 @@ class AutoSearchEngine:
             "w_energy", "w_forces", "w_stress", "w_piezoelectric",
             "w_magnetoelastic", "w_dipole", "w_polarizability", "w_charges",
             "w_atomic_dipoles", "w_atomic_polarizability", "w_c6", "w_bec",
-            "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi",
+            "w_magnetic_moments", "w_effective_field", "w_j", "w_di", "w_dmi", "w_waloss",
         )
     }
     LOSS_PARAM_TO_TARGET: Dict[str, str] = {
@@ -12034,6 +13132,7 @@ class AutoSearchEngine:
         "w_j": "J_effective",
         "w_di": "Di_effective",
         "w_dmi": "DMI_effective",
+        "w_waloss": "orbital_energies",
     }
 
     @staticmethod
@@ -12109,8 +13208,16 @@ class AutoSearchEngine:
         required_label_fractions: Dict[str, float] = {}
         unavailable_required_targets: List[str] = []
         for target in self.required_targets:
-            aliases = (target, "Di") if target == "Di_effective" else (target,)
-            label_count = max((labels.get(name, 0) for name in aliases), default=0)
+            if target in {"orbital_energies", "orbital_couplings"}:
+                label_count = min(
+                    (labels.get(name, 0) for name in HDF5_WAVEFUNCTION_LABELS),
+                    default=0,
+                )
+            else:
+                aliases = (target, "Di") if target == "Di_effective" else (target,)
+                label_count = max(
+                    (labels.get(name, 0) for name in aliases), default=0
+                )
             if label_count <= 0:
                 unavailable_required_targets.append(target)
                 continue
@@ -12200,12 +13307,29 @@ class AutoSearchEngine:
             plan = _filter_hdf5_stream_plan_for_mode(raw_plan, selected_mode)
             counts: Dict[str, int] = {}
             for target in self.validation_targets:
-                aliases = (target, "Di") if target == "Di_effective" else (target,)
-                mask = next(
-                    (raw_plan.label_masks[name] for name in aliases
-                     if name in raw_plan.label_masks),
-                    None,
-                )
+                if target in {"orbital_energies", "orbital_couplings"}:
+                    wavefunction_masks = [
+                        np.asarray(raw_plan.label_masks[name], dtype=np.bool_)
+                        for name in HDF5_WAVEFUNCTION_LABELS
+                        if name in raw_plan.label_masks
+                    ]
+                    mask = (
+                        np.logical_and.reduce(wavefunction_masks)
+                        if len(wavefunction_masks) == len(HDF5_WAVEFUNCTION_LABELS)
+                        else None
+                    )
+                else:
+                    aliases = (
+                        (target, "Di") if target == "Di_effective" else (target,)
+                    )
+                    mask = next(
+                        (
+                            raw_plan.label_masks[name]
+                            for name in aliases
+                            if name in raw_plan.label_masks
+                        ),
+                        None,
+                    )
                 counts[target] = (
                     int(np.count_nonzero(mask[plan.val_indices]))
                     if mask is not None else 0
@@ -12366,6 +13490,10 @@ class AutoSearchEngine:
                 if name in fixed_loss_params
             )
         )
+        if "w_waloss" in fixed_loss_params:
+            self.validation_targets = tuple(
+                dict.fromkeys(self.validation_targets + ("orbital_couplings",))
+            )
         self.score_targets: Tuple[str, ...] = self.validation_targets
         self.score_scales: Dict[str, float] = {}
         self.score_coverage: Dict[str, int] = {}
@@ -12444,6 +13572,7 @@ class AutoSearchEngine:
             "w_j":                  float(cfg.w_j),
             "w_di":                 float(cfg.w_di),
             "w_dmi":                float(cfg.w_dmi),
+            "w_waloss":             float(cfg.w_waloss),
             "lr":                  float(cfg.lr),
             "batch_size":          int(cfg.batch_size),
             "force_loss":          str(getattr(cfg, "force_loss", "mse")),
@@ -12476,6 +13605,7 @@ class AutoSearchEngine:
             "enable_spin":         bool(mc.enable_spin),
             "enable_film":         bool(mc.enable_film),
             "enable_dmi":          bool(mc.enable_dmi),
+            "enable_waloss":       bool(mc.enable_waloss),
             "qeq_smearing":        float(mc.qeq_smearing),
             "qeq_hardness_min":    float(mc.qeq_hardness_min),
             "qeq_pme_smearing":    float(mc.qeq_pme_smearing),
@@ -12756,6 +13886,8 @@ class AutoSearchEngine:
             model_values["enable_spin"] = True
         if float(params.get("w_dmi", self.base_cfg.w_dmi)) > 0.0:
             model_values["enable_dmi"] = True
+        if float(params.get("w_waloss", self.base_cfg.w_waloss)) > 0.0:
+            model_values["enable_waloss"] = True
         if extended_electric:
             model_values["enable_qeq"] = True
         if float(params.get("w_c6", self.base_cfg.w_c6)) > 0.0:
@@ -12856,6 +13988,11 @@ class AutoSearchEngine:
             w_j                    = float(params.get("w_j", self.base_cfg.w_j)),
             w_di                   = float(params.get("w_di", self.base_cfg.w_di)),
             w_dmi                  = float(params.get("w_dmi", self.base_cfg.w_dmi)),
+            w_waloss               = float(params.get("w_waloss", self.base_cfg.w_waloss)),
+            waloss_diagonal_weight = float(self.base_cfg.waloss_diagonal_weight),
+            waloss_off_diagonal_weight = float(
+                self.base_cfg.waloss_off_diagonal_weight
+            ),
             w_bec_sum_rule         = float(self.base_cfg.w_bec_sum_rule),
             w_coupling_consistency = float(self.base_cfg.w_coupling_consistency),
             label_aware_coupling   = bool(self.base_cfg.label_aware_coupling),
@@ -14261,6 +15398,12 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
           randomly initialized Layer 1 when explicitly started from scratch,
         - or both branches jointly.
 
+    WALoss is an auxiliary electronic Response objective.  In Response mode its
+    gradient stops at the frozen ground/response boundary; in Joint mode it can
+    refine the shared Response representation together with other L2/L3 labels.
+    It never substitutes orbital data for PES energy/force supervision and its
+    predicted matrix is not inserted into the conservative energy Hamiltonian.
+
     The returned validation metric is a normalized mean of all active target
     MAEs, so AutoSearch can compare mixed physical quantities without units
     or candidate loss weights determining the ranking. If the caller requests
@@ -14271,6 +15414,32 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         raise ValueError(f"epochs must be at least 1, got {cfg.epochs}")
     if int(cfg.batch_size) < 1:
         raise ValueError(f"batch_size must be at least 1, got {cfg.batch_size}")
+    # Fail before reading/allocating a model when the requested objective cannot
+    # be physical.  w_waloss activates an auxiliary Response head, so a Base-only
+    # optimizer would have no trainable path to that loss.  At least one internal
+    # component must remain active or the outer weight would multiply an
+    # identically zero objective.
+    for name in (
+        "w_waloss", "waloss_diagonal_weight", "waloss_off_diagonal_weight"
+    ):
+        value = float(getattr(cfg, name, 0.0))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    if float(cfg.w_waloss) > 0.0 and not bool(cfg.model.enable_waloss):
+        raise ValueError("w_waloss > 0 requires model.enable_waloss=True")
+    if float(cfg.w_waloss) > 0.0 and str(cfg.mode).strip().lower() == "base":
+        raise ValueError(
+            "WALoss trains the electronic response head and is available in "
+            "Response or Joint mode, not Base mode"
+        )
+    if (
+        float(cfg.w_waloss) > 0.0
+        and float(cfg.waloss_diagonal_weight) == 0.0
+        and float(cfg.waloss_off_diagonal_weight) == 0.0
+    ):
+        raise ValueError(
+            "w_waloss > 0 requires a positive diagonal or off-diagonal component"
+        )
     if int(getattr(cfg, "nonfinite_recovery_attempts", 3)) < 0:
         raise ValueError("nonfinite_recovery_attempts cannot be negative")
     _nonfinite_lr_decay = float(getattr(cfg, "nonfinite_lr_decay", 0.25))
@@ -14314,7 +15483,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         for name in (
             "e3mu_use_parity", "e3mu_use_l3", "enable_continuous_chem",
             "enable_qeq", "enable_pme", "enable_deq", "enable_d4",
-            "enable_spin", "enable_film", "enable_dmi",
+            "enable_spin", "enable_film", "enable_dmi", "enable_waloss",
         )
         if bool(getattr(cfg.model, name, False))
     ]
@@ -14325,7 +15494,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             "w_magnetoelastic", "w_dipole", "w_polarizability",
             "w_charges", "w_atomic_dipoles", "w_atomic_polarizability",
             "w_c6", "w_bec", "w_magnetic_moments", "w_effective_field",
-            "w_j", "w_di", "w_dmi", "w_bec_sum_rule",
+            "w_j", "w_di", "w_dmi", "w_waloss", "w_bec_sum_rule",
             "w_coupling_consistency",
         )
         if float(getattr(cfg, name)) > 0.0
@@ -14548,6 +15717,69 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             for name in configuration.properties
             if float(configuration.property_weights.get(name, 1.0)) > 0.0
         }
+    if composite_plan is not None:
+        available_training_labels = _hdf5_available_validation_labels(
+            composite_plan.large_plan, composite_plan.train_large_indices
+        )
+        wavefunction_shape = composite_plan.large_plan.label_shapes.get(
+            "orbital_hamiltonian", ()
+        )
+        inferred_waloss_dim = int(wavefunction_shape[0]) if wavefunction_shape else 0
+    elif stream_plan is not None:
+        available_training_labels = _hdf5_available_validation_labels(
+            stream_plan, stream_plan.train_indices
+        )
+        wavefunction_shape = stream_plan.label_shapes.get(
+            "orbital_hamiltonian", ()
+        )
+        inferred_waloss_dim = int(wavefunction_shape[0]) if wavefunction_shape else 0
+    else:
+        available_training_labels = {
+            str(name)
+            for configuration in train_cfgs
+            for name in configuration.properties
+            if float(configuration.property_weights.get(name, 1.0)) > 0.0
+        }
+        inferred_waloss_dim = _wavefunction_dimension_from_configurations(all_cfgs)
+        _propagate_wavefunction_dimension(all_cfgs, inferred_waloss_dim)
+    # Model construction needs K, but canonical HDF5 intentionally stores K in
+    # the label shape rather than hard-coding an orbital count in the program.
+    # Infer it after the exact train/validation selection is known, then require
+    # any explicit GUI/JSON value to agree.  This prevents silently truncating or
+    # padding physically different subspaces to fit a checkpoint head.
+    if bool(cfg.model.enable_waloss):
+        configured_waloss_dim = int(cfg.model.waloss_dim)
+        if configured_waloss_dim == 0:
+            if inferred_waloss_dim <= 0:
+                raise ValueError(
+                    "model.enable_waloss=True requires waloss_dim > 0 or a "
+                    "dataset with paired WALoss matrix labels"
+                )
+            cfg.model.waloss_dim = int(inferred_waloss_dim)
+        elif inferred_waloss_dim > 0 and configured_waloss_dim != inferred_waloss_dim:
+            raise ValueError(
+                f"Configured waloss_dim={configured_waloss_dim} does not match "
+                f"dataset orbital dimension {inferred_waloss_dim}"
+            )
+        log(
+            f"[{_now()}] WALoss aligned orbital subspace: "
+            f"dimension={int(cfg.model.waloss_dim)}; real-symmetric Hamiltonian; "
+            "reference eigenvectors are columns."
+        )
+    if float(cfg.w_waloss) > 0.0:
+        # Both splits must support the same physical observable.  Training with
+        # WALoss labels but selecting checkpoints without orbital validation
+        # would make early stopping and Auto Research scientifically undefined.
+        required_waloss_labels = set(HDF5_WAVEFUNCTION_LABELS)
+        missing_train = sorted(required_waloss_labels - available_training_labels)
+        missing_validation = sorted(
+            required_waloss_labels - available_validation_labels
+        )
+        if missing_train or missing_validation:
+            raise ValueError(
+                "WALoss requires paired labels in both train and validation "
+                f"splits; missing train={missing_train}, val={missing_validation}"
+            )
     stage_validation_targets = _stage_default_validation_targets(
         cfg.mode, cfg.model, available_validation_labels
     )
@@ -15194,6 +16426,10 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             self.exact_steps = 0
             self.edge_sample_size = 0
             self.sampled_mean_edges = float("nan")
+            self._prepared_epoch = -1
+            self._prepared_omat: Optional[Sequence[int]] = None
+            self._prepared_large: Optional[np.ndarray] = None
+            self._prepared_omat_step = 1
             self.omat_by_source: Dict[int, np.ndarray] = {}
             if self.omat_count and not ds.plan.omat_packed and not self.lazy_plan:
                 orders = ds.plan.source_orders[ds.omat_indices]
@@ -15213,15 +16449,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     self.omat_count,
                     max(1, int(round(ratio * self.large_count))),
                 )
-            if self.lazy_plan:
-                self.exact_steps = (
-                    self._count_role_steps(preview_count, local_offset=0)
-                    + self._count_role_steps(
-                        self.large_count, local_offset=self.omat_count
-                    )
-                )
-                self.estimated_steps = int(self.exact_steps)
-            else:
+            if not self.lazy_plan:
                 preview = self._role_batches(
                     np.arange(preview_count, dtype=np.int64)
                 )
@@ -15322,22 +16550,45 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
             ))
             return max(structure_steps, edge_steps, 1)
 
-        def _count_role_steps(self, count: int, *, local_offset: int) -> int:
-            total = int(count)
+        def _count_role_indices(self, indices: Sequence[int]) -> int:
+            total = int(len(indices))
             if total <= 0:
                 return 0
             if self.edge_counts is None or self.edge_budget is None:
                 return int(math.ceil(total / self.batch_size))
             return _count_ordered_structure_batch_chunks(
                 (
-                    self.edge_counts[
-                        int(local_offset) + start:
-                        int(local_offset) + min(total, start + self._EDGE_READ_CHUNK)
-                    ]
+                    self.edge_counts[np.asarray(
+                        indices[start:min(total, start + self._EDGE_READ_CHUNK)],
+                        dtype=np.int64,
+                    )]
                     for start in range(0, total, self._EDGE_READ_CHUNK)
                 ),
                 self.batch_size,
                 max_load=self.edge_budget,
+            )
+
+        def _prepare_epoch(self) -> None:
+            if (
+                self._prepared_epoch == self.epoch
+                and self._prepared_omat is not None
+                and self._prepared_large is not None
+            ):
+                return
+            rng = np.random.default_rng(self.seed + self.epoch)
+            omat = self._omat_epoch_indices(rng)
+            large = self.large_local.copy()
+            if self.shuffle:
+                rng.shuffle(large)
+            omat_steps = self._count_role_indices(omat)
+            large_steps = self._count_role_indices(large)
+            self.exact_steps = int(omat_steps + large_steps)
+            self.estimated_steps = int(self.exact_steps)
+            self._prepared_epoch = int(self.epoch)
+            self._prepared_omat = omat
+            self._prepared_large = large
+            self._prepared_omat_step = max(
+                1, int(math.ceil(omat_steps / max(1, large_steps)))
             )
 
         def _iter_role_batches(
@@ -15415,23 +16666,18 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                 self.oversized_structures = 0
 
         def __iter__(self) -> Iterable[List[int]]:
-            rng = np.random.default_rng(self.seed + self.epoch)
-            omat = self._omat_epoch_indices(rng)
-            large = self.large_local.copy()
-            if self.shuffle:
-                rng.shuffle(large)
+            self._prepare_epoch()
+            omat = self._prepared_omat
+            large = self._prepared_large
+            omat_step = int(self._prepared_omat_step)
+            if omat is None or large is None:
+                raise RuntimeError("Composite batch epoch was not prepared")
+            self._prepared_omat = None
+            self._prepared_large = None
+            self._prepared_epoch = -1
             if self.lazy_plan:
                 omat_batches_iter = self._iter_role_batches(omat)
                 large_batches_iter = self._iter_role_batches(large)
-                omat_steps = self._count_role_steps(len(omat), local_offset=0)
-                large_steps = self._count_role_steps(
-                    len(large), local_offset=self.omat_count
-                )
-                omat_step = max(
-                    1, int(math.ceil(omat_steps / max(1, large_steps)))
-                )
-                self.exact_steps = omat_steps + large_steps
-                self.estimated_steps = int(self.exact_steps)
                 self.epoch += 1
                 return iter(self._interleave_batches(
                     omat_batches_iter, large_batches_iter, omat_step
@@ -15455,6 +16701,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
 
         def __len__(self) -> int:
             if self.lazy_plan:
+                self._prepare_epoch()
                 return max(1, int(self.exact_steps))
             if self.ds.plan.mode == "joint" and self.large_count:
                 ratio = max(1e-12, float(getattr(cfg, "composite_joint_foundation_ratio", 4.0)))
@@ -16259,11 +17506,12 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         sampler = getattr(selected_loader, "batch_sampler", None)
         if bool(getattr(sampler, "lazy_plan", False)):
             edge_budget = getattr(sampler, "edge_budget", None)
+            exact_steps = int(len(selected_loader))
             mean_edges = float(getattr(sampler, "sampled_mean_edges", float("nan")))
             log(
                 f"[{_now()}] Batch plan [mps/{name}]: lazy exact streaming; "
                 f"requested_structures={int(getattr(sampler, 'requested_batch_size', cfg.batch_size))} "
-                f"estimated_steps={len(selected_loader)}"
+                f"exact_steps={exact_steps}"
                 + (
                     f" edge_budget={int(edge_budget)} sampled_mean_edges={mean_edges:.0f}"
                     if edge_budget is not None and math.isfinite(mean_edges)
@@ -16609,6 +17857,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         val_extra_metrics: Dict[str, List[float]] = {}
         val_residual_max: Dict[str, float] = {}
         val_batches_used = 0
+        val_steps = max(1, int(len(v_loader)))
         for batch in v_loader:
             if stop_flag and stop_flag():
                 stopped = True
@@ -16626,7 +17875,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     "epoch":  int(epoch),
                     "epochs": int(cfg.epochs),
                     "step":   int(val_step),
-                    "steps":  int(len(v_loader)),
+                    "steps":  int(val_steps),
                 })
             validation_ids = _batch_structure_ids(batch)
             batch = batch.to(device)
@@ -16885,6 +18134,24 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                         "c6", "bec", "magnetic_moments", "effective_field", "Di",
                     }
                     for metric_name in additional_metrics:
+                        if metric_name in {
+                            "orbital_energies", "orbital_couplings"
+                        }:
+                            waloss_terms = out.get("_waloss_terms")
+                            if not isinstance(waloss_terms, dict):
+                                continue
+                            prefix = (
+                                "diagonal"
+                                if metric_name == "orbital_energies"
+                                else "off_diagonal"
+                            )
+                            _collect_regression_pairs(
+                                metric_name,
+                                waloss_terms[f"{prefix}_prediction"],
+                                waloss_terms[f"{prefix}_reference"],
+                                waloss_terms["sample_weight"],
+                            )
+                            continue
                         if metric_name == "total_charge":
                             predicted_charge = scatter_sum(
                                 out["charges"], batch.batch,
@@ -17638,7 +18905,9 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
                     "w_magnetoelastic", "w_dipole", "w_polarizability",
                     "w_charges", "w_atomic_dipoles", "w_atomic_polarizability",
                     "w_c6", "w_bec", "w_magnetic_moments", "w_effective_field",
-                    "w_j", "w_di", "w_dmi", "w_bec_sum_rule",
+                    "w_j", "w_di", "w_dmi", "w_waloss",
+                    "waloss_diagonal_weight", "waloss_off_diagonal_weight",
+                    "w_bec_sum_rule",
                     "w_coupling_consistency",
                 )
             },
@@ -17731,6 +19000,7 @@ _GUI_TRAIN_DIRECT_FIELDS: Tuple[str, ...] = (
     "w_dipole", "w_polarizability", "w_charges", "w_atomic_dipoles",
     "w_atomic_polarizability", "w_c6", "w_bec", "w_magnetic_moments",
     "w_effective_field", "w_j", "w_di", "w_dmi", "w_bec_sum_rule",
+    "w_waloss", "waloss_diagonal_weight", "waloss_off_diagonal_weight",
     "w_coupling_consistency", "label_aware_coupling", "lr_scheduler",
     "export_sevennet", "save_epoch_artifacts", "stream_hdf5",
     "cache_neighbor_graphs",
@@ -18606,6 +19876,9 @@ class App(tk.Tk):
         self.var_w_j = tk.StringVar(value="0.0")
         self.var_w_di = tk.StringVar(value="0.0")
         self.var_w_dmi = tk.StringVar(value="0.0")
+        self.var_w_waloss = tk.StringVar(value="0.0")
+        self.var_waloss_diagonal_weight = tk.StringVar(value="1.0")
+        self.var_waloss_off_diagonal_weight = tk.StringVar(value="1.0")
         self.var_w_bec_sum_rule = tk.StringVar(value="0.0")
         self.var_w_coupling_consistency = tk.StringVar(value="0.0")
         self.var_label_aware_coupling = tk.BooleanVar(value=True)
@@ -18631,6 +19904,8 @@ class App(tk.Tk):
         self.var_enable_spin = tk.BooleanVar(value=False)
         self.var_enable_film = tk.BooleanVar(value=False)
         self.var_enable_dmi = tk.BooleanVar(value=False)
+        self.var_enable_waloss = tk.BooleanVar(value=False)
+        self.var_waloss_dim = tk.StringVar(value="0")
 
         self.var_qeq_smearing = tk.StringVar(value="0.35")
         self.var_qeq_hardness_min = tk.StringVar(value="0.25")
@@ -19194,6 +20469,8 @@ class App(tk.Tk):
             self.var_enable_spin,
             self.var_enable_film,
             self.var_enable_dmi,
+            self.var_enable_waloss,
+            self.var_waloss_dim,
         )
         for variable in variables:
             variable.trace_add(
@@ -19219,6 +20496,12 @@ class App(tk.Tk):
             enable_film = bool(self.var_enable_film.get())
             enable_spin = bool(self.var_enable_spin.get())
             enable_dmi = bool(self.var_enable_dmi.get())
+            enable_waloss = bool(self.var_enable_waloss.get())
+            waloss_dim = int(self.var_waloss_dim.get())
+            if enable_waloss and waloss_dim == 0:
+                waloss_dim = int(
+                    self._dataset_capability.get("wavefunction_dim", 0) or 0
+                )
             enable_pme = bool(self.var_enable_pme.get())
             use_parity = bool(self.var_e3mu_use_parity.get()) or use_l3 or enable_film
             use_parity = use_parity or (enable_spin and enable_dmi)
@@ -19240,6 +20523,8 @@ class App(tk.Tk):
                 enable_spin=enable_spin,
                 enable_film=enable_film,
                 enable_dmi=enable_dmi,
+                enable_waloss=enable_waloss,
+                waloss_dim=waloss_dim,
                 spin_cutoff=float(self.var_spin_cutoff.get()),
             )
         except (ValueError, RuntimeError, tk.TclError) as exc:
@@ -19706,6 +20991,9 @@ class App(tk.Tk):
                 ("J effective", self.var_w_j, "entry", None),
                 ("Di", self.var_w_di, "entry", None),
                 ("DMI", self.var_w_dmi, "entry", None),
+                ("Wavefunction alignment", self.var_w_waloss, "entry", None),
+                ("WALoss orbital energies", self.var_waloss_diagonal_weight, "entry", None),
+                ("WALoss orbital couplings", self.var_waloss_off_diagonal_weight, "entry", None),
             ],
         )
 
@@ -19734,6 +21022,7 @@ class App(tk.Tk):
                 ("enable_spin", "Spin J / Di / DMI", self.var_enable_spin),
                 ("enable_film", "FiLM coupling", self.var_enable_film),
                 ("enable_dmi", "DMI term", self.var_enable_dmi),
+                ("enable_waloss", "Electronic WALoss head", self.var_enable_waloss),
             ],
         )
         tk.Label(
@@ -19776,6 +21065,7 @@ class App(tk.Tk):
                 ("DEQ alpha max", self.var_deq_alpha_max, "entry", None),
                 ("D4 functional", self.var_d4_functional, "entry", None),
                 ("Spin cutoff", self.var_spin_cutoff, "entry", None),
+                ("Aligned orbital dimension", self.var_waloss_dim, "entry", None),
                 ("Coupling iterations", self.var_coupling_iterations, "entry", None),
                 ("Coupling tolerance", self.var_coupling_tol, "entry", None),
             ],
@@ -20575,6 +21865,7 @@ class App(tk.Tk):
             "enable_d4": float(self.var_w_c6.get()) > 0.0,
             "enable_spin": spin_supervised,
             "enable_dmi": float(self.var_w_dmi.get()) > 0.0,
+            "enable_waloss": float(self.var_w_waloss.get()) > 0.0,
         }
         for switch, required in required_switches.items():
             if required and switch in self._architecture_disabled_reasons:
@@ -20593,6 +21884,8 @@ class App(tk.Tk):
             self.var_enable_spin.set(True)
         if float(self.var_w_dmi.get()) > 0.0:
             self.var_enable_dmi.set(True)
+        if float(self.var_w_waloss.get()) > 0.0:
+            self.var_enable_waloss.set(True)
         use_parity = bool(self.var_e3mu_use_parity.get())
         use_l3 = bool(self.var_e3mu_use_l3.get())
         enable_film = bool(self.var_enable_film.get())
@@ -20629,6 +21922,8 @@ class App(tk.Tk):
             enable_spin=bool(self.var_enable_spin.get()),
             enable_film=enable_film,
             enable_dmi=bool(self.var_enable_dmi.get()),
+            enable_waloss=bool(self.var_enable_waloss.get()),
+            waloss_dim=int(self.var_waloss_dim.get()),
             qeq_smearing=float(self.var_qeq_smearing.get()),
             qeq_hardness_min=float(self.var_qeq_hardness_min.get()),
             qeq_pme_smearing=float(self.var_qeq_pme_smearing.get()),
@@ -20679,6 +21974,13 @@ class App(tk.Tk):
             "w_j": float(self.var_w_j.get()),
             "w_di": float(self.var_w_di.get()),
             "w_dmi": float(self.var_w_dmi.get()),
+            "w_waloss": float(self.var_w_waloss.get()),
+            "waloss_diagonal_weight": float(
+                self.var_waloss_diagonal_weight.get()
+            ),
+            "waloss_off_diagonal_weight": float(
+                self.var_waloss_off_diagonal_weight.get()
+            ),
             "w_bec_sum_rule": float(self.var_w_bec_sum_rule.get()),
             "w_coupling_consistency": float(self.var_w_coupling_consistency.get()),
             "label_aware_coupling": bool(self.var_label_aware_coupling.get()),
@@ -20696,6 +21998,7 @@ class App(tk.Tk):
                 "w_dipole", "w_polarizability", "w_charges", "w_atomic_dipoles",
                 "w_atomic_polarizability", "w_c6", "w_bec", "w_magnetic_moments",
                 "w_effective_field", "w_j", "w_di", "w_dmi",
+                "w_waloss",
                 "w_bec_sum_rule", "w_coupling_consistency",
             ):
                 values[name] = 0.0
@@ -20935,6 +22238,7 @@ class App(tk.Tk):
         "w_j":                 "var_w_j",
         "w_di":                "var_w_di",
         "w_dmi":               "var_w_dmi",
+        "w_waloss":            "var_w_waloss",
         "w_bec_sum_rule":      "var_w_bec_sum_rule",
         "w_coupling_consistency": "var_w_coupling_consistency",
         "label_aware_coupling": "var_label_aware_coupling",
@@ -20965,6 +22269,7 @@ class App(tk.Tk):
         "enable_spin":         "var_enable_spin",
         "enable_film":         "var_enable_film",
         "enable_dmi":          "var_enable_dmi",
+        "enable_waloss":       "var_enable_waloss",
         "qeq_smearing":        "var_qeq_smearing",
         "qeq_hardness_min":    "var_qeq_hardness_min",
         "qeq_pme_smearing":    "var_qeq_pme_smearing",
@@ -21674,6 +22979,27 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "1e-3-10.",
         "Requires both Spin and DMI plus DMI/SOC labels.",
     ),
+    "w_waloss": _p(
+        "Wavefunction-alignment loss weight",
+        "Weights the reference-eigenbasis Hamiltonian alignment objective.",
+        "U_ref^T H_pred U_ref is compared with U_ref^T H_ref U_ref without differentiating an eigensolver.",
+        "Start near 0.01-1 after energy/force training is stable.",
+        "Requires a fixed aligned orbital/Wannier basis plus paired orbital_hamiltonian and orbital_eigenvectors labels.",
+    ),
+    "waloss_diagonal_weight": _p(
+        "WALoss orbital-energy weight",
+        "Weights diagonal elements after transformation into the reference eigenbasis.",
+        "These entries represent aligned orbital energies and are normalized independently of matrix size.",
+        "Default 1.0; keep positive unless intentionally training couplings only.",
+        "Used only by WALoss.",
+    ),
+    "waloss_off_diagonal_weight": _p(
+        "WALoss orbital-coupling weight",
+        "Weights strict-upper-triangle elements in the aligned Hamiltonian.",
+        "These terms suppress unphysical mixing between reference eigenspaces without double-counting symmetric entries.",
+        "Default 1.0; lower it when near-degenerate subspaces carry gauge noise.",
+        "Used only by WALoss.",
+    ),
     "e3mu_use_parity": _p(
         "O(3) parity channels",
         "Separates polar and axial representations under reflection.",
@@ -21748,6 +23074,20 @@ PARAMETER_INFO: Dict[str, ParameterInfo] = {
         "An axial D vector contracts with S_i cross S_j, requiring correct O(3) parity and SOC signal.",
         "Enable only when chiral/SOC configurations identify DMI.",
         "Requires Spin, O(3), and DMI or SOC labels.",
+    ),
+    "enable_waloss": _p(
+        "Electronic Hamiltonian WALoss head",
+        "Adds an auxiliary real-symmetric Hamiltonian readout in a fixed aligned orbital subspace.",
+        "The head shares equivariant response features but remains distinct from the J/Di/DMI spin Hamiltonian.",
+        "Enable for Response or Joint training when electronic-structure labels are available.",
+        "Requires paired Hamiltonian/eigenvector labels and a consistent basis ordering.",
+    ),
+    "waloss_dim": _p(
+        "Aligned orbital dimension",
+        "Sets the number of orbitals or selected bands in the fixed WALoss subspace.",
+        "The Hamiltonian head predicts a symmetric K by K matrix; K must match every labeled record.",
+        "Use 0 to infer K from canonical HDF5 metadata, or enter K explicitly for legacy data.",
+        "Used only by the WALoss head.",
     ),
     "chem_max_z": _p(
         "Maximum atomic number",
@@ -21961,6 +23301,9 @@ GUI_DEFAULTS = {
     "w_j": "0.0",
     "w_di": "0.0",
     "w_dmi": "0.0",
+    "w_waloss": "0.0",
+    "waloss_diagonal_weight": "1.0",
+    "waloss_off_diagonal_weight": "1.0",
     "e3mu_use_parity": True,
     "e3mu_use_l3": False,
     "rbf_type": "gaussian",
@@ -21976,6 +23319,8 @@ GUI_DEFAULTS = {
     "enable_spin": False,
     "enable_film": False,
     "enable_dmi": False,
+    "enable_waloss": False,
+    "waloss_dim": "0",
     "qeq_smearing": "0.35",
     "qeq_hardness_min": "0.25",
     "qeq_pme_smearing": "1.0",
@@ -22069,6 +23414,10 @@ GUI_NUMERIC_RULES: Dict[str, GUINumericRule] = {
     "w_j": _float_rule(0.0),
     "w_di": _float_rule(0.0),
     "w_dmi": _float_rule(0.0),
+    "w_waloss": _float_rule(0.0),
+    "waloss_diagonal_weight": _float_rule(0.0),
+    "waloss_off_diagonal_weight": _float_rule(0.0),
+    "waloss_dim": _int_rule(0),
     "chem_max_z": _int_rule(1, 118),
     "chem_aug_prob": _float_rule(0.0, 1.0),
     "chem_aug_noise_std": _float_rule(0.0),
@@ -22178,6 +23527,9 @@ LEGACY_TK_VARIABLES = {
     "w_j": "var_w_j",
     "w_di": "var_w_di",
     "w_dmi": "var_w_dmi",
+    "w_waloss": "var_w_waloss",
+    "waloss_diagonal_weight": "var_waloss_diagonal_weight",
+    "waloss_off_diagonal_weight": "var_waloss_off_diagonal_weight",
     "w_bec_sum_rule": "var_w_bec_sum_rule",
     "w_coupling_consistency": "var_w_coupling_consistency",
     "label_aware_coupling": "var_label_aware_coupling",
@@ -22196,6 +23548,8 @@ LEGACY_TK_VARIABLES = {
     "enable_spin": "var_enable_spin",
     "enable_film": "var_enable_film",
     "enable_dmi": "var_enable_dmi",
+    "enable_waloss": "var_enable_waloss",
+    "waloss_dim": "var_waloss_dim",
     "qeq_smearing": "var_qeq_smearing",
     "qeq_hardness_min": "var_qeq_hardness_min",
     "qeq_pme_smearing": "var_qeq_pme_smearing",
@@ -22235,6 +23589,7 @@ AUTOSEARCH_TO_GUI = {
     "w_j": "w_j",
     "w_di": "w_di",
     "w_dmi": "w_dmi",
+    "w_waloss": "w_waloss",
     "lr": "lr",
     "batch_size": "batch_size",
     "force_loss": "force_loss",
@@ -22650,9 +24005,14 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         self._analysis_metric_menu_names: Tuple[str, ...] = ()
         self._analysis_metric_menu_syncing = False
         self._last_live_export_signature: Optional[Tuple[Any, ...]] = None
+        self._analysis_rendering = False
+        self._analysis_rerender_requested = False
+        self._analysis_layout_viewport_size: Tuple[int, int] = (0, 0)
+        self._analysis_observed_viewport_size: Tuple[int, int] = (0, 0)
+        self._analysis_viewport_widget: Optional[QtWidgets.QWidget] = None
         self._analysis_resize_timer = QtCore.QTimer(self)
         self._analysis_resize_timer.setSingleShot(True)
-        self._analysis_resize_timer.setInterval(90)
+        self._analysis_resize_timer.setInterval(32)
         self._analysis_resize_timer.timeout.connect(self._render_live_dashboard)
         self._default_path = Path.home() / ".dual_layer_field_gui.defaults.json"
         self._factory_values = dict(GUI_DEFAULTS)
@@ -23037,6 +24397,9 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             ("w_j", "J effective", None),
             ("w_di", "Di", None),
             ("w_dmi", "DMI", None),
+            ("w_waloss", "Wavefunction alignment", None),
+            ("waloss_diagonal_weight", "WALoss orbital energies", None),
+            ("waloss_off_diagonal_weight", "WALoss orbital couplings", None),
         )
         self.loss_keys = [key for key, _label, _items in specs]
         self._add_field_grid(card, specs)
@@ -23062,6 +24425,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             ("enable_spin", "Spin J / Di / DMI"),
             ("enable_film", "FiLM coupling"),
             ("enable_dmi", "DMI term"),
+            ("enable_waloss", "Electronic WALoss head"),
         )
         for index, (key, label) in enumerate(specs):
             tile = ToggleTile(label)
@@ -23122,6 +24486,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 ("deq_alpha_max", "DEQ alpha max", None),
                 ("d4_functional", "D4 functional", ("pbe", "pbe0", "b3lyp")),
                 ("spin_cutoff", "Spin cutoff", None),
+                ("waloss_dim", "Aligned orbital dimension (0=auto)", None),
                 ("coupling_iterations", "Coupling iterations", None),
                 ("coupling_tol", "Coupling tolerance", None),
             ),
@@ -23437,16 +24802,28 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
             self.figure = Figure(figsize=(11.0, 5.6), dpi=100, facecolor="#FFFDFE")
             self.canvas = FigureCanvasQTAgg(self.figure)
-            self.canvas.setMinimumHeight(300)
+            self.canvas.setMinimumHeight(240)
             self.analysis_canvas_scroll = QtWidgets.QScrollArea()
-            self.analysis_canvas_scroll.setWidgetResizable(True)
+            # The canvas is sized explicitly from the plot grid. Letting the
+            # scroll area resize it at the same time creates a scrollbar-width
+            # feedback loop that progressively narrows repeated redraws.
+            self.analysis_canvas_scroll.setWidgetResizable(False)
             self.analysis_canvas_scroll.setFrameShape(
                 QtWidgets.QFrame.Shape.NoFrame
+            )
+            self.analysis_canvas_scroll.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignLeft
+                | QtCore.Qt.AlignmentFlag.AlignTop
             )
             self.analysis_canvas_scroll.setHorizontalScrollBarPolicy(
                 QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
             )
+            self.analysis_canvas_scroll.setVerticalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
             self.analysis_canvas_scroll.setWidget(self.canvas)
+            self._analysis_viewport_widget = self.analysis_canvas_scroll.viewport()
+            self._analysis_viewport_widget.installEventFilter(self)
             analysis_layout.addWidget(self.analysis_canvas_scroll, 1)
         except Exception as exc:
             self.figure = None
@@ -23753,7 +25130,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 self._update_thread_policy_label()
             if key in {
                 "r_max", "num_channels", "num_interactions", "num_radial_basis",
-                "dtype", "rbf_type", "field_scale", "spin_cutoff",
+                "dtype", "rbf_type", "field_scale", "spin_cutoff", "waloss_dim",
             }:
                 self.estimate_timer.start()
             search_dependencies = {
@@ -24130,6 +25507,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 f"{len(self._capability.get('elements', []))} elements / "
                 f"{int(self._capability.get('periodic_structures', 0)):,} periodic. "
                 f"Labels: {', '.join(labels) if labels else 'none'}."
+                + (
+                    f" WALoss K={int(self._capability.get('wavefunction_dim', 0))}."
+                    if int(self._capability.get("wavefunction_dim", 0) or 0) > 0
+                    else ""
+                )
             )
         self._refresh_architecture_state()
         self._refresh_tooltips()
@@ -24147,6 +25529,10 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         enable_film = bool(values["enable_film"])
         enable_spin = bool(values["enable_spin"])
         enable_dmi = bool(values["enable_dmi"])
+        enable_waloss = bool(values["enable_waloss"])
+        waloss_dim = int(values["waloss_dim"])
+        if enable_waloss and waloss_dim == 0:
+            waloss_dim = int(self._capability.get("wavefunction_dim", 0) or 0)
         use_parity = bool(values["e3mu_use_parity"] or use_l3 or enable_film)
         use_parity = use_parity or (enable_spin and enable_dmi)
         if enable_pme and not self.backend.HAS_TORCHPME:
@@ -24178,6 +25564,8 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             enable_spin=enable_spin,
             enable_film=enable_film,
             enable_dmi=enable_dmi,
+            enable_waloss=enable_waloss,
+            waloss_dim=waloss_dim,
             qeq_smearing=float(values["qeq_smearing"]),
             qeq_hardness_min=float(values["qeq_hardness_min"]),
             qeq_pme_smearing=float(values["qeq_pme_smearing"]),
@@ -24271,6 +25659,11 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             "w_j": float(values["w_j"]),
             "w_di": float(values["w_di"]),
             "w_dmi": float(values["w_dmi"]),
+            "w_waloss": float(values["w_waloss"]),
+            "waloss_diagonal_weight": float(values["waloss_diagonal_weight"]),
+            "waloss_off_diagonal_weight": float(
+                values["waloss_off_diagonal_weight"]
+            ),
             "w_bec_sum_rule": float(values["w_bec_sum_rule"]),
             "w_coupling_consistency": float(values["w_coupling_consistency"]),
             "label_aware_coupling": bool(values["label_aware_coupling"]),
@@ -24288,6 +25681,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 "w_dipole", "w_polarizability", "w_charges", "w_atomic_dipoles",
                 "w_atomic_polarizability", "w_c6", "w_bec", "w_magnetic_moments",
                 "w_effective_field", "w_j", "w_di", "w_dmi",
+                "w_waloss",
                 "w_bec_sum_rule", "w_coupling_consistency",
             ):
                 result[key] = 0.0
@@ -25614,47 +27008,102 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
         return candidate if candidate.is_file() else None
 
     def _resize_analysis_canvas(self, desired_height: int) -> None:
-        """Apply an absolute canvas size so repeated redraws cannot shrink axes."""
-        scroll = getattr(self, "analysis_canvas_scroll", None)
-        viewport = scroll.viewport() if scroll is not None else None
-        width = max(
-            640,
-            int(viewport.width()) if viewport is not None else int(self.canvas.width()),
-        )
-        viewport_height = (
-            int(viewport.height()) if viewport is not None else int(self.canvas.height())
-        )
-        height = max(300, int(desired_height), viewport_height)
-        self.canvas.setMinimumHeight(300)
-        self.canvas.setMinimumHeight(height)
-        self.canvas.setMaximumHeight(height)
+        """Size the canvas from the current viewport, never from its prior frame."""
+        width, viewport_height = self._raw_analysis_viewport_size()
+        height = max(1, int(desired_height), viewport_height)
+        self._analysis_layout_viewport_size = (width, viewport_height)
+        # The old minimum-height clamp could leave a 240 px canvas inside a
+        # smaller viewport with scrolling disabled.  Clear all inherited size
+        # locks before applying this frame's absolute dimensions.
+        self.canvas.setMinimumSize(0, 0)
+        self.canvas.setMaximumSize(16777215, 16777215)
         if self.canvas.width() != width or self.canvas.height() != height:
             self.canvas.resize(width, height)
 
-    def _analysis_viewport_size(self) -> Tuple[int, int]:
+    def _set_analysis_vertical_scroll(self, enabled: bool) -> bool:
+        scroll = getattr(self, "analysis_canvas_scroll", None)
+        if scroll is None:
+            return False
+        policy = (
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+            if enabled else QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        changed = scroll.verticalScrollBarPolicy() != policy
+        if changed:
+            scroll.setVerticalScrollBarPolicy(policy)
+            scroll.updateGeometry()
+            parent = scroll.parentWidget()
+            if parent is not None and parent.layout() is not None:
+                parent.layout().invalidate()
+                parent.layout().activate()
+        return changed
+
+    def _raw_analysis_viewport_size(self) -> Tuple[int, int]:
         scroll = getattr(self, "analysis_canvas_scroll", None)
         viewport = scroll.viewport() if scroll is not None else None
-        return (
-            max(
-                640,
-                int(viewport.width())
-                if viewport is not None else int(self.canvas.width()),
-            ),
-            max(
-                300,
-                int(viewport.height())
-                if viewport is not None else int(self.canvas.height()),
-            ),
-        )
+        fallback_width = int(getattr(self, "canvas", self).width())
+        fallback_height = int(getattr(self, "canvas", self).height())
+        width = int(viewport.width()) if viewport is not None else fallback_width
+        height = int(viewport.height()) if viewport is not None else fallback_height
+        return max(1, width), max(1, height)
 
-    def resizeEvent(self, event: Any) -> None:
-        """Reflow live charts after the GUI viewport settles at its new ratio."""
-        super().resizeEvent(event)
+    def _analysis_viewport_size(self) -> Tuple[int, int]:
+        return self._raw_analysis_viewport_size()
+
+    def _schedule_analysis_reflow(self) -> None:
+        """Throttle live resize work while preserving the final viewport event."""
         timer = getattr(self, "_analysis_resize_timer", None)
-        if timer is not None and getattr(self, "canvas", None) is not None:
+        if timer is None or getattr(self, "canvas", None) is None:
+            return
+        if self._analysis_rendering:
+            self._analysis_rerender_requested = True
+        elif not timer.isActive():
             timer.start()
 
+    def eventFilter(self, watched: Any, event: Any) -> bool:  # noqa: N802
+        viewport = getattr(self, "_analysis_viewport_widget", None)
+        if (
+            viewport is not None
+            and watched is viewport
+            and event.type() == QtCore.QEvent.Type.Resize
+        ):
+            size = event.size()
+            observed = (max(1, int(size.width())), max(1, int(size.height())))
+            if observed != self._analysis_observed_viewport_size:
+                self._analysis_observed_viewport_size = observed
+                self._schedule_analysis_reflow()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event: Any) -> None:
+        """Request throttled chart reflow during interactive window resizing."""
+        super().resizeEvent(event)
+        self._schedule_analysis_reflow()
+
     def _render_live_dashboard(self) -> None:
+        if getattr(self, "figure", None) is None or getattr(self, "canvas", None) is None:
+            return
+        if self._analysis_rendering:
+            self._analysis_rerender_requested = True
+            return
+        timer = getattr(self, "_analysis_resize_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        self._analysis_rendering = True
+        self._analysis_rerender_requested = False
+        try:
+            self._render_live_dashboard_impl()
+        finally:
+            self._analysis_rendering = False
+            current_viewport = self._raw_analysis_viewport_size()
+            rerender = (
+                self._analysis_rerender_requested
+                or current_viewport != self._analysis_layout_viewport_size
+            )
+            self._analysis_rerender_requested = False
+            if rerender:
+                self._schedule_analysis_reflow()
+
+    def _render_live_dashboard_impl(self) -> None:
         if getattr(self, "figure", None) is None or getattr(self, "canvas", None) is None:
             return
         figure = self.figure
@@ -25713,12 +27162,19 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
             )
         if hasattr(self, "analysis_stage_summary"):
             self.analysis_stage_summary.setText(stage_text)
+            self.analysis_stage_summary.updateGeometry()
+            summary_parent = self.analysis_stage_summary.parentWidget()
+            if summary_parent is not None and summary_parent.layout() is not None:
+                summary_parent.layout().invalidate()
+                summary_parent.layout().activate()
         view = str(self.value("live_plot")) if "live_plot" in self.controls else "Regression"
         if view == "Multi-Task":
             view = "MAE History"
         if view not in {"Regression", "MAE History"}:
+            self._set_analysis_vertical_scroll(False)
             self._resize_analysis_canvas(360)
         if not history:
+            self._set_analysis_vertical_scroll(False)
             self._resize_analysis_canvas(360)
             axis = figure.add_subplot(111)
             axis.set_axis_off()
@@ -25785,21 +27241,31 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                             )
                         )
             if replay_panels:
+                self._set_analysis_vertical_scroll(len(replay_panels) > 2)
                 available_width, available_height = self._analysis_viewport_size()
-                # About 245 px per cell is sufficient once the metric name is
-                # kept in the title. A normal 800-900 px dashboard therefore
-                # uses three columns instead of growing into a six-panel tower.
-                maximum_columns = max(1, min(4, available_width // 245))
-                rows, columns = _automatic_panel_grid(
-                    len(replay_panels), max_columns=maximum_columns
-                )
+                # One metric uses one height-aligned slot; every other case uses
+                # exactly two viewport-width columns. Additional metrics add
+                # rows only, which keeps stage/epoch redraws spatially stable.
+                columns = 1 if len(replay_panels) == 1 else 2
+                rows = int(math.ceil(len(replay_panels) / columns))
                 if len(replay_panels) <= 2:
                     # One or two metrics always occupy one viewport-height row.
                     # There is no vertical expansion or hidden placeholder row.
                     target_height = available_height
                 else:
-                    row_height = 270 if columns >= 3 else 300
-                    target_height = max(460, row_height * rows, available_height)
+                    row_height = max(
+                        260,
+                        min(360, int(round(0.39 * available_width))),
+                    )
+                    row_gap_px = 32
+                    outer_y_px = 24
+                    target_height = max(
+                        460,
+                        row_height * rows
+                        + row_gap_px * (rows - 1)
+                        + 2 * outer_y_px,
+                        available_height,
+                    )
                 self._resize_analysis_canvas(target_height)
                 regression_export_panels = list(replay_panels)
                 for index, (stage_id, replayed_epoch, metric_name, metric) in enumerate(
@@ -25822,6 +27288,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                         ],
                     )
             else:
+                self._set_analysis_vertical_scroll(False)
                 self._resize_analysis_canvas(360)
                 legacy_images = [
                     (
@@ -25840,6 +27307,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
 
                     columns = 2 if len(legacy_images) > 1 else 1
                     rows = int(math.ceil(len(legacy_images) / columns))
+                    self._set_analysis_vertical_scroll(len(legacy_images) > 2)
                     self._resize_analysis_canvas(max(420, 350 * rows))
                     for index, (stage_id, image_path) in enumerate(legacy_images):
                         axis = figure.add_subplot(rows, columns, index + 1)
@@ -25873,6 +27341,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     )
         combined_mae_legend_bottom = 0.0
         if view == "MAE History":
+            self._set_analysis_vertical_scroll(False)
             available_metric_names = _ordered_plottable_mae_metric_names({
                 name
                 for _stage_id, stage_history in stage_groups
@@ -26047,7 +27516,102 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                     0.5, 0.5, "Memory telemetry starts after the first epoch",
                     ha="center", va="center", color="#797386", transform=axis.transAxes,
                 )
-        if combined_mae_legend_bottom:
+        if view == "Regression" and regression_export_panels:
+            visible_axes = [
+                axis for axis in figure.axes if axis.get_visible()
+            ]
+            canvas_width = max(1.0, float(self.canvas.width()))
+            canvas_height = max(1.0, float(self.canvas.height()))
+            outer_x_px = min(32.0, 0.06 * canvas_width)
+            column_gap_px = min(36.0, 0.08 * canvas_width)
+            slot_width = max(
+                1.0,
+                (
+                    canvas_width
+                    - 2.0 * outer_x_px
+                    - column_gap_px
+                ) / 2.0,
+            )
+            label_allowance_px = min(
+                56.0, max(42.0, 0.18 * slot_width)
+            )
+            if len(visible_axes) <= 2:
+                # One and two panels share the same two-column width budget and
+                # the current viewport height. Toggling the second metric can
+                # only change horizontal placement, never plot height.
+                top_px = min(58.0, max(36.0, 0.18 * canvas_height))
+                bottom_px = min(50.0, max(34.0, 0.17 * canvas_height))
+                side_px = max(32.0, min(
+                    canvas_height - top_px - bottom_px,
+                    slot_width - label_allowance_px,
+                ))
+                for axis_index, axis in enumerate(visible_axes):
+                    center_x = (
+                        0.5 * canvas_width
+                        if len(visible_axes) == 1
+                        else (
+                            outer_x_px
+                            + axis_index * (slot_width + column_gap_px)
+                            + 0.5 * slot_width
+                        )
+                    )
+                    x_px = max(0.0, center_x - 0.5 * side_px)
+                    axis.set_position((
+                        x_px / canvas_width,
+                        bottom_px / canvas_height,
+                        side_px / canvas_width,
+                        side_px / canvas_height,
+                    ))
+            else:
+                # Multi-row Regression is width-led: two deterministic column
+                # slots are derived from the live viewport, while rows only
+                # extend the canvas downward. No empty subplot is constructed
+                # for an odd final row, and text measurements cannot move or
+                # progressively shrink the axes between redraws.
+                rows = int(math.ceil(len(visible_axes) / 2.0))
+                outer_y_px = min(24.0, 0.04 * canvas_height)
+                row_gap_px = min(32.0, 0.06 * canvas_height)
+                slot_height = max(
+                    1.0,
+                    (
+                        canvas_height
+                        - 2.0 * outer_y_px
+                        - row_gap_px * (rows - 1)
+                    ) / max(1, rows),
+                )
+                top_px = min(48.0, max(38.0, 0.135 * slot_height))
+                bottom_px = min(50.0, max(40.0, 0.14 * slot_height))
+                side_px = max(32.0, min(
+                    slot_width - label_allowance_px,
+                    slot_height - top_px - bottom_px,
+                ))
+                vertical_slack = max(
+                    0.0,
+                    slot_height - top_px - bottom_px - side_px,
+                )
+                for axis_index, axis in enumerate(visible_axes):
+                    row_index, column_index = divmod(axis_index, 2)
+                    center_x = (
+                        outer_x_px
+                        + column_index * (slot_width + column_gap_px)
+                        + 0.5 * slot_width
+                    )
+                    row_bottom = (
+                        outer_y_px
+                        + (rows - row_index - 1)
+                        * (slot_height + row_gap_px)
+                    )
+                    x_px = max(0.0, center_x - 0.5 * side_px)
+                    y_px = (
+                        row_bottom + bottom_px + 0.5 * vertical_slack
+                    )
+                    axis.set_position((
+                        x_px / canvas_width,
+                        y_px / canvas_height,
+                        side_px / canvas_width,
+                        side_px / canvas_height,
+                    ))
+        elif combined_mae_legend_bottom:
             figure.tight_layout(
                 pad=1.5,
                 rect=(0.0, combined_mae_legend_bottom, 1.0, 1.0),
