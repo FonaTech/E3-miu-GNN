@@ -250,6 +250,124 @@ Thus $`E_{\mathrm{spin}}`$ is even, while
 $`H_i^{\mathrm{eff}}=-\partial E_{\mathrm{spin}}/\partial S_i`$ is odd. Both
 properties are exact in the deterministic self-test.
 
+## Wavefunction alignment and electronic Hamiltonian
+
+### Why a matrix-element loss is not enough
+
+Let a reference electronic Hamiltonian in a fixed $`K`$-orbital subspace be
+$`H^*`$, and let $`\widehat H=H^*+\Delta H`$ be the model prediction. A uniform
+MSE over raw matrix entries treats a shift of an orbital energy and a coupling
+between two reference eigenstates as interchangeable numerical errors. They
+are not interchangeable physically.
+
+For Hermitian perturbations, Weyl's bound gives
+
+```math
+|\widehat\epsilon_i-\epsilon_i^*|
+\leq \|\Delta H\|_2
+\leq \|\Delta H\|_{\mathrm F}.
+```
+
+If many entries each carry an error of scale $`\delta`$, the Frobenius norm can
+grow as $`O(K\delta)`$. Therefore small-looking element errors do not by
+themselves guarantee small orbital-energy errors as the aligned subspace grows.
+More importantly, first-order nondegenerate perturbation theory gives the
+mixing of reference state $`i`$ into state $`j`$ as
+
+```math
+c_{j\leftarrow i}
+\simeq
+\frac{\langle u_j^*|\Delta H|u_i^*\rangle}
+{\epsilon_i^*-\epsilon_j^*}.
+```
+
+An off-diagonal residual can consequently rotate an eigenspace strongly when
+the energy gap is small even if its absolute magnitude is modest. This is the
+physical motivation for separating orbital-energy and orbital-mixing errors.
+
+### Implemented aligned objective
+
+For graph $`g`$, the columns of $`U_g^*`$ are the orthonormal reference
+eigenvectors of $`H_g^*`$. The model's optional
+`WavefunctionHamiltonianHead` predicts a real-symmetric $`K\times K`$ matrix
+$`\widehat H_g`$. Prediction and reference are rotated into the same reference
+eigenspace:
+
+```math
+\widetilde H_g=(U_g^*)^\dagger\widehat H_gU_g^*,
+\qquad
+\widetilde H_g^*=(U_g^*)^\dagger H_g^*U_g^*
+=\mathrm{diag}(\epsilon_{g,1}^*,\ldots,\epsilon_{g,K}^*).
+```
+
+The diagonal term measures orbital-energy error directly,
+
+```math
+\mathcal L_{\mathrm{diag}}
+=\frac{\sum_gm_g\sum_i
+|\widetilde H_{g,ii}-\widetilde H_{g,ii}^*|^2}
+{\sum_gm_gK},
+```
+
+and the strict upper triangle measures residual coupling between distinct
+reference states,
+
+```math
+\mathcal L_{\mathrm{off}}
+=\frac{\sum_gm_g\sum_{i\lt j}
+|\widetilde H_{g,ij}-\widetilde H_{g,ij}^*|^2}
+{\sum_gm_gK(K-1)/2}.
+```
+
+The complete auxiliary objective is
+
+```math
+\mathcal L_{\mathrm{WA}}
+=\lambda_{\mathrm d}\mathcal L_{\mathrm{diag}}
++\lambda_{\mathrm o}\mathcal L_{\mathrm{off}}.
+```
+
+Using only the strict upper triangle avoids counting the symmetric element
+twice. Independent normalization is also essential: without it, the
+$`K(K-1)/2`$ coupling entries would increasingly dominate the $`K`$ diagonal
+entries as $`K`$ grows.
+
+This construction is physics-informed in the PINN sense that an eigenproblem
+determines the residual coordinates and their physical interpretation. It is
+not a discretized Schrödinger-equation residual, a Kohn-Sham solver, or a claim
+to recover the many-electron wavefunction. The prediction is not diagonalized
+during training. Gradients pass through the fixed products with $`U_g^*`$ and
+the symmetric head, avoiding eigensolver derivatives and their ambiguity at
+degeneracy.
+
+### Gauge, degeneracy, and scope
+
+A common unitary change of raw basis applied consistently to $`\widehat H_g`$,
+$`H_g^*`$, and $`U_g^*`$ leaves the aligned matrices unchanged. This invariance
+does not repair inconsistent dataset gauges. All structures in one training
+domain must use the same fixed orbital/Wannier subspace, orbital order, energy
+zero, spin channel, k-point convention, and electronic-structure method. Phase
+choices must be consistent; near an exact or numerical degeneracy, the whole
+degenerate subspace should be aligned before assigning individual eigenvectors
+or a large off-diagonal weight.
+
+The current implementation has these deliberate boundaries:
+
+- one fixed graph-level real-symmetric matrix dimension $`K`$ per dataset and
+  checkpoint, rather than a variable-band or k-resolved container;
+- a separate electronic auxiliary head, never a reinterpretation of the
+  time-reversal spin $`J/D_i`$/DMI Hamiltonian;
+- no direct contribution from $`\widehat H_g`$ to $`E_{\mathrm{tot}}`$, forces,
+  or stress; WALoss influences shared learned features only through training;
+- paired masks: a sample supplies both `orbital_hamiltonian` and
+  `orbital_eigenvectors`, or neither; and
+- no active WALoss labels in the current Neo Tiny, Small, Standard, SE, Large,
+  Plus, or Max files.
+
+The last point is a data boundary, not an implementation gap. WALoss becomes a
+scientific training target only after a compatible gauge-aligned electronic
+dataset is collected and independently validated.
+
 ## Conservative derivative observables
 
 All enabled components are summed before differentiation:

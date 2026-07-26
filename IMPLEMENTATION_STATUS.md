@@ -1,6 +1,6 @@
 # Mixed-Granularity E(3)-mu-GNN Implementation Status
 
-Status date: 2026-07-20
+Status date: 2026-07-27
 
 This page is a concise boundary between implemented software, verified
 behavior, and remaining scientific validation. The complete manuscript is in
@@ -17,6 +17,7 @@ All executable project logic is merged into
 | Layer 1: local atomic | parity-aware O(3) scalar, polar, axial, $L=2$, optional $L=3$ message passing; continuous chemistry; conservative energy | short-range energy, total energy, forces |
 | Layer 2: electric/domain | constrained differentiable QEq; periodic Ewald/PME; exact Thole-damped polarization equilibrium; molecular D4 | charges, electrostatic potential, dipoles, polarizabilities, C6, BEC, named energies and residuals |
 | Layer 3: spin | time-reversal-even Heisenberg exchange, traceless single-ion anisotropy, optional axial DMI | $J_{ij}$, $D_i$, DMI, spin energy, magnetic moments, effective spin field |
+| Auxiliary electronic | fixed-dimension real-symmetric Hamiltonian head and reference-eigenspace WALoss | aligned orbital Hamiltonian, diagonal/off-diagonal loss and MAE diagnostics |
 | Cross-granularity coupling | bounded FiLM from charge, potential, and spin invariants to local equivariant features | coupling residual and refined energy/response outputs |
 
 The active Hamiltonian is
@@ -27,13 +28,15 @@ E_{\mathrm{short}}+E_{\mathrm{QEq}}+E_{\mathrm{PME}}
 +E_{\mathrm{D4}}+E_{\mathrm{spin}}+E_{\mathrm{resp}}.
 ```
 
-Forces, BEC, and spin effective fields are derivatives of the assembled energy,
-not post-processing corrections.
+Forces, stress, BEC, and spin effective fields are derivatives of the assembled
+energy, not post-processing corrections. The auxiliary electronic Hamiltonian
+does not enter this energy and is separate from the Layer-3 spin Hamiltonian.
 
 ## Training and GUI
 
 - Base, response, and joint modes share one `TrainConfig` and trainer.
-- Fourteen task weights cover all currently implemented target families.
+- Mask-aware task weights cover the observable families plus optional paired
+  WALoss Hamiltonian/eigenvector supervision.
 - PyQt6 architecture switches are filtered by HDF5 masks, periodicity, and
   physical dependencies.
 - Disabled controls retain explanatory hover documentation without exposing
@@ -69,21 +72,33 @@ not post-processing corrections.
 
 Canonical `e3mu-hdf5-v1` files store packed geometry, explicit target masks,
 source/method/system/group metadata, fixed group-safe splits, units, and
-provenance. Tiny and Small are deterministic nested subsets of Standard;
-Large is a trajectory-rich corpus built under a separate policy.
+provenance. Composite `e3mu-composite-hdf5-v1` files embed a complete canonical
+response payload and add packed OMat24 foundation arrays, exact selection
+provenance, and atomic-reference statistics. Tiny and Small are deterministic
+nested subsets of Standard; Large is built under a separate trajectory-rich
+policy.
 
-| Tier | Structures | Atoms | Approximate size |
-| --- | ---: | ---: | ---: |
-| Tiny | 5,575 | 371,803 | 21.3 MB |
-| Small | 15,221 | 964,550 | 52.8 MB |
-| Standard | 46,414 | 2,316,736 | 135.1 MB |
-| Large | 613,267 | 17,760,024 | 1.23 GB |
+| Tier | Schema | Embedded response | OMat24 foundation | Total structures | Total atoms | Size |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Tiny | canonical | 5,780 | 0 | 5,780 | 394,755 | 20.011 MiB |
+| Small | canonical | 16,703 | 0 | 16,703 | 1,069,318 | 51.218 MiB |
+| Standard | canonical | 46,414 | 0 | 46,414 | 2,316,736 | 0.120772 GiB |
+| SE | composite | Standard: 46,414 | 559,279 | 605,693 | 12,767,209 | 0.690297 GiB |
+| Large | canonical | 613,267 | 0 | 613,267 | 17,760,024 | 1.219244 GiB |
+| Plus | composite | Large: 613,267 | 25,206,004 | 25,819,271 | 488,227,614 | 38.237181 GiB |
+| Max | composite | Large: 613,267 | 100,670,282 | 101,283,549 | 1,899,323,661 | 128.559024 GiB |
 
 The portable tiers contain Layer-1 labels, electric-response labels, spins,
 magnetic moments, and 100 effective spin-field records. They do **not** contain
 active direct $J$, $D_i$, or DMI aggregate labels. The Layer-3 architecture is
 functionally and symmetry validated, but paper-grade magnetic calibration
 still requires compatible collected calculations.
+
+The schema and trainer support optional paired `orbital_hamiltonian` and
+`orbital_eigenvectors` labels for WALoss. All seven current tiers omit those
+arrays and the optional `wavefunction_dim` attribute. Existing targets and old
+checkpoints remain supported, but no released Neo file currently supervises
+the electronic Hamiltonian head.
 
 Absolute energies from unrelated electronic-structure methods are masked from
 the shared aggregate energy objective. Missing labels are never fabricated.
@@ -92,7 +107,8 @@ the shared aggregate energy objective. Missing labels are never fabricated.
 
 At the time of this status update:
 
-- Regression suite: 44 tests pass.
+- The regression suite covers physical invariants, dataset contracts, training,
+  GUI behavior, and checkpoint compatibility.
 - Conservative-force finite-difference error: $8.15\times10^{-12}$
   eV/angstrom.
 - QEq stationarity residual: $9.39\times10^{-12}$.
@@ -103,6 +119,9 @@ At the time of this status update:
 - D4 energy and C6 agree with the official `dftd4` H2 reference.
 - QEq, PME, polarization, D4, FiLM, and Layer-3 supervised paths retain
   gradients in focused tests.
+- WALoss tests cover reference-basis invariance, separate diagonal/off-diagonal
+  normalization, differentiability without a predicted eigensolver, paired
+  masks, checkpoint warm starts, and separation from the spin Hamiltonian.
 - HDF5 masks, group splits, checkpoint round trips, GUI capability filtering,
   Auto Research write-back, and VASP magnetic mapping are regression-tested.
 
@@ -137,6 +156,8 @@ the software MIT license does not relicense them.
 
 - Run and collect converged independent magnetic calculations with direct
   $J$, $D_i$, DMI, and held-out spin-configuration validation.
+- Collect a fixed-subspace, gauge-aligned electronic Hamiltonian/eigenvector
+  dataset and establish held-out WALoss orbital-energy and coupling accuracy.
 - Calibrate QEq hardness and solver shifts on larger independent domains.
 - Perform converged phonon and long molecular-dynamics stability studies.
 - Evaluate periodic dispersion with an explicitly periodic backend before

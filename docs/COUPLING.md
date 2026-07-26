@@ -48,6 +48,7 @@ the same division while preserving its own capability boundaries.
 | QEq, PME, DEQ, D4 | When enabled and trained | No |
 | Dipole, polarizability, BEC | When trained | No |
 | Spin Hamiltonian | When enabled, trained, and supplied a spin state | No |
+| Electronic orbital Hamiltonian | When WALoss is enabled, trained, and the fixed basis is documented | No |
 | FiLM feedback | When enabled | No |
 | Conservative Cauchy stress | Fully periodic native checkpoint; recommend only when trained | No |
 | Virial tensor | No | No |

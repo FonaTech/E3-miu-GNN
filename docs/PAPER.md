@@ -4,8 +4,9 @@
 Implementation-aligned manuscript, July 2026
 
 This manuscript documents the atomic, domain, and spin layers implemented in
-`E3_miu_GNN.py`, together with FiLM coupling, the canonical dataset system,
-and verified training behavior.
+`E3_miu_GNN.py`, together with FiLM coupling, wavefunction-aligned electronic
+Hamiltonian supervision, the two Neo HDF5 layouts, and verified training
+behavior.
 
 ## Abstract
 
@@ -24,11 +25,16 @@ molecular DFT-D4. Layer 3 parameterizes a time-reversal-even spin Hamiltonian
 containing Heisenberg exchange, single-ion anisotropy, and an optional
 Dzyaloshinskii-Moriya term. Charge, electrostatic potential, and spin
 invariants feed back into Layer 1 through bounded feature-wise linear
-modulation. All energy components are assembled before differentiating forces,
+modulation. A separate real-symmetric electronic Hamiltonian head supports a
+wavefunction alignment loss (WALoss) that resolves diagonal orbital-energy
+error from off-diagonal reference-state mixing without diagonalizing the
+prediction. All energy components are assembled before differentiating forces,
 Born effective charges, and effective spin fields, preserving their relation to
-a common Hamiltonian. A mask-aware HDF5 format permits partially labelled,
-multi-source supervision without inventing absent targets or mixing
-incompatible energy references. Deterministic tests verify E(3)/O(3)
+a common Hamiltonian. Two mask-aware HDF5 layouts permit partially labelled,
+multi-source supervision and self-contained OMat24/response compositions
+without inventing absent targets or mixing incompatible energy references. The
+current Neo tiers contain no paired WALoss matrices, so no orbital-accuracy
+result is claimed. Deterministic tests verify E(3)/O(3)
 transformation behavior, time reversal, charge conservation, differentiability,
 and conservative forces. Short data benchmarks establish functional behavior,
 while also showing that converged multi-domain and magnetic accuracy remains a
@@ -117,7 +123,7 @@ levels:
 2. an electric domain layer with constrained and long-range solvers; and
 3. a time-reversal-aware spin Hamiltonian.
 
-The implementation makes four concrete contributions.
+The implementation makes five concrete contributions.
 
 **Symmetry-resolved local features.** Polar and axial vectors are kept
 separate under inversion, and higher-order geometry is represented through
@@ -131,6 +137,12 @@ Forces therefore include their positional derivatives.
 **Interpretable spin energy.** Exchange, anisotropy, and DMI parameters are
 predicted from geometric features and assembled into a Hamiltonian that is
 exactly even under simultaneous spin reversal.
+
+**Physics-aligned electronic supervision.** An optional fixed-subspace
+Hamiltonian head is compared in the reference eigenspace. WALoss separately
+normalizes orbital-energy and orbital-coupling residuals, so matrix size does
+not silently change their balance and no gradient crosses a predicted
+eigendecomposition.
 
 **Feedback instead of independent addition.** Layer-2 and Layer-3 invariants
 condition subsequent atomic messages through FiLM. Electronic state can thus
@@ -170,6 +182,8 @@ flowchart TB
     N --> A[Atomic scalar, polar, axial, L2 and optional L3 features]
     A --> R[Response parameters]
     R --> E[Electric-domain solvers]
+    R --> W[Electronic Hamiltonian head]
+    W --> WA[WALoss, training only]
     A --> M[Spin Hamiltonian]
     E --> F[FiLM condition]
     M --> F
@@ -417,7 +431,21 @@ s_n\frac{C_n^{AB}}
 The current backend is molecular. Periodic structures receive no D4 energy,
 and the GUI disables the switch for a dataset containing periodic structures.
 
-### 3.5 Layer 3: time-reversal-aware spin Hamiltonian
+### 3.5 Auxiliary electronic Hamiltonian head
+
+The optional `WavefunctionHamiltonianHead` pools shared Response scalar
+features graph by graph and predicts the $`K(K+1)/2`$ independent coefficients
+of a fixed $`K\times K`$ real-symmetric matrix. A fixed symmetric basis expands
+those coefficients into $`\widehat H_g`$, so Hermiticity is structural rather
+than an approximate loss constraint.
+
+This matrix represents a user-declared aligned orbital or Wannier subspace. It
+is neither the total interatomic energy nor the Layer-3 classical-spin
+Hamiltonian. It therefore does not enter $`E_{\mathrm{tot}}`$ and is never
+reinterpreted as $`J_{ij}`$, $`D_i`$, or DMI. Its gradients can still improve
+the shared Response representation when compatible labels activate WALoss.
+
+### 3.6 Layer 3: time-reversal-aware spin Hamiltonian
 
 A spin is an axial vector: under an orthogonal spatial transform $`\mathbf Q`$,
 
@@ -453,7 +481,7 @@ and the effective field is the energy derivative
 =-\frac{\partial E_{\mathrm{spin}}}{\partial\mathbf S_i}.
 ```
 
-### 3.6 Cross-granularity FiLM coupling
+### 3.7 Cross-granularity FiLM coupling
 
 The first domain/spin pass produces a four-component condition at every atom,
 
@@ -505,7 +533,7 @@ sequenceDiagram
     L1->>L1: refine local representation
 ```
 
-### 3.7 Energy assembly and derivative observables
+### 3.8 Energy assembly and derivative observables
 
 The complete implemented Hamiltonian is
 
@@ -534,11 +562,21 @@ Z^{*}_{i,\alpha\beta}
 
 ## 4. Data generation and training strategy
 
-### 4.1 Canonical mixed-label representation
+### 4.1 Mixed-label HDF5 representations
 
-Neo uses a ragged HDF5 schema. Atomic arrays are concatenated and indexed by
-`atom_ptr`; every physical target has a structure-level mask. The mask, not a
-placeholder value, determines whether a target contributes to training.
+Neo uses two self-contained HDF5 layouts. In canonical `e3mu-hdf5-v1`, atomic
+arrays are concatenated and indexed by `structures/atom_ptr`; `labels/` stores
+dense or packed physical tensors, `masks/` states which rows are valid, and
+`metadata/` stores source, method, group-safe split, and provenance. The mask,
+not a placeholder value, determines whether a target contributes to training.
+
+Composite `e3mu-composite-hdf5-v1` retains those four root groups for an
+embedded complete Standard or Large response payload. It additionally stores a
+deterministic OMat24 foundation under `sources/omat24/packed/`, its selected
+source shard and row under `selection/`, and OMat24 atomic-reference statistics
+under `atomic_reference/`. Positions, cells, energies, forces, and stress retain
+their source float64 values; an external Parquet tree is not required at
+training time.
 
 ```mermaid
 flowchart LR
@@ -548,27 +586,59 @@ flowchart LR
     G --> S[Fixed train / val / test split]
     S --> M[Label masks and energy-domain policy]
     M --> H[e3mu-hdf5-v1]
-    H --> T[Tiny, Small, Standard, Large tiers]
+    H --> T[Tiny, Small, Standard, Large]
+    T --> X[e3mu-composite-hdf5-v1]
+    O[Packed OMat24 foundation] --> X
+    X --> P[SE, Plus, Max]
 ```
 
-The standard tier contains 46,414 structures and 2,316,736 atoms. Its fixed
-split is 37,192 train, 4,541 validation, and 4,681 test structures. Principal
-active-label counts are:
+The complete seven-tier materialized inventory is:
 
-| Target | Labelled structures |
-| --- | ---: |
-| Energy and forces | 22,761 |
-| Dipole | 22,891 |
-| Charges and atomic dipoles | 18,130 |
-| Molecular polarizability, atomic polarizability, and C6 | 4,060 |
-| Born effective charge | 662 |
-| Spins and magnetic moments | 12,100 |
-| Effective spin field | 100 |
+| Tier | Schema | Embedded Neo response | OMat24 foundation | Total structures | Total atoms | On-disk size |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Tiny | canonical | 5,780 | 0 | 5,780 | 394,755 | 20.011 MiB |
+| Small | canonical | 16,703 | 0 | 16,703 | 1,069,318 | 51.218 MiB |
+| Standard | canonical | 46,414 | 0 | 46,414 | 2,316,736 | 0.120772 GiB |
+| SE | composite | Standard: 46,414 | 559,279 | 605,693 | 12,767,209 | 0.690297 GiB |
+| Large | canonical | 613,267 | 0 | 613,267 | 17,760,024 | 1.219244 GiB |
+| Plus | composite | Large: 613,267 | 25,206,004 | 25,819,271 | 488,227,614 | 38.237181 GiB |
+| Max | composite | Large: 613,267 | 100,670,282 | 101,283,549 | 1,899,323,661 | 128.559024 GiB |
+
+Tiny and Small are deterministic nested subsets of Standard. Large follows a
+separate trajectory-rich policy. SE combines the complete Standard response
+corpus with an exact `1/180` Max OMat24 selection; Plus and Max embed complete
+Large. Max contains 100,670,282 unique OMat24 configurations after 154,252
+duplicate configuration IDs are removed.
+
+Mask-derived response coverage is not inferred from file size:
+
+| Target family | Tiny | Small | Standard | Large |
+| --- | ---: | ---: | ---: | ---: |
+| Energy and forces | 1,912 | 8,131 | 22,761 | 505,736 |
+| Cauchy stress | 2,024 | 8,243 | 22,873 | 505,848 |
+| Field and total charge | 3,768 | 8,472 | 23,553 | 107,431 |
+| Dipole | 3,145 | 7,810 | 22,891 | 106,769 |
+| Charges and atomic dipoles | 2,011 | 4,844 | 18,130 | 101,993 |
+| Molecular/atomic polarizability and C6 | 302 | 406 | 4,060 | 43,430 |
+| Born effective charge | 623 | 662 | 662 | 662 |
+| Clamped-ion piezoelectric tensor | 112 | 112 | 112 | 112 |
+| Spins and magnetic moments | 1,074 | 4,320 | 12,100 | 73,029 |
+| Effective spin field | 100 | 100 | 100 | 100 |
+| Stress + spins | 974 | 4,220 | 12,000 | 72,929 |
+| Paired magnetoelastic stress | 0 | 0 | 0 | 0 |
+| Paired WALoss matrices | 0 | 0 | 0 | 0 |
+
+Composite response rows inherit exactly the Standard or Large coverage shown
+above; OMat24 foundation rows add only compatible energy, force, and stress.
+The seven current files contain no `orbital_hamiltonian` or
+`orbital_eigenvectors` arrays and omit the optional `wavefunction_dim`
+attribute. WALoss is therefore an implemented data-contract extension, not a
+label claimed for the current Neo release.
 
 Direct $`J`$, $`D_i`$, and DMI aggregate labels are absent from the portable tiers;
 their masks remain false. This is not interpreted as a zero physical value.
-The repository includes the Tiny tier, while Small, Standard, Large, and
-release metadata are distributed through the
+The repository includes the Tiny tier, while the larger canonical and
+Composite tiers and their release metadata are distributed through the
 [project dataset on Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN).
 
 ![Dataset tiers](assets/generated/dataset-tiers.png)
@@ -616,7 +686,66 @@ S_{\mathrm{val}}
 with fixed characteristic scales $`s_t`$. A candidate cannot improve its ranking
 merely by reducing its own loss weight.
 
-### 4.4 Optimization modes
+### 4.4 Wavefunction-aligned Hamiltonian supervision
+
+Uniform raw-matrix MSE does not distinguish perturbations that shift reference
+orbital energies from those that mix reference states. This distinction is
+especially important near a small gap because first-order state mixing contains
+the inverse energy denominator
+
+```math
+c_{j\leftarrow i}\simeq
+\frac{\langle u_j^*|\Delta H|u_i^*\rangle}
+{\epsilon_i^*-\epsilon_j^*}.
+```
+
+For each active graph $`g`$, WALoss transforms prediction and reference with the
+columns of the supplied reference eigenvector matrix $`U_g^*`$:
+
+```math
+\widetilde H_g=(U_g^*)^\dagger\widehat H_gU_g^*,
+\qquad
+\widetilde H_g^*=(U_g^*)^\dagger H_g^*U_g^*
+=\mathrm{diag}(\epsilon_{g,1}^*,\ldots,\epsilon_{g,K}^*).
+```
+
+Its two independently normalized terms are
+
+```math
+\mathcal L_{\mathrm{diag}}
+=\frac{\sum_gm_g\sum_i
+|\widetilde H_{g,ii}-\widetilde H_{g,ii}^*|^2}
+{\sum_gm_gK},
+```
+
+```math
+\mathcal L_{\mathrm{off}}
+=\frac{\sum_gm_g\sum_{i\lt j}
+|\widetilde H_{g,ij}-\widetilde H_{g,ij}^*|^2}
+{\sum_gm_gK(K-1)/2},
+\qquad
+\mathcal L_{\mathrm{WA}}
+=\lambda_{\mathrm d}\mathcal L_{\mathrm{diag}}
++\lambda_{\mathrm o}\mathcal L_{\mathrm{off}}.
+```
+
+The strict upper triangle prevents symmetric double counting; separate
+normalization prevents the $`O(K^2)`$ coupling population from overwhelming the
+$`O(K)`$ energy population. The complete trainer adds
+$`w_{\mathrm{waloss}}\mathcal L_{\mathrm{WA}}`$ only for paired active masks in
+Response or Joint training. It never diagonalizes $`\widehat H_g`$, so gradients
+do not traverse an eigensolver.
+
+Reference ingestion verifies finite values, symmetry, orthonormality, and that
+$`U_g^*`$ diagonalizes $`H_g^*`$ within a scale-aware tolerance. These numerical
+checks do not create a physical gauge. All rows in a training domain must share
+one ordered orbital/Wannier subspace, phase or degenerate-subspace convention,
+spin and k-point convention, energy zero, and electronic-structure method. The
+current Neo tiers have zero paired WALoss records, so this manuscript reports
+implementation and deterministic loss tests but no WALoss production-accuracy
+result.
+
+### 4.5 Optimization modes
 
 The trainer supports a ground-state base stage, a response stage, and joint
 fine-tuning. The full-chain workflow can freeze the ground branch during
@@ -653,10 +782,13 @@ derivatives. With the documented seed 7, the current maximum errors are:
 
 ![Physics validation](assets/generated/physics-self-tests.png)
 
-The repository regression suite currently contains 54 passing tests. It also
-checks MPS-specific QEq solves, differentiable PME and D4 references, DEQ
-gradients, Layer-3 supervised gradients, checkpoint safety, HDF5 invariants,
-dataset-aware GUI state, and magnetic VASP mapping.
+The repository regression suite additionally checks MPS-specific QEq solves,
+differentiable PME and D4 references, DEQ gradients, Layer-3 supervised
+gradients, checkpoint safety, HDF5 invariants, dataset-aware GUI state, and
+magnetic VASP mapping. WALoss-focused tests cover diagonal/off-diagonal
+normalization, common-basis invariance, differentiability without a predicted
+eigensolver, paired-mask validation, checkpoint warm starts, and its separation
+from the classical-spin Hamiltonian.
 
 ### 5.2 Small held-out benchmarks
 
@@ -696,6 +828,11 @@ Several boundaries are material when interpreting results:
 - Direct $`J`$, $`D_i`$, and DMI labels are not present in the portable Neo tiers;
   the Layer-3 Hamiltonian is functionally and symmetry validated but does not
   yet have a paper-grade cross-material calibration result.
+- WALoss and its real-symmetric auxiliary head are implemented, but the current
+  Neo tiers contain no aligned Hamiltonian/eigenvector pairs. No orbital-energy
+  or orbital-coupling accuracy is claimed. The fixed-$`K`$ head is not a
+  variable-band, k-resolved, real-space-wavefunction, or strong-correlation
+  solver.
 - Absolute energies from different electronic-structure methods remain
   separately masked instead of being forced into a common zero.
 - Born effective charge tensors are retained as published; the dataset reports
@@ -712,9 +849,11 @@ layer provides explicit O(3)
 parity channels; its domain layer turns predicted electronic parameters into
 constrained electrostatic, polarization, and dispersion energies; its spin
 layer supplies a time-reversal-consistent magnetic Hamiltonian; and FiLM
-allows domain and spin state to refine local messages. A mask-aware dataset
-contract and derivative-based validation keep the physical meaning of each
-target visible. The implementation is therefore a complete research platform
+allows domain and spin state to refine local messages. Optional WALoss adds a
+reference-eigenspace electronic objective without conflating that auxiliary
+matrix with total or spin energy. A mask-aware two-schema dataset contract and
+derivative-based validation keep the physical meaning of each target visible.
+The implementation is therefore a complete research platform
 for controlled L1-L3 experiments, while its short benchmarks and unresolved
 data redistribution item set clear limits on current accuracy and release
 claims.

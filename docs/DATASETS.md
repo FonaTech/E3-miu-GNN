@@ -1,6 +1,6 @@
-# Datasets and Canonical Data Contract
+# Datasets and HDF5 Data Contracts
 
-This document expands Section 4.1-4.3 of the [paper](PAPER.md). It summarizes
+This document expands Sections 4.1-4.4 of the [paper](PAPER.md). It summarizes
 the data consumed by the E(3)-GNN implementation. The authoritative release
 records remain the Neo [Dataset Card](../Datasets/Neo/README.md),
 [source declaration](../Datasets/Neo/SOURCES_AND_PROCESSING.md),
@@ -8,9 +8,9 @@ records remain the Neo [Dataset Card](../Datasets/Neo/README.md),
 [license ledger](../Datasets/Neo/LICENSES_AND_ATTRIBUTION.md).
 
 The repository carries the
-[Tiny HDF5 file](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5)
-for quick checks. The complete dataset release, including Small, Standard, and
-Large, is hosted at
+[Tiny HDF5 file](https://github.com/FonaTech/E3-miu-GNN/blob/main/Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5)
+for quick checks. The complete release-facing dataset family, including Small,
+Standard, SE, Large, Plus, and Max, is hosted at
 [FonaTech/E3-miu-GNN on Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN).
 
 ## Design objective
@@ -29,7 +29,10 @@ flowchart LR
     P --> S[Fixed group-safe split]
     S --> M[Target masks and energy-domain policy]
     M --> H[e3mu-hdf5-v1]
-    H --> T[Tiny, Small, Standard and Large tiers]
+    H --> T[Tiny, Small, Standard and Large]
+    T --> X[e3mu-composite-hdf5-v1]
+    O[Deterministic packed OMat24 foundation] --> X
+    X --> P[SE, Plus and Max files]
 ```
 
 ## Upstream source families
@@ -99,12 +102,45 @@ must never be interpreted as zero observations.
 | Dispersion | C6 | eV $`\mathrm{angstrom}^6`$ |
 | Layer 3 | spins; magnetic moments; effective field | dimensionless; $`\mu_B`$; eV/spin |
 | Reserved spin targets | $`J`$, $`D_i`$, DMI; paired magnetoelastic stress | eV; eV/angstrom$^3$ |
+| Optional electronic WALoss | orbital Hamiltonian; reference eigenvectors | eV; dimensionless |
 
 The current portable tiers contain spins, magnetic moments, and 100 effective
 spin-field records. Direct aggregate $`J`$, $`D_i`$, and DMI masks are all false.
 The architecture can consume those targets after compatible VASP collections
 are added, but their absence must not be described as fully supervised
 three-layer magnetic calibration.
+
+## Optional WALoss data contract
+
+WALoss is an optional extension of the canonical response-label contract used
+by `e3mu-hdf5-v1` and by the response root of
+`e3mu-composite-hdf5-v1`; it does not imply that a Neo release tier contains
+electronic-structure matrices. A labeled structure owns both of the following
+structure-level arrays or neither:
+
+| Label | Per-structure shape | Unit | Meaning |
+| --- | --- | --- | --- |
+| `orbital_hamiltonian` | `(K, K)` | eV | Real-symmetric electronic Hamiltonian in the declared aligned orbital/Wannier basis |
+| `orbital_eigenvectors` | `(K, K)` | dimensionless | Reference eigenvectors as columns in the same basis |
+
+One file has one fixed positive $`K`$, recorded as the root attribute
+`wavefunction_dim`. Both masks must be active together. The reader verifies
+finite values, matching square shapes, real symmetry, orthonormal columns, and
+that the supplied eigenvectors diagonalize the paired Hamiltonian. Inactive
+dense slots are padding and never become zero-valued supervision.
+
+Shape agreement is not sufficient scientific alignment. Every row must use the
+same ordered orbital or Wannier subspace, phase/gauge convention, spin channel,
+k-point convention, energy zero, and electronic-structure method, or must be
+explicitly separated into compatible training domains. For near-degenerate
+states, align the whole degenerate subspace before choosing individual vectors.
+The current contract represents one fixed matrix per structure; it is not a
+general variable-band or k-resolved Hamiltonian container.
+
+The current Neo Tiny, Small, Standard, SE, Large, Plus, and Max files do not
+publish these two labels and omit the optional `wavefunction_dim` attribute, so
+WALoss remains disabled for those binaries. Adding the optional schema fields
+does not rewrite or claim new supervision for any existing release.
 
 ## Fixed physical grouping and splits
 
@@ -149,32 +185,19 @@ sampled.
 
 ![Neo dataset tiers](assets/generated/dataset-tiers.png)
 
-## Composite packed tiers
+### Canonical file inventory
 
-Plus and Max use `e3mu-composite-hdf5-v1` and are self-contained single-file
-datasets. Their selected OMat24 rows are stored under
-`sources/omat24/packed` with ragged `atom_ptr`, atomic numbers, positions,
-forces, cells, periodic flags, stress, energies, and stable identifiers. The
-packed writer preserves source float64 geometry and labels without quantization;
-it does not depend on an external OMat24 directory at runtime. The complete Neo
-Large payload remains embedded in the same file.
+All four canonical files expose the same four root groups and differ only in
+row selection and source policy. Their current materialized contents are:
 
-At training time, `E3_miu_GNN.py` builds or reuses an exact topology cache keyed
-by the composite file, selected structure ids, cutoff, and neighborhood backend.
-The cache stores edge counts for MPS edge-budget batching and bitwise-exact
-periodic-shift dictionaries. This changes host decoding and graph reuse, not
-the numerical labels or the model cutoff.
+| Tier | File | Structures | Atoms | Elements | Periodic structures | On-disk size | Relationship |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Tiny | `neo_tiny_l1_l2_l3.h5` | 5,780 | 394,755 | 85 | 3,769 | 20.011 MiB | Deterministic nested subset of Small |
+| Small | `neo_small_l1_l2_l3.h5` | 16,703 | 1,069,318 | 85 | 11,859 | 51.218 MiB | Deterministic nested subset of Standard |
+| Standard | `neo_mixed_l1_l2_l3.h5` | 46,414 | 2,316,736 | 85 | 28,284 | 0.120772 GiB | Complete portable response corpus |
+| Large | `neo_large_l1_l2_l3.h5` | 613,267 | 17,760,024 | 87 | 511,274 | 1.219244 GiB | Separate trajectory-rich policy |
 
-| Tier | Structures | Atoms | Elements | Periodic structures | File size | Distribution |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Tiny | 5,780 | 394,755 | 85 | 3,769 | 21.0 MB | [GitHub](https://github.com/FonaTech/E3-miu-GNN/blob/main/datasets/neo_tiny_l1_l2_l3.h5) |
-| Small | 16,703 | 1,069,318 | 85 | 11,859 | 53.7 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_small_l1_l2_l3.h5) |
-| Standard | 46,414 | 2,316,736 | 85 | 28,284 | 129.7 MB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_mixed_l1_l2_l3.h5) |
-| Large | 613,267 | 17,760,024 | 87 | 511,274 | 1.31 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_large_l1_l2_l3.h5) |
-| Plus | 25,819,271 | 488,227,614 | 94 | 25,717,278 | 40.63 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_plus_l1_l2_l3.h5) |
-| Max | 101,283,549 | 1,899,323,661 | 94 | 101,181,556 | 137.61 GB | [Hugging Face](https://huggingface.co/datasets/FonaTech/E3-miu-GNN/blob/main/canonical/neo_max_l1_l2_l3.h5) |
-
-The fixed split counts are:
+The canonical fixed splits are:
 
 | Tier | Train | Validation | Test |
 | --- | ---: | ---: | ---: |
@@ -183,27 +206,85 @@ The fixed split counts are:
 | Standard | 37,192 | 4,541 | 4,681 |
 | Large | 492,759 | 59,813 | 60,695 |
 
-## Standard-tier target coverage
+## Composite packed tiers
 
-| Target family | Labelled structures |
-| --- | ---: |
-| Energy and forces | 22,761 |
-| Cauchy stress | 22,873 |
-| Field and total charge | 23,553 |
-| Dipole | 22,891 |
-| Charges and atomic dipoles | 18,130 |
-| Molecular polarizability, atomic polarizability, and C6 | 4,060 |
-| Born effective charge | 662 |
-| Clamped-ion piezoelectric tensor | 112 |
-| Spins and magnetic moments | 12,100 |
-| Effective spin field | 100 |
+SE, Plus, and Max use `e3mu-composite-hdf5-v1`. Each is a self-contained single
+HDF5 file with this logical structure:
 
-Within Standard, all 112 JARVIS-DFPT records jointly carry stress, BEC, and
-piezoelectric labels, while 12,000 MPtrj records jointly carry stress and spin
-labels. Large contains 505,848 stress labels, of which 72,929 also carry spin
-states. These are mechanism-matched total-stress observations. They are not
-same-geometry spin-pair differences, so `magnetoelastic_stress` has zero active
-records and `w_magnetoelastic` remains zero by default.
+```text
+/
+|-- structures/                   embedded complete Standard or Large geometry
+|-- labels/                       embedded Neo response labels
+|-- masks/                        embedded per-label validity masks
+|-- metadata/                     embedded Neo provenance and fixed splits
+|-- selection/
+|   |-- source_order              OMat24 shard index
+|   |-- row_index                 selected materialized row
+|   |-- source_row_index          exact upstream Parquet row
+|   |-- split_code                0=train, 1=validation, 2=test
+|   `-- atom_count                exact structure size for batch planning
+|-- sources/omat24/packed/
+|   |-- atom_ptr, atomic_numbers, positions, cell, pbc
+|   |-- energy, forces, stress, stress_volume_normalized
+|   `-- configuration_id, material_id, source_row_index
+`-- atomic_reference/             OMat24-only normal equations and element map
+```
+
+The canonical root groups describe the response component only; the OMat24
+foundation is not duplicated into those arrays. A composite reader forms its
+logical dataset from both components and uses `selection/split_code` for the
+foundation rows. The packed writer preserves source float64 geometry and labels
+without quantization, and runtime loading does not depend on an external OMat24
+directory.
+
+| File/tier | Embedded Neo response | OMat24 foundation | Total structures | Total atoms | On-disk size | Role |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| SE | Standard: 46,414 | 559,279 | 605,693 | 12,767,209 | 0.690297 GiB | Compact foundation; exact `1/180` Max selection |
+| Plus | Large: 613,267 | 25,206,004 | 25,819,271 | 488,227,614 | 38.237181 GiB | Quarter-scale material-family foundation |
+| Max | Large: 613,267 | 100,670,282 | 101,283,549 | 1,899,323,661 | 128.559024 GiB | Complete deduplicated OMat24 foundation |
+
+Plus and Max embed complete Large; SE embeds complete Standard. Max removes
+154,252 duplicated configuration IDs before the retained 100,670,282-row
+selection.
+
+At training time, `E3_miu_GNN.py` builds or reuses an exact topology cache keyed
+by the composite file, selected structure ids, cutoff, and neighborhood backend.
+The cache stores edge counts for MPS edge-budget batching and bitwise-exact
+periodic-shift dictionaries. This changes host decoding and graph reuse, not
+the numerical labels or the model cutoff.
+
+## Target coverage across response tiers
+
+The mask-derived active structure counts for all canonical response payloads
+are shown below. Composite files inherit one complete Standard or Large column
+and add OMat24 energy/force/stress foundation rows; they do not copy response
+labels onto the OMat24 component.
+
+| Target family | Tiny | Small | Standard | Large |
+| --- | ---: | ---: | ---: | ---: |
+| Energy and forces | 1,912 | 8,131 | 22,761 | 505,736 |
+| Cauchy stress | 2,024 | 8,243 | 22,873 | 505,848 |
+| Field and total charge | 3,768 | 8,472 | 23,553 | 107,431 |
+| Dipole | 3,145 | 7,810 | 22,891 | 106,769 |
+| Charges and atomic dipoles | 2,011 | 4,844 | 18,130 | 101,993 |
+| Molecular/atomic polarizability and C6 | 302 | 406 | 4,060 | 43,430 |
+| Born effective charge | 623 | 662 | 662 | 662 |
+| Clamped-ion piezoelectric tensor | 112 | 112 | 112 | 112 |
+| Spins and magnetic moments | 1,074 | 4,320 | 12,100 | 73,029 |
+| Effective spin field | 100 | 100 | 100 | 100 |
+| Stress + spins | 974 | 4,220 | 12,000 | 72,929 |
+| Paired magnetoelastic stress | 0 | 0 | 0 | 0 |
+| Paired WALoss matrices | 0 | 0 | 0 | 0 |
+
+SE therefore contains the Standard response counts plus 559,279 OMat24
+foundation rows; its total stress count is 582,152. Plus and Max
+contain the Large response counts plus their respective foundations; their
+total stress counts are 25,711,852 and 101,176,130. All 112 JARVIS-DFPT rows
+jointly carry stress, BEC, and piezoelectric labels. The stress-plus-spin rows
+are mechanism-matched total-stress observations, not same-geometry spin-pair
+differences, so `magnetoelastic_stress` remains inactive. Likewise, zero WALoss
+coverage means absence of the optional paired matrices, not a zero-valued
+electronic Hamiltonian.
 
 These counts describe available supervision, not equal coverage of every
 element, chemical environment, or physical regime.

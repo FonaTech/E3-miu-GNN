@@ -34,7 +34,7 @@ solvers.
 | 15 | electronegativity equilibrium and charge conservation | (16)-(19) | constrained differentiable QEq | `DifferentiableQEq` |
 | 16a-b | pair readout and spin Hamiltonian | (25)-(27) | implemented with optional DMI | `TimeReversalSpinHamiltonian` |
 | 17-18 | charge/spin conditioning and FiLM modulation | (28)-(30) | implemented as bounded feedback | FiLM condition builder, `FastEquivariantCoreO3` |
-| 19 | comprehensive weighted loss | (33)-(34) | implemented for the active masked target set | `TrainConfig`, `train_dual_layer` |
+| 19 | comprehensive weighted loss and WALoss | (33)-(34) and WALoss text | implemented for the active masked target set, including aligned orbital Hamiltonians | `wavefunction_alignment_loss`, `TrainConfig`, `train_dual_layer` |
 
 ## Formula 1: electronic-structure foundation
 
@@ -157,8 +157,10 @@ general Clebsch-Gordan library.
 \widehat{\boldsymbol\mu}\cdot\boldsymbol{\mathcal E}.
 ```
 
-The implementation uses the resulting effective energy expansion; it does not
-represent the electronic wavefunction factor explicitly.
+The effective-energy path does not solve the Kohn-Sham equations or represent a
+real-space electronic wavefunction. An optional auxiliary WALoss head described
+under Formula 19 predicts a finite-dimensional electronic Hamiltonian in a
+user-supplied aligned orbital or Wannier subspace.
 
 The field-coupling convention defines
 $`\widehat V_{\mathrm{ext}}=-\widehat{\boldsymbol\mu}\cdot\boldsymbol{\mathcal E}`$
@@ -507,8 +509,9 @@ A broad multi-target objective can be written as
 +w_W\mathcal L_{\mathrm{wave}}+w_{\mathrm{Ha}}\mathcal L_{\mathrm{Hamiltonian}}.
 ```
 
-Wavefunction and a direct Hessian loss are not implemented targets. The actual
-objective is
+A direct Hessian loss remains unimplemented. The wavefunction term is now
+realized as a reference-eigenspace Hamiltonian alignment objective, while the
+remaining targets use the mask-aware objective
 
 ```math
 \mathcal L_{\mathrm{implemented}}
@@ -533,3 +536,60 @@ mask. The implementation can additionally penalize the BEC acoustic sum rule,
 $`\sum_i Z_i^*=0`$, and active electric/spin FiLM fixed-point residuals. These
 remain auxiliary physical constraints rather than substitutes for observable
 labels.
+
+### Formula 19a: wavefunction alignment loss
+
+For graph $`g`$, let $`H_g^*`$ be a reference Hamiltonian and let the columns of
+$`U_g^*`$ be its orthonormal reference eigenvectors in one fixed orbital or
+Wannier gauge. The electronic auxiliary head predicts a real-symmetric matrix
+$`\widehat H_g`$ of the same fixed dimension $`K`$. Both matrices are expressed
+in the same reference eigenspace:
+
+```math
+\widetilde H_g
+=(U_g^*)^{\dagger}\widehat H_gU_g^*,
+\qquad
+\widetilde H_g^*
+=(U_g^*)^{\dagger}H_g^*U_g^*
+=\mathrm{diag}(\epsilon_{g,1}^*,\ldots,\epsilon_{g,K}^*).
+```
+
+The diagonal orbital-energy error and strict-upper-triangle orbital-coupling
+error are normalized independently:
+
+```math
+\mathcal L_{\mathrm{diag}}
+=\frac{\sum_gm_g\sum_{i=1}^{K}
+|\widetilde H_{g,ii}-\widetilde H_{g,ii}^*|^2}
+{\sum_gm_gK},
+```
+
+```math
+\mathcal L_{\mathrm{off}}
+=\frac{\sum_gm_g\sum_{1\le i\lt j\le K}
+|\widetilde H_{g,ij}-\widetilde H_{g,ij}^*|^2}
+{\sum_gm_gK(K-1)/2},
+\qquad
+\mathcal L_{\mathrm{WA}}
+=\lambda_{\mathrm d}\mathcal L_{\mathrm{diag}}
++\lambda_{\mathrm o}\mathcal L_{\mathrm{off}}.
+```
+
+The strict upper triangle avoids counting symmetric couplings twice. Separate
+normalization prevents the $`O(K^2)`$ coupling population from overwhelming the
+$`O(K)`$ energy population. The complete trainer adds
+$`w_{\mathrm{waloss}}\mathcal L_{\mathrm{WA}}`$ only for active paired masks.
+
+No eigensolver is applied to $`\widehat H_g`$ during training. Gradients pass
+through the fixed basis products and `WavefunctionHamiltonianHead`, avoiding
+eigensolver backpropagation. Ingestion verifies that $`H_g^*`$ is symmetric,
+$`U_g^*`$ is orthonormal, and $(U_g^*)^\dagger H_g^*U_g^*$ is diagonal within a
+scale-aware tolerance. The mathematical primitive also accepts complex
+Hermitian tensors; the current canonical HDF5 contract and model head are real.
+
+This objective is invariant to a common unitary change of raw basis applied to
+$`\widehat H_g`$, $`H_g^*`$, and $`U_g^*`$. That mathematical invariance does not
+repair inconsistent gauges between dataset rows: every row must first be
+projected into the same ordered subspace and energy convention. Near-degenerate
+subspaces require a stable subspace gauge before assigning a large off-diagonal
+weight.
