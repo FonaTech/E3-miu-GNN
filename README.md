@@ -1,9 +1,11 @@
 # Mixed-Granularity E(3)-mu-GNN
 
-An E(3)-equivariant atomistic graph neural network that couples local chemical
-interactions, differentiable electrostatic and polarization physics, a
-time-reversal-aware spin Hamiltonian, and optional wavefunction-aligned
-electronic Hamiltonian supervision in one trainable model.
+E3-miu-GNN is an open-source research platform for learning atomistic energy
+surfaces together with electric, magnetic, and electronic response. It combines
+an E(3)-equivariant local graph representation with differentiable physical
+solvers, mixed-granularity feedback, and a mask-aware data/training system.
+The same model can be used from the GUI, command line, ASE, or headless Python
+and LLM workflows.
 
 > **Research status.** The three-layer architecture, canonical data pipeline,
 > training system, PyQt6 interface, and deterministic physics tests are
@@ -12,36 +14,41 @@ electronic Hamiltonian supervision in one trainable model.
 
 ![Mixed-granularity architecture](docs/assets/proposal/mixed-granularity-core.png)
 
-*Figure 1. Implemented E(3)-mu-GNN atomic, domain-response, spin, and coupling
-architecture.*
+*Figure 1. E(3)-mu-GNN atomic, domain-response, spin, and coupling architecture.*
 
-## What is implemented
+## Core capabilities
 
-- **Layer 1 - local atomic representation:** scalar, polar-vector,
-  axial-vector, symmetric-traceless $`L=2`$, and optional $`L=3`$ channels with
-  explicit O(3) parity handling.
-- **Layer 2 - domain response:** constrained differentiable QEq, periodic
+The project combines three physical layers and the tooling needed to train and
+evaluate them:
+
+- **Layer 1 — local atomic representation:** scalar, polar-vector, axial-vector,
+  symmetric-traceless $`L=2`$, and configurable $`L=3`$ channels with explicit
+  O(3) parity handling.
+- **Layer 2 — domain response:** differentiable constrained QEq, periodic
   Ewald/PME through `torch-pme`, Thole-damped self-consistent polarization,
   molecular DFT-D4, dipoles, polarizabilities, charges, C6, and Born effective
-  charges. An optional fixed-dimension real-symmetric electronic Hamiltonian
-  head supports wavefunction alignment loss (WALoss) in a declared
-  orbital/Wannier subspace.
-- **Layer 3 - magnetic response:** geometry-conditioned Heisenberg exchange,
-  traceless single-ion anisotropy, optional Dzyaloshinskii-Moriya interaction,
-  magnetic moments, and effective spin fields.
-- **Cross-granularity feedback:** charge, electrostatic potential, and spin
-  invariants modulate atomic message passing through bounded FiLM gates;
-  label-aware activity masks keep L2/L3 mechanisms off L1-only foundation graphs.
-- **Training and evaluation:** mask-aware mixed-label losses, group-safe fixed
-  splits, staged base/response/joint training, normalized multi-task model
-  selection, conservative cell-strain stress, BEC sum-rule and coupling
-  constraints, diagonal/off-diagonal WALoss diagnostics, live plots, memory
-  diagnostics, safe checkpoints, and a
-  dataset-aware Auto Research workflow with paired one-factor sensitivity
-  screening, physical-group local refinement, and independent confirmation.
-- **Data tooling:** canonical ragged HDF5, deterministic tier construction,
-  strict validation, provenance records, source-specific masking, and
-  rights-aware Hugging Face staging with supported Dataset Viewer tables.
+  charges.
+- **Layer 3 — magnetic response:** geometry-conditioned Heisenberg exchange,
+  traceless single-ion anisotropy, Dzyaloshinskii–Moriya interaction,
+  magnetic moments, and effective spin fields, with capability gating when a
+  selected dataset or architecture does not activate a term.
+- **Cross-granularity feedback:** bounded FiLM modulation from charge,
+  electrostatic-potential, and spin invariants, with label-aware activity masks
+  that keep inactive L2/L3 mechanisms out of L1-only foundation graphs.
+- **Training and evaluation:** mask-aware mixed-label objectives, group-safe
+  fixed splits, staged Base/Response/Joint training, normalized multi-task
+  checkpoint selection, conservative cell-strain stress, BEC sum-rule and
+  coupling constraints, live plots, memory diagnostics, safe checkpoints, and
+  dataset-aware Auto Research with one-factor screening, physical-group
+  refinement, and independent confirmation.
+- **Data tooling:** canonical and Composite ragged HDF5, deterministic tier
+  construction, strict validation, provenance records, source-specific masks,
+  and rights-aware Hugging Face staging with Dataset Viewer tables.
+
+An optional wavefunction-aligned Hamiltonian objective (WALoss) is available for
+datasets that provide paired, gauge-aligned orbital/Wannier labels. The current
+Neo release does not include those labels; its ordinary energy, force, stress,
+response, and spin targets remain fully usable.
 
 ## Effective Hamiltonian
 
