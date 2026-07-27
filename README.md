@@ -400,6 +400,14 @@ requirements.txt              Complete research environment
 pyproject.toml                Installable package and `e3mu` entry point
 ```
 
+## Acknowledgements
+
+I gratefully acknowledge Yoshitada Morikawa, Ikutaro Hamada, and Harry H. Halim
+for their guidance and valuable advice. This acknowledgement does not imply
+their authorship or endorsement of this repository, and they bear no
+responsibility for its contents, implementation, results, or conclusions. All
+responsibility rests solely with the author.
+
 ## Citation
 
 Use [CITATION.cff](CITATION.cff) when citing the software. Until a versioned
