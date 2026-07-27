@@ -402,11 +402,11 @@ pyproject.toml                Installable package and `e3mu` entry point
 
 ## Acknowledgements
 
-I gratefully acknowledge Yoshitada Morikawa, Ikutaro Hamada, and Harry H. Halim
-for their guidance and valuable advice. This acknowledgement does not imply
-their authorship or endorsement of this repository, and they bear no
-responsibility for its contents, implementation, results, or conclusions. All
-responsibility rests solely with the author.
+I gratefully acknowledge Prof. Yoshitada Morikawa, Prof. Ikutaro Hamada, and
+Prof. Harry H. Halim for their guidance and valuable advice. This
+acknowledgement does not imply their authorship or endorsement of this
+repository, and they bear no responsibility for its contents, implementation,
+results, or conclusions. All responsibility rests solely with the author.
 
 ## Citation
 
