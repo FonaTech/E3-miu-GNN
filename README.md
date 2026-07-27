@@ -1,9 +1,11 @@
 # Mixed-Granularity E(3)-mu-GNN
 
-An E(3)-equivariant atomistic graph neural network that couples local chemical
-interactions, differentiable electrostatic and polarization physics, a
-time-reversal-aware spin Hamiltonian, and optional wavefunction-aligned
-electronic Hamiltonian supervision in one trainable model.
+E3-miu-GNN is an open-source research platform for learning atomistic energy
+surfaces together with electric, magnetic, and electronic response. It combines
+an E(3)-equivariant local graph representation with differentiable physical
+solvers, mixed-granularity feedback, and a mask-aware data/training system.
+The same model can be used from the GUI, command line, ASE, or headless Python
+and LLM workflows.
 
 > **Research status.** The three-layer architecture, canonical data pipeline,
 > training system, PyQt6 interface, and deterministic physics tests are
@@ -12,36 +14,99 @@ electronic Hamiltonian supervision in one trainable model.
 
 ![Mixed-granularity architecture](docs/assets/proposal/mixed-granularity-core.png)
 
-*Figure 1. Implemented E(3)-mu-GNN atomic, domain-response, spin, and coupling
-architecture.*
+*Figure 1. E(3)-mu-GNN atomic, domain-response, spin, and coupling architecture.*
 
-## What is implemented
+## Core capabilities
 
-- **Layer 1 - local atomic representation:** scalar, polar-vector,
-  axial-vector, symmetric-traceless $`L=2`$, and optional $`L=3`$ channels with
-  explicit O(3) parity handling.
-- **Layer 2 - domain response:** constrained differentiable QEq, periodic
+The project combines three physical layers and the tooling needed to train and
+evaluate them:
+
+- **Layer 1 — local atomic representation:** scalar, polar-vector, axial-vector,
+  symmetric-traceless $`L=2`$, and configurable $`L=3`$ channels with explicit
+  O(3) parity handling.
+- **Layer 2 — domain response:** differentiable constrained QEq, periodic
   Ewald/PME through `torch-pme`, Thole-damped self-consistent polarization,
   molecular DFT-D4, dipoles, polarizabilities, charges, C6, and Born effective
-  charges. An optional fixed-dimension real-symmetric electronic Hamiltonian
-  head supports wavefunction alignment loss (WALoss) in a declared
-  orbital/Wannier subspace.
-- **Layer 3 - magnetic response:** geometry-conditioned Heisenberg exchange,
-  traceless single-ion anisotropy, optional Dzyaloshinskii-Moriya interaction,
-  magnetic moments, and effective spin fields.
-- **Cross-granularity feedback:** charge, electrostatic potential, and spin
-  invariants modulate atomic message passing through bounded FiLM gates;
-  label-aware activity masks keep L2/L3 mechanisms off L1-only foundation graphs.
-- **Training and evaluation:** mask-aware mixed-label losses, group-safe fixed
-  splits, staged base/response/joint training, normalized multi-task model
-  selection, conservative cell-strain stress, BEC sum-rule and coupling
-  constraints, diagonal/off-diagonal WALoss diagnostics, live plots, memory
-  diagnostics, safe checkpoints, and a
-  dataset-aware Auto Research workflow with paired one-factor sensitivity
-  screening, physical-group local refinement, and independent confirmation.
-- **Data tooling:** canonical ragged HDF5, deterministic tier construction,
-  strict validation, provenance records, source-specific masking, and
-  rights-aware Hugging Face staging with supported Dataset Viewer tables.
+  charges.
+- **Layer 3 — magnetic response:** geometry-conditioned Heisenberg exchange,
+  traceless single-ion anisotropy, Dzyaloshinskii–Moriya interaction,
+  magnetic moments, and effective spin fields, with capability gating when a
+  selected dataset or architecture does not activate a term.
+- **Cross-granularity feedback:** bounded FiLM modulation from charge,
+  electrostatic-potential, and spin invariants, with label-aware activity masks
+  that keep inactive L2/L3 mechanisms out of L1-only foundation graphs.
+- **Training and evaluation:** mask-aware mixed-label objectives, group-safe
+  fixed splits, staged Base/Response/Joint training, normalized multi-task
+  checkpoint selection, conservative cell-strain stress, BEC sum-rule and
+  coupling constraints, live plots, memory diagnostics, safe checkpoints, and
+  dataset-aware Auto Research with one-factor screening, physical-group
+  refinement, and independent confirmation.
+- **Data tooling:** canonical and Composite ragged HDF5, deterministic tier
+  construction, strict validation, provenance records, source-specific masks,
+  and rights-aware Hugging Face staging with Dataset Viewer tables.
+
+## Architecture at a glance
+
+The model follows a mixed-granularity path rather than treating every physical
+quantity as one undifferentiated scalar correction:
+
+1. **Layer 1** builds parity-aware equivariant local atomic features and a
+   short-range energy.
+2. **Layer 2** turns shared features into charge, electrostatic, polarization,
+   dispersion, and electric-response quantities using differentiable physical
+   solvers.
+3. **Layer 3** predicts geometry-conditioned spin interactions and magnetic
+   response while preserving time-reversal symmetry.
+4. **FiLM feedback** sends charge, potential, and spin invariants back into the
+   atomic representation, allowing domain and magnetic state to refine local
+   messages.
+
+The energy-producing branches are assembled before forces, stress, and response
+derivatives are evaluated. An optional electronic branch leaves this energy
+path and provides auxiliary supervision:
+
+```mermaid
+flowchart LR
+    A[Structure and physical state] --> G[Neighbor graph]
+    G --> L1["Layer 1: parity-aware O(3) features"]
+    L1 --> PES[Short-range energy]
+    L1 --> R["Layer 2 response heads"]
+    R --> Q["QEq / PME / polarization / D4"]
+    R --> S["Layer 3 spin Hamiltonian"]
+    R --> W["Optional electronic Hamiltonian head"]
+    W --> WA["WALoss: training auxiliary"]
+    Q --> C[Charge and potential invariants]
+    S --> C2[Spin invariants]
+    C --> F[Bounded FiLM feedback]
+    C2 --> F
+    F --> L1
+    PES --> H[Effective Hamiltonian]
+    Q --> H
+    S --> H
+    H --> O[Energy, forces, stress, response, spin field]
+```
+
+### Optional electronic alignment (WALoss)
+
+When paired, gauge-aligned orbital/Wannier labels are available, the Response
+features can also predict a fixed-dimension real-symmetric electronic
+Hamiltonian. WALoss compares it in the reference eigenspace,
+
+```math
+\widetilde H=(U^*)^\dagger\widehat H U^*,
+\qquad
+\mathcal L_{\mathrm{WA}}
+=\lambda_{\mathrm d}\mathcal L_{\mathrm{diag}}
++\lambda_{\mathrm o}\mathcal L_{\mathrm{off}}.
+```
+
+The diagonal and strict-off-diagonal terms respectively track orbital-energy
+error and reference-state mixing. This branch is auxiliary: it is not the
+classical-spin Hamiltonian and does not enter $`E_{\mathrm{tot}}`$. The current
+Neo tiers do not contain these optional labels, while their energy, force,
+stress, electric-response, and spin targets remain usable. The full physical
+derivation and data contract are in [Physical mechanisms](docs/PHYSICS.md),
+[the paper](docs/PAPER.md), and [Datasets](docs/DATASETS.md).
 
 ## Effective Hamiltonian
 
@@ -73,100 +138,6 @@ Forces and spin fields remain derivatives of the same energy:
 \mathbf H_i^{\mathrm{eff}}=-\frac{\partial E_{\mathrm{spin}}}{\partial \mathbf S_i},
 \qquad
 Z^{*}_{i,\alpha\beta}=\frac{\partial \mu_\alpha}{\partial R_{i\beta}}.
-```
-
-## Wavefunction alignment loss
-
-Entry-wise Hamiltonian fitting in an arbitrary raw orbital basis does not state
-which errors perturb orbital energies and which errors mix reference states.
-This matters because a matrix can contain many individually small errors, while
-their collective spectral norm grows with subspace size; near a small energy
-gap, even a modest off-diagonal perturbation can strongly rotate the associated
-eigenspace. WALoss makes those two physical effects explicit.
-
-For a reference Hamiltonian $`H_g^*`$ with orthonormal eigenvectors $`U_g^*`$
-and a predicted Hamiltonian $`\widehat H_g`$, both matrices are expressed in the
-reference eigenspace:
-
-```math
-\widetilde H_g=(U_g^*)^\dagger\widehat H_gU_g^*,
-\qquad
-\widetilde H_g^*=(U_g^*)^\dagger H_g^*U_g^*
-=\mathrm{diag}(\epsilon_{g,1}^*,\ldots,\epsilon_{g,K}^*).
-```
-
-The diagonal residual directly penalizes orbital-energy error. The strict upper
-triangle penalizes unwanted coupling between reference eigenstates without
-counting a symmetric pair twice. The two populations are normalized
-independently before applying their weights:
-
-```math
-\mathcal L_{\mathrm{WA}}
-=\lambda_{\mathrm d}\mathcal L_{\mathrm{diag}}
-+\lambda_{\mathrm o}\mathcal L_{\mathrm{off}}.
-```
-
-This is a physics-informed auxiliary objective: it encodes the reference
-eigenproblem in the feature-space loss, but it is not a Kohn-Sham solver and it
-does not reconstruct a real-space many-electron wavefunction. The prediction
-path never diagonalizes $`\widehat H_g`$; gradients pass only through fixed
-basis products and the symmetric Hamiltonian head. The head is graph-level,
-real, and fixed $`K\times K`$, is separate from the $`J/D_i`$/DMI spin
-Hamiltonian, and does not enter $`E_{\mathrm{tot}}`$.
-
-Scientific use requires every labelled row to share the same ordered
-orbital/Wannier subspace, gauge or degenerate-subspace convention, energy zero,
-spin channel, k-point convention, and electronic-structure method. The current
-Neo release files contain neither `orbital_hamiltonian` nor
-`orbital_eigenvectors` (the absent optional dimension resolves to $`K=0`$), so
-WALoss is implemented in the code but is not trained by any published Neo tier.
-A compatible custom dataset can enable it in Response or Joint mode with:
-
-```json
-{
-  "mode": "response",
-  "model": {"enable_waloss": true, "waloss_dim": 0},
-  "w_waloss": 1.0,
-  "waloss_diagonal_weight": 1.0,
-  "waloss_off_diagonal_weight": 1.0
-}
-```
-
-`waloss_dim = 0` requests inference from the paired HDF5 labels. See the
-[physics derivation](docs/PHYSICS.md#wavefunction-alignment-and-electronic-hamiltonian),
-[training contract](docs/TRAINING_AND_VALIDATION.md#wavefunction-alignment-objective),
-and [dataset contract](docs/DATASETS.md#optional-waloss-data-contract).
-
-The change is backward compatible at the current loader boundary. Legacy Neo
-data and pre-WALoss checkpoints continue to train and infer their original
-targets; a WALoss-enabled warm start reuses the matching ground/response
-weights and initializes only the new electronic head. This does not grant an
-old checkpoint electronic-Hamiltonian validity, and a new WALoss checkpoint is
-not promised to load in source versions that predate the head.
-
-## Execution graph
-
-```mermaid
-flowchart LR
-    A[Atomic numbers, positions, cell, field, spins] --> G[Neighbor graph]
-    G --> L1["Layer 1: parity-aware O(3) message passing"]
-    L1 --> PES[Short-range energy]
-    L1 --> R[Response tensor heads]
-    R --> W[Aligned electronic Hamiltonian head]
-    W --> WA[WALoss, training only]
-    R --> Q[Layer 2: QEq and PME]
-    R --> P[Layer 2: polarization and D4]
-    R --> S[Layer 3: J, Di, and DMI]
-    Q --> C[Charge and potential condition]
-    S --> C2[Spin-invariant condition]
-    C --> F[FiLM feedback]
-    C2 --> F
-    F --> L1
-    PES --> H[Effective Hamiltonian]
-    Q --> H
-    P --> H
-    S --> H
-    H --> O[Energy, forces, stress, response tensors, spin field]
 ```
 
 ## Quick start
