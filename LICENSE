@@ -1,21 +1,231 @@
-MIT License
+E3-miu-GNN Research and Non-Commercial License
+Version 1.0, 17 September 2026
 
 Copyright (c) 2026 Yufeng Zhan (Fona)
+Project attribution: E3-miu-GNN, by Yufeng Zhan and Guohua Hu.
+License reference: LicenseRef-E3-miu-GNN-Research-NonCommercial-1.0
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Original project source code and original project documentation supplied
+with this release are offered under this License, except for material
+subject to a file-specific or third-party notice. Existing rights under
+prior valid licenses are not revoked. See NOTICE.md for scope, historical
+notices, and the commercial-authorization request route. Each Licensor
+grants rights only to the extent of its authority.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+This is a source-available license. It is not the GNU General Public License,
+is not compatible with the GNU GPL, and is not an Open Source Initiative
+approved license. Its non-commercial restriction is an independent condition,
+not a condition permitted by the GNU GPL. Copyright and third-party notices
+applicable to particular material must be preserved.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. Definitions
+
+"Licensor" means each copyright holder, or person authorized by that holder,
+who expressly applies this License to material that the holder may license.
+An author credit or a repository-maintainer role does not itself establish
+ownership of, or authority to license, another person's rights.
+
+"Covered Work" means material expressly placed under this License by its
+Licensor and modifications or derivative works of that material to the extent
+copyright permission is required. Independent third-party software, datasets,
+model weights, and other material are not covered merely because they are
+stored, installed, used, or distributed alongside the Covered Work.
+
+"Commercial Use" means use primarily intended for or directed toward
+commercial advantage or monetary compensation, including:
+
+  a. use by or on behalf of a for-profit entity for its research, development,
+     evaluation, operations, products, services, or competitive advantage;
+  b. use to develop, provide, operate, or support a commercial product or
+     service, including a hosted service, paid application, or consulting;
+  c. contract research for a commercial purpose, or sponsored research in
+     which a commercial sponsor receives exclusive, proprietary, or
+     preferential commercial rights in the work or results;
+  d. training, fine-tuning, validating, or operating models intended for a
+     commercial product or service; and
+  e. selling, renting, licensing for a fee, or otherwise monetizing copies
+     of the Covered Work or derivative works.
+
+Ordinary research salaries, public or charitable research grants, tuition at
+non-profit educational institutions, and ordinary scholarly publication fees
+do not, by themselves, make research Commercial Use. Research funding without
+the purposes or benefits described above does not, by itself, do so either.
+An institution's academic or non-profit status does not exempt an otherwise
+commercial activity.
+
+Gratis pass-through hosting, mirroring, or transmission of copies, without
+using the Covered Work to provide a computational or other commercial service,
+is not Commercial Use merely because the intermediary is a for-profit entity.
+Charging no more than the reasonable physical cost of reproducing and
+delivering a copy is also permitted under this License.
+
+"Non-Commercial Purpose" means academic research, education, personal study,
+evaluation, or sharing that is not Commercial Use as defined above.
+
+"Commercial Authorization" means a separate written agreement from all
+relevant rightsholders, or their duly authorized representatives, expressly
+permitting the identified Commercial Use. It applies only to the parties,
+material, purposes, and period specified in that agreement.
+
+"Distribute" means to enable another person or legal entity to receive a copy
+of the Covered Work, in source or non-source form. Providing a hosted service
+without transferring a copy is not, for that reason alone, Distribution, but
+the service may still constitute Commercial Use.
+
+"Corresponding Source" means the preferred form of the Covered Work for
+modification and the source files and scripts needed to build, install, run,
+and modify the distributed Covered Work. It excludes independent external
+dependencies that are not part of that work; this exclusion does not excuse
+any obligations under the licenses of those dependencies or a combined work.
+
+"You" means the individual or legal entity exercising rights under this
+License.
+
+2. Non-Commercial Permission
+
+Subject to this License, each Licensor grants You a worldwide, non-exclusive,
+royalty-free copyright license to use, reproduce, study, modify, display,
+perform, and Distribute that Licensor's Covered Work solely for a
+Non-Commercial Purpose. The grant lasts for the term of the applicable
+copyright, subject to the termination provisions below.
+
+No permission for Commercial Use is granted. Commercial Use requires
+Commercial Authorization before it begins, whether or not a copy is
+Distributed and whether or not the software itself is offered free of charge.
+Submitting a request, receiving no response, or providing author attribution
+does not constitute Commercial Authorization.
+
+Nothing in this License limits uses that do not require the Licensor's
+permission under applicable law or rights available under another valid
+license that You hold.
+
+3. Distributing Unmodified Source
+
+You may Distribute unmodified source copies for a Non-Commercial Purpose if
+You include this License, preserve applicable copyright, license, attribution,
+provenance, and warranty notices, and identify this License as applying to the
+Covered Work. Include the project's accompanying NOTICE.md when distributing
+the project. You may not impose additional legal or technical restrictions
+that prevent recipients from exercising the rights this License grants.
+
+4. Distributing Modified Works
+
+When You Distribute a modified Covered Work for a Non-Commercial Purpose,
+You must also:
+
+  a. prominently identify it as modified, state the relevant date, and
+     describe the changes sufficiently to distinguish it from the original;
+  b. license the derivative work as a whole under this same License;
+  c. provide its complete Corresponding Source under this License; and
+  d. preserve the notices required by Section 3 and the attribution required
+     by Section 6.
+
+Independent works merely collected on the same medium are not made Covered
+Works by that collection. Whether a linked, imported, embedded, or adapted
+component forms part of a derivative work depends on applicable law and the
+actual relationship between the works, not solely on packaging or file names.
+
+5. Distributing Non-Source Copies
+
+You may Distribute non-source copies for a Non-Commercial Purpose only if
+You comply with Sections 3 and 4 as applicable and provide complete
+machine-readable Corresponding Source, at no additional charge, either with
+each copy or through equivalent download access clearly identified beside
+the non-source download. When using download access, maintain it while the
+non-source download is offered and for at least three years after Your last
+Distribution of those non-source copies.
+
+This is a condition of this License and is not a statement of the GNU GPL's
+different source-delivery options.
+
+6. Author Attribution
+
+Preserve the following reasonable attribution in Distributed copies or
+substantial portions of the Covered Work and in its applicable legal notices:
+
+  E3-miu-GNN, by Yufeng Zhan and Guohua Hu.
+
+You may add accurate credits for modifications and other contributors. Do not
+misrepresent the origin of the Covered Work or imply that the original
+authors endorse Your modified version, product, service, or research results.
+No trademark, logo, certification, or endorsement rights are granted.
+
+Citing the project and the software version in publications is requested as
+an academic practice, but is not an additional condition of this License.
+Independent publications, results, or other outputs are not Covered Works
+merely because they were created using the software. An output containing
+copyrightable portions of the Covered Work may itself be a Covered Work.
+
+7. Automatic Downstream Permission
+
+Each recipient of a compliant Distribution receives the applicable permission
+directly from each Licensor under this License. You may not demand a separate
+license fee, royalty, registration, or approval for the Non-Commercial
+Purpose rights granted here. Recipients remain subject to this License's
+conditions, including its restriction on Commercial Use.
+
+8. Third-Party Rights and Compatibility
+
+This License does not replace third-party licenses or grant rights to
+third-party data, software, weights, trademarks, or patents. Preserve and
+comply with the separate terms of such material. If a combination cannot be
+Distributed consistently with all applicable licenses, this License does
+not authorize its Distribution. In particular, its non-commercial condition
+does not override the GNU GPL's prohibition on further restrictions.
+
+9. Patent Permission
+
+To the extent a Licensor has authority to grant it, that Licensor grants You
+a non-exclusive, worldwide, royalty-free patent license under claims owned
+or controlled by that Licensor that are necessarily infringed by exercising
+the permissions in Section 2 for its Covered Work as supplied. This does not
+cover Commercial Use or claims infringed solely because of Your later
+modifications or combinations.
+
+If You initiate patent litigation alleging that the Covered Work infringes
+a patent, the patent permissions granted to You under this section terminate
+when that proceeding is filed.
+
+10. Termination and Cure
+
+Your rights under this License terminate automatically on breach. If this is
+Your first breach notified by a particular Licensor and You remedy it within
+30 days after receiving that Licensor's written notice, rights from that
+Licensor are automatically reinstated on cure. A Licensor may also reinstate
+its grant in writing. Reinstatement does not excuse liability accrued before
+reinstatement to the extent provided by applicable law.
+
+Termination of Your rights does not terminate the rights of recipients who
+received compliant copies and remain in compliance. Provisions concerning
+attribution in copies retained or previously Distributed, third-party
+rights, accrued obligations, warranty, liability, and interpretation survive
+termination to the extent applicable.
+
+11. No Warranty
+
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE COVERED WORK IS PROVIDED
+"AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTIES, INCLUDING WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT,
+ACCURACY, OR RELIABILITY. YOU ASSUME THE RISKS OF USING AND DISTRIBUTING IT.
+NO RESEARCH, SAFETY, OR PRODUCTION PERFORMANCE IS WARRANTED.
+
+12. Limitation of Liability
+
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, NO LICENSOR, AUTHOR, OR CONTRIBUTOR
+IS LIABLE FOR DAMAGES ARISING FROM THIS LICENSE OR THE USE OR INABILITY TO
+USE THE COVERED WORK, INCLUDING LOSS OF DATA, PROFITS, OR RESEARCH RESULTS,
+WHETHER IN CONTRACT, TORT, OR OTHERWISE, EVEN IF ADVISED OF THE POSSIBILITY
+OF SUCH DAMAGES. THIS DOES NOT EXCLUDE LIABILITY THAT CANNOT LAWFULLY BE
+EXCLUDED.
+
+13. Interpretation and Later Versions
+
+This License does not transfer ownership of any work. The English text is
+the operative text; translations and summaries are explanatory only.
+
+If a provision is unenforceable, the remaining provisions apply to the
+extent permitted by law. Nothing in this License grants commercial rights
+beyond those expressly authorized by the relevant rightsholders. No later
+version or revised terms apply automatically; they require an express grant
+from the relevant Licensor. This License does not cancel rights previously
+granted under MIT, GPL, or any other valid license.

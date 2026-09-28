@@ -6,8 +6,11 @@ authors:
   - family-names: "Zhan"
     given-names: "Yufeng"
     alias: "Fona"
-year: 2026
-license: MIT
+  - family-names: "Hu"
+    given-names: "Guohua"
+repository-code: "https://github.com/FonaTech/E3-miu-GNN"
+# Custom license: use license-url, not a made-up SPDX-list license value.
+license-url: "https://github.com/FonaTech/E3-miu-GNN/blob/main/LICENSE"
 keywords:
   - equivariant graph neural network
   - machine-learning interatomic potential

@@ -1,11 +1,17 @@
 # Mixed-Granularity E(3)-mu-GNN
 
-E3-miu-GNN is an open-source research platform for learning atomistic energy
+E3-miu-GNN is a source-available research platform for learning atomistic energy
 surfaces together with electric, magnetic, and electronic response. It combines
 an E(3)-equivariant local graph representation with differentiable physical
 solvers, mixed-granularity feedback, and a mask-aware data/training system.
 The same model can be used from the GUI, command line, ASE, or headless Python
 and LLM workflows.
+
+> **License.** By **Yufeng Zhan and Guohua Hu**. Qualifying non-commercial
+> research, education, modification, and sharing are permitted free of license
+> fees. Commercial use requires prior written authorization. This is a custom
+> research license, **not GNU GPL or OSI open source**. Read [LICENSE](LICENSE),
+> [NOTICE.md](NOTICE.md), and the [Chinese licensing rationale](docs/LICENSE_RATIONALE.md).
 
 > **Research status.** The three-layer architecture, canonical data pipeline,
 > training system, PyQt6 interface, and deterministic physics tests are
@@ -333,7 +339,7 @@ Large-scale pretraining is currently in progress. The present release provides
 the architecture, training system, datasets, and validation tools; validated
 pretrained checkpoints will be published in a later project version.
 
-The software MIT license does not relicense dataset components. In particular,
+The software research license does not relicense dataset components. In particular,
 the archive-level redistribution terms for the transformed `BEC/H2O`,
 `BEC/MAPbI3`, and `BEC/dimer` records remain under review. Read
 [Dataset and licensing](docs/DATASETS.md) before redistributing a binary.
@@ -383,6 +389,7 @@ part maps to a deeper user or developer reference:
 | Python and ASE API | [Public API](docs/API.md) |
 | Human, script, and agent interfaces | [Interface guide](docs/INTERFACES.md) |
 | Phonopy, SevenNet-style, and workflow coupling | [Coupling](docs/COUPLING.md) |
+| Research license, commercial authorization, and official sources | [Licensing rationale (Chinese)](docs/LICENSE_RATIONALE.md) |
 
 ## Repository layout
 
@@ -416,8 +423,23 @@ experiment together with the dataset versions and checksums.
 
 ## License
 
-Original software and project documentation are released under the
-[MIT License](LICENSE). Datasets, checkpoints, dependencies, and identifiable
-third-party records are not relicensed by MIT. Read [NOTICE.md](NOTICE.md) and
-[Datasets/Neo/LICENSES_AND_ATTRIBUTION.md](Datasets/Neo/LICENSES_AND_ATTRIBUTION.md)
-before redistribution.
+Original software and project documentation are offered under the
+[E3-miu-GNN Research and Non-Commercial License v1.0](LICENSE).
+**Unauthorized commercial use is not permitted under this license.**
+The commercial-use definition includes enterprise internal R&D, commercial
+model training, paid consulting, and hosted commercial services. Follow the
+[authorization request route](NOTICE.md#commercial-authorization) before
+commercial use.
+
+Qualifying non-commercial research and sharing are allowed without a license
+fee. Preserve **Yufeng Zhan and Guohua Hu** attribution and required notices;
+when distributing modified versions, identify the changes, provide the
+corresponding source, and retain the same license. Existing valid MIT grants
+are not revoked; see the [historical notice](docs/licensing/README.md).
+
+Datasets, checkpoints, and third-party dependencies retain their separate
+terms. In particular, the GPL version of PyQt6 cannot be combined into a
+GPL-covered distribution carrying this non-commercial restriction; appropriate
+permissions or a compatible replacement are needed for such a distribution.
+Read [NOTICE.md](NOTICE.md), [dataset boundaries](docs/DATASETS.md), and the
+[Chinese rationale and official sources](docs/LICENSE_RATIONALE.md).

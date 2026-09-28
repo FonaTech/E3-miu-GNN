@@ -4,6 +4,15 @@ This guide defines the minimum procedure for reproducing the implemented
 E(3)-GNN checks and starting a controlled training run. Run commands from the
 repository root.
 
+Original project software and documentation are provided under the
+[E3-miu-GNN Research and Non-Commercial License v1.0](../LICENSE), with
+attribution to **Yufeng Zhan and Guohua Hu**. Qualifying non-commercial
+research and sharing are permitted without a license fee; commercial use,
+including enterprise internal R&D and commercial model training, requires
+prior written authorization. See [NOTICE.md](../NOTICE.md) and the
+[licensing rationale](LICENSE_RATIONALE.md) for scope, historical MIT rights,
+and third-party requirements, including PyQt6 combination compatibility.
+
 ## Software environment
 
 Python 3.10 or newer is recommended. Create an isolated environment:
@@ -272,7 +281,16 @@ retain an unresolved archive-level rights review.
 7. State unsupported or unsupervised outputs explicitly.
 8. For WALoss, archive the basis/gauge contract and verify paired masks in both
    train and validation; do not claim it from the current Neo tiers.
-9. Verify source-level dataset licenses before distributing binaries.
+9. Verify the licenses of the exact dataset, model, and dependency versions
+   before distributing them. In particular, resolve the PyQt6 licensing
+   conflict before distributing a GPL-covered combination under the project's
+   non-commercial terms.
 10. Scan tracked text for credentials, absolute workstation paths, and concrete
    proxy endpoints.
 11. Archive the source commit and environment with the final result.
+12. Include `LICENSE`, `NOTICE.md`, and applicable historical and third-party
+    notices with software distributions; preserve Yufeng Zhan and Guohua Hu
+    attribution. For modified distributions, identify changes and dates,
+    provide complete corresponding source, and retain the same project
+    license as required by its terms. Paper citation is requested separately,
+    not an additional license condition.
