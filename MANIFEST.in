@@ -1,0 +1,3 @@
+include LICENSE NOTICE.md CITATION.cff CONTRIBUTING.md
+include docs/LICENSE_RATIONALE.md docs/DATASETS.md
+include docs/licensing/README.md docs/licensing/MIT-HISTORICAL.txt

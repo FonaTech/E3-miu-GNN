@@ -1,11 +1,14 @@
 # Datasets and HDF5 Data Contracts
 
 This document expands Sections 4.1-4.4 of the [paper](PAPER.md). It summarizes
-the data consumed by the E(3)-GNN implementation. The authoritative release
-records remain the Neo [Dataset Card](../Datasets/Neo/README.md),
-[source declaration](../Datasets/Neo/SOURCES_AND_PROCESSING.md),
-[schema](../Datasets/Neo/DATA_SCHEMA.md), and
-[license ledger](../Datasets/Neo/LICENSES_AND_ATTRIBUTION.md).
+the data consumed by the E(3)-GNN implementation. The complete Neo release
+records are referenced by the historical project paths
+`Datasets/Neo/README.md`, `Datasets/Neo/SOURCES_AND_PROCESSING.md`,
+`Datasets/Neo/DATA_SCHEMA.md`, and `Datasets/Neo/LICENSES_AND_ATTRIBUTION.md`.
+Those records are not included in this local snapshot. Obtain the source and
+license records for the exact dataset version before redistributing it;
+[NOTICE.md](../NOTICE.md) summarizes the known boundaries without replacing
+the missing archive-level permissions.
 
 The repository carries the
 [Tiny HDF5 file](https://github.com/FonaTech/E3-miu-GNN/blob/main/Datasets/Neo/canonical/neo_tiny_l1_l2_l3.h5)
@@ -48,7 +51,8 @@ flowchart LR
 | Supplied BEC archive | H2O, MAPbI3, and dimer BEC tensors | archive rights unresolved | present locally; blocks public aggregate release |
 
 Exact DOIs, checksums, pinned commits, transformations, and attribution text
-are recorded in the source declaration and license ledger linked above.
+must be checked against the matching source declaration and license ledger
+identified above; those records are not supplied by this snapshot.
 
 ## Canonical ragged HDF5
 
@@ -331,13 +335,19 @@ projecting or rewriting the source tensor.
 
 ## Redistribution boundary
 
-The repository's MIT license does not cover Neo binaries. The binaries are
-currently hosted on Hugging Face, but hosting does not replace the component
+The repository's [E3-miu-GNN Research and Non-Commercial License v1.0](../LICENSE)
+applies to the original software and documentation, with attribution to
+Yufeng Zhan and Guohua Hu. It does not cover Neo binaries or replace their
+upstream licenses. The binaries are currently hosted on Hugging Face, but
+hosting does not replace the component
 licenses or resolve the archive-level terms for transformed `BEC/H2O`,
 `BEC/MAPbI3`, and `BEC/dimer` records. The associated article license is not
 assumed to license a separately supplied archive.
 
 For a fully cleared redistribution record, obtain durable permission or rebuild
 every tier without those records, regenerate manifests and checksums, rerun the
-hierarchy audit, and repeat model smoke tests. See the
-[Hugging Face release procedure](../Datasets/Neo/HUGGINGFACE_UPLOAD.md).
+hierarchy audit, and repeat model smoke tests. The historical release procedure
+is referenced as `Datasets/Neo/HUGGINGFACE_UPLOAD.md`; that document is also
+absent from this snapshot. Its absence must not be treated as redistribution
+permission. See [the licensing rationale](LICENSE_RATIONALE.md) for the
+distinction between software licensing and data rights.

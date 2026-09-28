@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,8 +8,16 @@ version = "0.1.0"
 description = "Mixed-granularity E(3)-equivariant atomistic graph neural network"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
-authors = [{name = "Fona Group"}]
+license = "LicenseRef-E3-miu-GNN-Research-NonCommercial-1.0"
+license-files = [
+  "LICENSE",
+  "NOTICE.md",
+  "docs/LICENSE_RATIONALE.md",
+  "docs/DATASETS.md",
+  "docs/licensing/README.md",
+  "docs/licensing/MIT-HISTORICAL.txt",
+]
+authors = [{name = "Yufeng Zhan"}, {name = "Guohua Hu"}]
 dependencies = [
   "numpy>=1.26",
   "torch>=2.3,<3",

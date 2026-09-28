@@ -3,6 +3,12 @@
 **Yufeng Zhan (Fona)**  
 Implementation-aligned manuscript, July 2026
 
+> **Software attribution:** Yufeng Zhan and Guohua Hu. The accompanying
+> original project software and documentation use the
+> [E3-miu-GNN Research and Non-Commercial License v1.0](../LICENSE).
+> Qualifying non-commercial research and sharing are permitted; commercial use
+> requires prior written authorization. See the [licensing statement](#code-data-and-licensing-statement).
+
 This manuscript documents the atomic, domain, and spin layers implemented in
 `E3_miu_GNN.py`, together with FiLM coupling, wavefunction-aligned electronic
 Hamiltonian supervision, the two Neo HDF5 layouts, and verified training
@@ -860,8 +866,14 @@ claims.
 
 ## Code, data, and licensing statement
 
-The implementation is in `E3_miu_GNN.py` and is released under
-MIT terms. Neo dataset binaries are not covered by the software license.
+The implementation is in `E3_miu_GNN.py` and is offered under the
+[E3-miu-GNN Research and Non-Commercial License v1.0](../LICENSE), with
+software attribution to Yufeng Zhan and Guohua Hu. Qualifying non-commercial
+research and sharing are permitted; commercial use requires prior written
+authorization. This is source-available software, not GPL or OSI open source.
+Earlier valid MIT grants are not revoked. See [NOTICE.md](../NOTICE.md) for
+scope and dependency compatibility. Neo dataset binaries are not covered by
+the software license.
 MPtrj, JARVIS-DFT, QM7-X, SO3LR, SCFNN, and DeepSPIN retain their respective
 upstream terms. The binaries are hosted in the project Hugging Face dataset;
 the standalone redistribution terms of the supplied BEC archive remain under
@@ -871,7 +883,7 @@ and transformations are in `Datasets/Neo/SOURCES_AND_PROCESSING.md`.
 
 ## References
 
-1. Y. Zhan, *E(3)-mu-GNN*, open-source software repository (2026), <https://github.com/FonaTech/E3-miu-GNN>.
+1. Y. Zhan and G. Hu, *E(3)-mu-GNN*, source-available research software repository (2026), <https://github.com/FonaTech/E3-miu-GNN>.
 2. P. Hohenberg and W. Kohn, "Inhomogeneous Electron Gas," *Physical Review* **136**, B864-B871 (1964), <https://doi.org/10.1103/PhysRev.136.B864>.
 3. W. Kohn and L. J. Sham, "Self-Consistent Equations Including Exchange and Correlation Effects," *Physical Review* **140**, A1133-A1138 (1965), <https://doi.org/10.1103/PhysRev.140.A1133>.
 4. I. Batatia et al., "MACE: Higher Order Equivariant Message Passing Neural Networks for Fast and Accurate Force Fields," *NeurIPS* (2022), <https://doi.org/10.48550/arXiv.2206.07697>.

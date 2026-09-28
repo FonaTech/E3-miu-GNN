@@ -37,7 +37,21 @@ test. A new long-range solver must report convergence and stability residuals.
 
 ## Licensing
 
-Contributions to original source code and documentation are accepted under the
-project's MIT license. Dataset records and copied third-party material retain
-their upstream terms; do not submit them under MIT unless you own the rights to
-do so.
+By intentionally submitting original source code or documentation for
+inclusion, you offer that contribution under the project's
+[E3-miu-GNN Research and Non-Commercial License v1.0](LICENSE), unless a
+separate written agreement specifies otherwise. Confirm that you have the
+right to grant that license, including any necessary employer or institutional
+permission. You retain your copyright; submission is not a copyright transfer
+or permission for maintainers to commercially relicense your work.
+
+Preserve the project attribution to Yufeng Zhan and Guohua Hu, existing
+copyright notices, and accurate credits for your changes. The project is
+source-available, not GNU GPL or OSI open source. Its non-commercial terms
+cannot be imposed on a GPL-covered combination. Check copied code and linked
+dependencies, including PyQt6, before contributing; see [NOTICE.md](NOTICE.md).
+
+Dataset records, models, and third-party material retain their upstream terms;
+do not label them with the project license unless the relevant rights permit
+it. Historical MIT grants remain valid for the material they cover. Read the
+[licensing rationale](docs/LICENSE_RATIONALE.md) for scope and migration details.

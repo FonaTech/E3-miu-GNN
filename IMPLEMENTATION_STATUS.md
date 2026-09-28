@@ -140,17 +140,23 @@ calibration.
 
 ## Publication status
 
-- Original code and project documentation: MIT.
+- Original code and project documentation: E3-miu-GNN Research and
+  Non-Commercial License v1.0; source-available, not GPL or OSI open source.
+  Attribution: Yufeng Zhan and Guohua Hu. Earlier valid MIT grants remain valid.
+- GUI dependency licensing: GPL-covered combinations with PyQt6 cannot carry
+  the project's non-commercial restriction; resolve permissions or replace
+  incompatible components before distributing such a combination.
 - Root README, manuscript, technical sections, contribution guide, citation
   metadata, notice, figures, and formula audit: prepared.
-- Canonical data binaries: intentionally excluded from GitHub.
+- Local snapshot: contains a Tiny HDF5 dataset and model checkpoints; these
+  are not covered by the root software license or cleared by this change.
 - Neo Hugging Face technical staging: prepared and validated locally.
 - Public Neo binary release: **blocked** until redistribution rights for the
   supplied `BEC/H2O`, `BEC/MAPbI3`, and `BEC/dimer` archive are confirmed or
   those records are removed and all tiers are rebuilt.
 
 Dataset components retain MIT, CC BY 4.0, GPL-3.0, or unresolved source terms;
-the software MIT license does not relicense them.
+the software research license does not relicense them.
 
 ## Remaining scientific work
 
