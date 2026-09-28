@@ -7,12 +7,6 @@ solvers, mixed-granularity feedback, and a mask-aware data/training system.
 The same model can be used from the GUI, command line, ASE, or headless Python
 and LLM workflows.
 
-> **License.** By **Yufeng Zhan and Guohua Hu**. Qualifying non-commercial
-> research, education, modification, and sharing are permitted free of license
-> fees. Commercial use requires prior written authorization. This is a custom
-> research license, **not GNU GPL or OSI open source**. Read [LICENSE](LICENSE),
-> [NOTICE.md](NOTICE.md), and the [Chinese licensing rationale](docs/LICENSE_RATIONALE.md).
-
 > **Research status.** The three-layer architecture, canonical data pipeline,
 > training system, PyQt6 interface, and deterministic physics tests are
 > implemented. Reported dataset and short-run metrics are functional validation,
