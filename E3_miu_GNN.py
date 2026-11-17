@@ -52,6 +52,7 @@ import ast
 import argparse
 import collections
 import copy
+import dataclasses
 import gc
 import hashlib
 import importlib.util
@@ -60,6 +61,7 @@ import itertools
 import json
 import math
 import os
+import platform
 import queue
 import re
 import subprocess
@@ -312,6 +314,69 @@ def _default_device_name() -> str:
     return "cpu"
 
 
+# Compute engine.  ``resolve_device`` is the one place a frontend chooses the
+# engine: ``device='mlx'`` keeps every Torch interface (configs, checkpoints,
+# batches, losses, optimizers, outputs) and runs the model math in the native
+# Apple-MLX engine (SECTION: Apple-MLX Engine); any other device runs Torch.
+_COMPUTE_ENGINE: Dict[str, str] = {"name": "torch"}
+
+
+def _mlx_is_available() -> bool:
+    return bool(HAS_MLX and _mlx_caps().supported)
+
+
+def set_compute_engine(name: str) -> str:
+    """Select ``"torch"`` or ``"mlx"`` for every later model forward."""
+    engine = str(name or "torch").strip().lower()
+    if engine not in ("torch", "mlx"):
+        raise ValueError("compute engine must be 'torch' or 'mlx'")
+    if engine == "mlx" and not _mlx_is_available():
+        raise ValueError("MLX was requested but is not available (needs Apple silicon and mlx>=0.22)")
+    _COMPUTE_ENGINE["name"] = engine
+    return engine
+
+
+def compute_engine() -> str:
+    return _COMPUTE_ENGINE["name"]
+
+
+@contextmanager
+def compute_engine_scope(name: str):
+    """Run the enclosed model calls on engine ``name``, then restore the previous one.
+
+    Lets objects that chose their device at construction (e.g. the ASE
+    calculator) keep it when another object later calls ``resolve_device``.
+    """
+    previous = _COMPUTE_ENGINE["name"]
+    set_compute_engine(name)
+    try:
+        yield
+    finally:
+        _COMPUTE_ENGINE["name"] = previous
+
+
+def _engine_note() -> str:
+    if _COMPUTE_ENGINE["name"] != "mlx":
+        return ""
+    return f", engine=MLX [{_mlx_caps().describe()}]"
+
+
+def _mlx_forward(model: torch.nn.Module, batch: Any, options: Dict[str, Any]) -> Optional[Dict[str, torch.Tensor]]:
+    """Run ``model.forward`` on the MLX engine when it is the selected engine."""
+    if _COMPUTE_ENGINE["name"] != "mlx":
+        return None
+    engine = mlx_engine_of(model)
+    if engine is None or engine.fingerprint != mlx_model_fingerprint(model):
+        engine = mlx_bind_engine(model)
+    return engine.forward(model, batch, **options)
+
+
+try:  # the MLX call is opaque to TorchDynamo (torch.compile graph-breaks around it)
+    _mlx_forward = torch._dynamo.disable(_mlx_forward)
+except Exception:  # pragma: no cover - old Torch without dynamo
+    pass
+
+
 def _process_rss_bytes() -> int:
     """Return resident memory without requiring psutil at runtime."""
     try:
@@ -453,11 +518,17 @@ def resolve_device(name: Optional[str], *, dtype: str = "float32") -> Tuple[torc
         raise ValueError("CUDA was requested but is not available")
     if requested == "mps" and not _mps_is_available():
         raise ValueError("MPS was requested but is not available")
+    if requested == "mlx":
+        # Native Apple-MLX engine.  Torch tensors stay on the CPU (unified
+        # memory); float32 runs on the Apple GPU, float64 on the MLX CPU stream.
+        set_compute_engine("mlx")
+        return torch.device("cpu"), str(dtype).lower()
     if requested not in ("cpu", "mps", "cuda"):
-        raise ValueError("device must be one of: auto, cpu, mps, cuda")
+        raise ValueError("device must be one of: auto, cpu, mps, cuda, mlx")
     runtime_dtype = str(dtype).lower()
     if requested == "mps" and runtime_dtype == "float64":
         runtime_dtype = "float32"
+    set_compute_engine("torch")
     return torch.device(requested), runtime_dtype
 
 
@@ -9771,6 +9842,20 @@ class DualLayerFieldModel(torch.nn.Module):
             also contains an auxiliary ``orbital_hamiltonian``; that matrix is
             supervised by WALoss but is not a term in ``e_total``.
         """
+        _engine_out = _mlx_forward(self, batch, dict(
+            training=training,
+            compute_forces=compute_forces,
+            compute_stress=compute_stress,
+            compute_bec=compute_bec,
+            compute_piezoelectric=compute_piezoelectric,
+            compute_stress_components=compute_stress_components,
+            compute_magnetoelastic=compute_magnetoelastic,
+            use_response_terms=use_response_terms,
+            retain_graph=retain_graph,
+            use_response=use_response,
+        ))
+        if _engine_out is not None:
+            return _engine_out
         if training is None:
             training = bool(self.training)
         if use_response is not None:
@@ -10344,6 +10429,25 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
         use_spin_terms: Optional[bool] = None,
         label_aware_coupling: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        _engine_out = _mlx_forward(self, batch, dict(
+            training=training,
+            compute_forces=compute_forces,
+            compute_stress=compute_stress,
+            compute_bec=compute_bec,
+            compute_piezoelectric=compute_piezoelectric,
+            compute_stress_components=compute_stress_components,
+            compute_magnetoelastic=compute_magnetoelastic,
+            use_response_terms=use_response_terms,
+            retain_graph=retain_graph,
+            use_response=use_response,
+            use_domain_terms=use_domain_terms,
+            use_polarization_terms=use_polarization_terms,
+            use_dispersion_terms=use_dispersion_terms,
+            use_spin_terms=use_spin_terms,
+            label_aware_coupling=label_aware_coupling,
+        ))
+        if _engine_out is not None:
+            return _engine_out
         if training is None:
             training = bool(self.training)
         if use_response is not None:
@@ -10869,6 +10973,3543 @@ class MixedGranularityE3GNN(DualLayerFieldModel):
             "dispersion_activity": dispersion_activity,
             "spin_activity": spin_activity,
         }
+
+# ══════════════════════════════════════════════════════════════════════════
+# SECTION: Apple-MLX Engine
+# Native Apple-MLX execution of the models above.  ``resolve_device('mlx')``
+# selects it; configs, checkpoints, batches, losses, optimizers and output
+# dicts stay the Torch ones.  Every name here carries an MLX/mlx prefix.
+# ══════════════════════════════════════════════════════════════════════════
+
+# --------------------------------------------------------------------------
+# MLX engine: runtime, device capabilities, and process policy.
+# ``mlx.core`` is imported on first use, so this module still imports on
+# machines without MLX.  Features are detected instead of being inferred from
+# version numbers alone: an older MLX wheel on an M1 degrades to portable code
+# paths, while an M5 uses the custom Metal kernels and larger memory budgets.
+# --------------------------------------------------------------------------
+
+mx: Any = None  # ``mlx.core`` once _mlx_import() has run
+MIN_MLX_VERSION: Tuple[int, int, int] = (0, 22, 0)
+HAS_MLX = importlib.util.find_spec("mlx") is not None
+_MLX_STATE: Dict[str, Any] = {"caps": None, "import_error": None, "matmul_error": None}
+
+
+def _mlx_import() -> Any:
+    """Import ``mlx.core`` once and return it (``None`` without MLX).
+
+    M5-class (NAX) GPUs run float32 matmuls as TF32 by default (~1e-3
+    relative error), which breaks the QEq/DEQ solves and float32 parity with
+    Torch.  Full float32 is pinned before the import unless E3MU_MLX_TF32=1
+    opts into the faster path; MLX latches the setting at the first GPU matmul
+    of the process.
+    """
+    global mx
+    if mx is not None or _MLX_STATE["import_error"] is not None:
+        return mx
+    request = os.environ.get("E3MU_MLX_TF32")
+    if request is not None:
+        enabled = request.strip().lower() in ("1", "true", "yes", "on")
+        os.environ["MLX_ENABLE_TF32"] = "1" if enabled else "0"
+    else:
+        os.environ.setdefault("MLX_ENABLE_TF32", "0")
+    try:
+        import mlx.core as mlx_core
+    except Exception as exc:  # pragma: no cover - machines without MLX
+        _MLX_STATE["import_error"] = exc
+        return None
+    mx = mlx_core
+    return mx
+
+
+class _MLXCustomFunction:
+    """``mx.custom_function`` built on first call, so definitions need no MLX."""
+
+    def __init__(self, fn: Callable[..., Any]) -> None:
+        self._fn = fn
+        self._vjp_rule: Optional[Callable[..., Any]] = None
+        self._built: Any = None
+        self.__name__ = getattr(fn, "__name__", "custom_function")
+        self.__doc__ = getattr(fn, "__doc__", None)
+
+    def vjp(self, rule: Callable[..., Any]) -> Callable[..., Any]:
+        self._vjp_rule = rule
+        self._built = None
+        return rule
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self._built is None:
+            built = mx.custom_function(self._fn)
+            if self._vjp_rule is not None:
+                built.vjp(self._vjp_rule)
+            self._built = built
+        return self._built(*args, **kwargs)
+
+
+def _mlx_custom_function(fn: Callable[..., Any]) -> _MLXCustomFunction:
+    return _MLXCustomFunction(fn)
+
+
+def _mlx_parse_version(text: str) -> Tuple[int, int, int]:
+    numbers = [int(value) for value in re.findall(r"\d+", str(text))[:3]]
+    while len(numbers) < 3:
+        numbers.append(0)
+    return int(numbers[0]), int(numbers[1]), int(numbers[2])
+
+
+def _mlx_quiet_call(getter: Any, default: Any) -> Any:
+    """Call an MLX query whose deprecated alias may warn; ``default`` on failure."""
+    if not callable(getter):
+        return default
+    try:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return getter()
+    except Exception:
+        return default
+
+
+def _mlx_device_info() -> Dict[str, Any]:
+    if mx is None:
+        return {}
+    for getter in (
+        getattr(mx, "device_info", None),
+        getattr(getattr(mx, "metal", None), "device_info", None),
+    ):
+        info = _mlx_quiet_call(getter, None)
+        if info is not None:
+            return dict(info)
+    return {}
+
+
+def _mlx_gpu_generation(architecture: str) -> int:
+    """Return the Apple GPU family number (13=M1, 14=M2, 15=M3, 16=M4, 17=M5)."""
+    match = re.search(r"g(\d+)", str(architecture))
+    return int(match.group(1)) if match else 0
+
+
+@dataclass(frozen=True)
+class MLXCapabilities:
+    """What the installed MLX build and the Apple GPU of this machine support."""
+
+    available: bool
+    version: Tuple[int, int, int]
+    version_text: str
+    device_name: str
+    architecture: str
+    gpu_generation: int
+    memory_bytes: int
+    recommended_working_set: int
+    gpu_available: bool
+    has_custom_function: bool
+    has_metal_kernel: bool
+    has_compile: bool
+    has_checkpoint: bool
+    native_bfloat16: bool
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def supported(self) -> bool:
+        return bool(self.available and self.version >= MIN_MLX_VERSION and self.has_custom_function)
+
+    @property
+    def is_latest_generation(self) -> bool:
+        return self.gpu_generation >= 17
+
+    def describe(self) -> str:
+        return (
+            f"MLX {self.version_text} on {self.device_name or 'unknown device'} "
+            f"({self.architecture or 'unknown arch'}, gen {self.gpu_generation}); "
+            f"metal_kernel={self.has_metal_kernel}, compile={self.has_compile}"
+        )
+
+
+def _mlx_detect() -> MLXCapabilities:
+    if _mlx_import() is None:
+        return MLXCapabilities(
+            available=False, version=(0, 0, 0), version_text="unavailable",
+            device_name="", architecture="", gpu_generation=0, memory_bytes=0,
+            recommended_working_set=0, gpu_available=False,
+            has_custom_function=False, has_metal_kernel=False, has_compile=False,
+            has_checkpoint=False, native_bfloat16=False,
+            extras={"import_error": repr(_MLX_STATE["import_error"])},
+        )
+    version_text = str(getattr(mx, "__version__", "0.0.0"))
+    info = _mlx_device_info()
+    architecture = str(info.get("architecture", ""))
+    generation = _mlx_gpu_generation(architecture)
+    try:
+        gpu_available = bool(mx.metal.is_available())
+    except Exception:
+        gpu_available = False
+    fast = getattr(mx, "fast", None)
+    return MLXCapabilities(
+        available=True,
+        version=_mlx_parse_version(version_text),
+        version_text=version_text,
+        device_name=str(info.get("device_name", platform.machine())),
+        architecture=architecture,
+        gpu_generation=generation,
+        memory_bytes=int(info.get("memory_size", 0) or 0),
+        recommended_working_set=int(info.get("max_recommended_working_set_size", 0) or 0),
+        gpu_available=gpu_available,
+        has_custom_function=hasattr(mx, "custom_function"),
+        has_metal_kernel=bool(fast is not None and hasattr(fast, "metal_kernel") and gpu_available),
+        has_compile=hasattr(mx, "compile"),
+        has_checkpoint=hasattr(mx, "checkpoint"),
+        # M1 (g13) lacks native bfloat16 arithmetic; MLX emulates it slowly.
+        native_bfloat16=bool(generation >= 14),
+        extras={"device_info": info},
+    )
+
+
+def _mlx_caps() -> MLXCapabilities:
+    """Capabilities of this process, detected once."""
+    if _MLX_STATE["caps"] is None:
+        _MLX_STATE["caps"] = _mlx_detect()
+    return _MLX_STATE["caps"]
+
+
+def _mlx_require() -> MLXCapabilities:
+    caps = _mlx_caps()
+    if not caps.available:
+        raise RuntimeError(
+            "The MLX engine requires the 'mlx' package on Apple silicon "
+            f"(import failed: {caps.extras.get('import_error')})"
+        )
+    if caps.version < MIN_MLX_VERSION:
+        raise RuntimeError(
+            f"MLX >= {'.'.join(map(str, MIN_MLX_VERSION))} is required; found {caps.version_text}"
+        )
+    if not caps.has_custom_function:
+        raise RuntimeError("This MLX build lacks mx.custom_function, which the engine requires")
+    return caps
+
+
+def _mlx_env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _mlx_configure_memory(limit_fraction: float = 0.125, cap_bytes: int = 2 << 30) -> Dict[str, int]:
+    """Bound the MLX buffer cache: min(RAM/8, 2 GiB), or E3MU_MLX_CACHE_LIMIT_MB.
+
+    Graph batches change shape every step, so cached buffers are rarely reused;
+    on the 604-structure test split a 2 GiB cap ran 2% slower than 16 GiB with
+    a 6.7 GB instead of 21.7 GB peak footprint (M5 Max, float32).
+    """
+    caps = _mlx_caps()
+    if not caps.available:
+        return dict()
+    total = int(caps.memory_bytes or 0)
+    limit = int(min(cap_bytes, max(1 << 30, int(total * float(limit_fraction))))) if total else int(cap_bytes)
+    override = os.environ.get("E3MU_MLX_CACHE_LIMIT_MB")
+    if override not in (None, ""):
+        limit = max(0, int(float(override) * (1 << 20)))
+    setter = getattr(mx, "set_cache_limit", None) or getattr(getattr(mx, "metal", None), "set_cache_limit", None)
+    if callable(setter) and _mlx_quiet_call(lambda: setter(limit) or True, False):
+        return {"cache_limit": limit}
+    return dict()
+
+
+def _mlx_clear_cache() -> None:
+    if _mlx_caps().available:
+        clearer = getattr(mx, "clear_cache", None) or getattr(getattr(mx, "metal", None), "clear_cache", None)
+        _mlx_quiet_call(clearer, None)
+
+
+def _mlx_peak_memory() -> int:
+    if not _mlx_caps().available:
+        return 0
+    getter = getattr(mx, "get_peak_memory", None) or getattr(getattr(mx, "metal", None), "get_peak_memory", None)
+    return int(_mlx_quiet_call(getter, 0) or 0)
+
+
+def _mlx_reset_peak_memory() -> None:
+    if _mlx_caps().available:
+        resetter = getattr(mx, "reset_peak_memory", None) or getattr(getattr(mx, "metal", None), "reset_peak_memory", None)
+        _mlx_quiet_call(resetter, None)
+
+
+def _mlx_matmul_precision() -> float:
+    """Relative error of a float32 GPU matmul (about 1e-7 in full FP32, 1e-3 in TF32)."""
+    if _MLX_STATE["matmul_error"] is not None:
+        return float(_MLX_STATE["matmul_error"])
+    error = 0.0
+    caps = _mlx_caps()
+    if caps.available and caps.gpu_available:
+        rng = np.random.default_rng(0)
+        a = rng.normal(size=(64, 64))
+        b = rng.normal(size=(64, 8))
+        with mx.stream(mx.gpu):
+            out = mx.array(a.astype(np.float32)) @ mx.array(b.astype(np.float32))
+            mx.eval(out)
+        exact = a @ b
+        error = float(np.abs(np.array(out) - exact).max() / np.abs(exact).max())
+    _MLX_STATE["matmul_error"] = error
+    return error
+
+
+def _mlx_tf32_active() -> bool:
+    return _mlx_matmul_precision() > 1e-5
+
+
+# --------------------------------------------------------------------------
+# MLX engine: deterministic segment reductions (CSR Metal kernel).
+#
+# Deterministic segment reductions and gathers for graph message passing.
+#
+# Edges are sorted by their receiving node on the host, so every node owns a
+# contiguous edge range described by a CSR pointer. On the GPU a custom
+# Metal kernel sums each range in a fixed order, which is deterministic and
+# avoids atomics. The kernel's VJP is a gather, so higher-order derivatives
+# (force training) stay exact. Float64 runs on the CPU stream, where MLX's
+# scatter-add is sequential and therefore also deterministic.
+# --------------------------------------------------------------------------
+
+_MLX_SEGMENT_SUM_SOURCE = r"""
+    uint col = thread_position_in_grid.x;
+    uint seg = thread_position_in_grid.y;
+    uint width = msg_shape[1];
+    uint n_seg = ptr_shape[0] - 1;
+    if (col >= width || seg >= n_seg) {
+        return;
+    }
+    int start = ptr[seg];
+    int stop = ptr[seg + 1];
+    float acc = 0.0f;
+    for (int e = start; e < stop; ++e) {
+        acc += static_cast<float>(msg[(size_t)e * width + col]);
+    }
+    out[(size_t)seg * width + col] = static_cast<T>(acc);
+"""
+
+_MLX_KERNEL = None
+_MLX_KERNEL_DISABLED = not _mlx_env_flag("E3MU_MLX_METAL_KERNELS", True)
+
+
+def _mlx_segment_kernel():
+    global _MLX_KERNEL, _MLX_KERNEL_DISABLED
+    if _MLX_KERNEL_DISABLED or not _mlx_caps().has_metal_kernel:
+        return None
+    if _MLX_KERNEL is None:
+        try:
+            _MLX_KERNEL = mx.fast.metal_kernel(
+                name="e3mu_csr_segment_sum",
+                input_names=["msg", "ptr"],
+                output_names=["out"],
+                source=_MLX_SEGMENT_SUM_SOURCE,
+            )
+        except Exception:
+            _MLX_KERNEL_DISABLED = True
+            return None
+    return _MLX_KERNEL
+
+
+def _mlx_launch_segment_sum(msg2d: mx.array, ptr: mx.array, n_seg: int) -> mx.array:
+    kernel = _mlx_segment_kernel()
+    width = int(msg2d.shape[1])
+    tx = 1
+    while tx < width and tx < 64:
+        tx *= 2
+    ty = max(1, 256 // tx)
+    return kernel(
+        inputs=[msg2d, ptr],
+        template=[("T", msg2d.dtype)],
+        grid=(width, n_seg, 1),
+        threadgroup=(tx, ty, 1),
+        output_shapes=[(n_seg, width)],
+        output_dtypes=[msg2d.dtype],
+    )[0]
+
+
+@_mlx_custom_function
+def _mlx_csr_segment_sum(msg2d: mx.array, ptr: mx.array, owner: mx.array) -> mx.array:
+    return _mlx_launch_segment_sum(msg2d, ptr, int(ptr.shape[0]) - 1)
+
+
+@_mlx_csr_segment_sum.vjp
+def _mlx_csr_segment_sum_vjp(primals, cotangent, output):
+    _msg, ptr, owner = primals
+    return mx.take(cotangent, owner, axis=0), mx.zeros_like(ptr), mx.zeros_like(owner)
+
+
+def _mlx_uses_kernel(x: mx.array) -> bool:
+    if x.dtype not in (mx.float32, mx.float16, mx.bfloat16):
+        return False
+    if _mlx_segment_kernel() is None:
+        return False
+    try:
+        return mx.default_device() == mx.gpu
+    except Exception:
+        return False
+
+
+class _MLXSegments:
+    """CSR description of a sorted ownership map (edges->nodes, atoms->graphs)."""
+
+    __slots__ = ("ptr", "owner", "count", "n")
+
+    def __init__(self, ptr: mx.array, owner: mx.array, count: mx.array, n: int):
+        self.ptr = ptr   # (n + 1,) int32
+        self.owner = owner      # (m,) int32, non-decreasing
+        self.count = count      # (n,) float, clamped to >= 1 (Torch scatter_mean rule)
+        self.n = int(n)
+
+    def sum(self, values: mx.array) -> mx.array:
+        """scatter_sum(values, owner, dim_size=n) along axis 0."""
+        tail = tuple(values.shape[1:])
+        if int(values.shape[0]) == 0:
+            return mx.zeros((self.n,) + tail, dtype=values.dtype)
+        if _mlx_uses_kernel(values):
+            width = 1
+            for size in tail:
+                width *= int(size)
+            out = _mlx_csr_segment_sum(values.reshape(int(values.shape[0]), width), self.ptr, self.owner)
+            return out.reshape((self.n,) + tail)
+        return mx.zeros((self.n,) + tail, dtype=values.dtype).at[self.owner].add(values)
+
+    def mean(self, values: mx.array) -> mx.array:
+        """scatter_mean with Torch's count.clamp(min=1) division."""
+        total = self.sum(values)
+        count = self.count.astype(values.dtype)
+        return total / count.reshape((-1,) + (1,) * (values.ndim - 1))
+
+    def expand(self, values: mx.array) -> mx.array:
+        """Broadcast per-segment values back to the owners (values[owner])."""
+        return mx.take(values, self.owner, axis=0)
+
+
+def _mlx_gather(values: mx.array, index: mx.array) -> mx.array:
+    return mx.take(values, index, axis=0)
+
+
+def _mlx_segment_kernel_available() -> bool:
+    return _mlx_segment_kernel() is not None
+
+
+def _mlx_kernel_self_check() -> Optional[str]:
+    """Verify the Metal kernel against scatter-add once at engine start."""
+    if _mlx_segment_kernel() is None:
+        return None
+    try:
+        rng = np.random.default_rng(0)
+        owner_np = np.sort(rng.integers(0, 37, 401)).astype(np.int32)
+        ptr_np = np.searchsorted(owner_np, np.arange(38)).astype(np.int32)
+        values = mx.array(rng.normal(size=(401, 5, 3)).astype(np.float32))
+        seg = _MLXSegments(mx.array(ptr_np), mx.array(owner_np), mx.ones((37,)), 37)
+        with mx.stream(mx.gpu):
+            fast = seg.sum(values)
+            ref = mx.zeros((37, 5, 3)).at[mx.array(owner_np)].add(values)
+            err = float(mx.max(mx.abs(fast - ref)).item())
+        if not err < 1e-4:
+            raise RuntimeError(f"segment-sum kernel mismatch {err:.3e}")
+    except Exception as exc:
+        global _MLX_KERNEL_DISABLED
+        _MLX_KERNEL_DISABLED = True
+        return f"Metal segment kernel disabled: {exc}"
+    return None
+
+
+# --------------------------------------------------------------------------
+# MLX engine: elementwise math with Torch-matching gradients.
+#
+# Elementwise math with Torch-matching gradients and exact float64 variants.
+#
+# MLX's float64 exp/sin/cos/sigmoid run at roughly float32 accuracy
+# (measured 3e-7..4e-5 relative error on MLX 0.32). The float64 path used by
+# validation therefore routes through identities whose primitives are exact
+# in float64 (power, tanh, tan, log1p). Float32/16 paths use the native fast
+# kernels.
+#
+# Torch's clamp passes gradient 1 at the clamp boundary while ``mx.clip``
+# and ``mx.maximum`` pass 0, so clamp/relu here reproduce the Torch rule
+# exactly.
+# --------------------------------------------------------------------------
+
+def _mlx_is_f64(x: mx.array) -> bool:
+    return x.dtype == mx.float64
+
+
+def _mlx_first(primals):
+    return primals[0] if isinstance(primals, (tuple, list)) else primals
+
+
+def _mlx_exp(x: mx.array) -> mx.array:
+    if _mlx_is_f64(x):
+        return mx.power(mx.array(math.e, dtype=x.dtype), x)
+    return mx.exp(x)
+
+
+def _mlx_sigmoid(x: mx.array) -> mx.array:
+    if _mlx_is_f64(x):
+        return 0.5 * (1.0 + mx.tanh(0.5 * x))
+    return mx.sigmoid(x)
+
+
+def _mlx_silu(x: mx.array) -> mx.array:
+    if _mlx_is_f64(x):
+        return x * (0.5 * (1.0 + mx.tanh(0.5 * x)))
+    return x * mx.sigmoid(x)
+
+
+def _mlx_tanh(x: mx.array) -> mx.array:
+    return mx.tanh(x)
+
+
+def _mlx_softplus(x: mx.array) -> mx.array:
+    """torch.nn.functional.softplus with beta=1, threshold=20."""
+    return mx.where(x > 20.0, x, mx.log1p(_mlx_exp(mx.minimum(x, 20.0))))
+
+
+def _mlx_tan_half(a: mx.array) -> mx.array:
+    k = mx.stop_gradient(mx.round(a / (2.0 * math.pi)))
+    return mx.tan(0.5 * (a - k * (2.0 * math.pi)))
+
+
+@_mlx_custom_function
+def _mlx_cos64(a):
+    t = _mlx_tan_half(mx.stop_gradient(a))
+    return (1.0 - t * t) / (1.0 + t * t)
+
+
+@_mlx_custom_function
+def _mlx_sin64(a):
+    t = _mlx_tan_half(mx.stop_gradient(a))
+    return 2.0 * t / (1.0 + t * t)
+
+
+@_mlx_cos64.vjp
+def _mlx_cos64_vjp(primals, cotangent, output):
+    return (-_mlx_sin64(_mlx_first(primals)) * cotangent,)
+
+
+@_mlx_sin64.vjp
+def _mlx_sin64_vjp(primals, cotangent, output):
+    return (_mlx_cos64(_mlx_first(primals)) * cotangent,)
+
+
+def _mlx_cos(x: mx.array) -> mx.array:
+    return _mlx_cos64(x) if _mlx_is_f64(x) else mx.cos(x)
+
+
+def _mlx_sin(x: mx.array) -> mx.array:
+    return _mlx_sin64(x) if _mlx_is_f64(x) else mx.sin(x)
+
+
+def _mlx_clamp(x: mx.array, lo: Optional[float] = None, hi: Optional[float] = None) -> mx.array:
+    """torch.clamp: value clip(x, lo, hi); gradient 1 where lo <= x <= hi."""
+    y = x
+    if lo is not None:
+        y = mx.where(x >= lo, y, mx.array(lo, dtype=x.dtype))
+    if hi is not None:
+        y = mx.where(x <= hi, y, mx.array(hi, dtype=x.dtype))
+    return y
+
+
+def _mlx_clamp_min_array(x: mx.array, lo: mx.array) -> mx.array:
+    return mx.where(x >= lo, x, mx.stop_gradient(lo + mx.zeros_like(x)))
+
+
+def _mlx_relu(x: mx.array) -> mx.array:
+    """torch.relu: gradient 0 at x == 0."""
+    return mx.where(x > 0, x, mx.zeros_like(x))
+
+
+def _mlx_fast_layer_norm(x: mx.array, weight: mx.array, bias: mx.array, eps: float) -> mx.array:
+    if _mlx_is_f64(x) or not hasattr(mx, "fast"):
+        mean = mx.mean(x, axis=-1, keepdims=True)
+        centered = x - mean
+        var = mx.mean(centered * centered, axis=-1, keepdims=True)
+        return centered * mx.rsqrt(var + eps) * weight + bias
+    return mx.fast.layer_norm(x, weight, bias, eps)
+
+
+def _mlx_smooth_scalar_bound(value: mx.array, max_abs: float = 32.0) -> mx.array:
+    cap = float(max_abs)
+    return value * mx.rsqrt(1.0 + mx.square(value / cap))
+
+
+def _mlx_smooth_equivariant_bound(value: mx.array, max_norm: float = 100.0) -> mx.array:
+    cap = float(max_norm)
+    norm_squared = mx.sum(value * value, axis=-1, keepdims=True)
+    return value * mx.rsqrt(1.0 + norm_squared / (cap * cap))
+
+
+def _mlx_xcross(a: mx.array, b: mx.array) -> mx.array:
+    """Cross product over the last axis.
+
+    ``mx.linalg.cross`` breaks ``mx.compile`` when two layers reuse one
+    broadcast operand (IndexError: unordered_map::at), so the engine always
+    uses this explicit form.
+    """
+    a0, a1, a2 = a[..., 0], a[..., 1], a[..., 2]
+    b0, b1, b2 = b[..., 0], b[..., 1], b[..., 2]
+    return mx.stack([a1 * b2 - a2 * b1, a2 * b0 - a0 * b2, a0 * b1 - a1 * b0], axis=-1)
+
+
+# W. J. Cody's rational Chebyshev approximations (CALERF), accurate to about
+# 1e-16 in float64; MLX's native float64 erf is only float32-accurate.
+_MLX_ERF_A = (3.16112374387056560e00, 1.13864154151050156e02, 3.77485237685302021e02,
+                        3.20937758913846947e03, 1.85777706184603153e-1)
+_MLX_ERF_B = (2.36012909523441209e01, 2.44024637934444173e02, 1.28261652607737228e03,
+                        2.84423683343917062e03)
+_MLX_ERF_C = (5.64188496988670089e-1, 8.88314979438837594e00, 6.61191906371416295e01,
+                        2.98635138197400131e02, 8.81952221241769090e02, 1.71204761263407058e03,
+                        2.05107837782607147e03, 1.23033935479799725e03, 2.15311535474403846e-8)
+_MLX_ERF_D = (1.57449261107098347e01, 1.17693950891312499e02, 5.37181101862009858e02,
+                        1.62138957456669019e03, 3.29079923573345963e03, 4.36261909014324716e03,
+                        3.43936767414372164e03, 1.23033935480374942e03)
+_MLX_ERF_P = (3.05326634961232344e-1, 3.60344899949804439e-1, 1.25781726111229246e-1,
+                        1.60837851487422766e-2, 6.58749161529837803e-4, 1.63153871373020978e-2)
+_MLX_ERF_Q = (2.56852019228982242e00, 1.87295284992346725e00, 5.27905102951428412e-1,
+                        6.05183413124413191e-2, 2.33520497626869185e-3)
+_MLX_INV_SQRT_PI = 5.6418958354775628695e-1
+
+
+def _mlx_erfc_tail_scale(y: mx.array) -> mx.array:
+    ysq = mx.floor(y * 16.0) / 16.0
+    delta = (y - ysq) * (y + ysq)
+    return _mlx_exp(-ysq * ysq) * _mlx_exp(-delta)
+
+
+def _mlx_erf64_value(x: mx.array) -> mx.array:
+    y = mx.abs(x)
+    # |x| <= 0.46875
+    ysq = y * y
+    num = _MLX_ERF_A[4] * ysq
+    den = ysq
+    for i in range(3):
+        num = (num + _MLX_ERF_A[i]) * ysq
+        den = (den + _MLX_ERF_B[i]) * ysq
+    small = x * (num + _MLX_ERF_A[3]) / (den + _MLX_ERF_B[3])
+    # 0.46875 < |x| <= 4 (erfc)
+    ym = mx.minimum(y, 4.0)
+    num = _MLX_ERF_C[8] * ym
+    den = ym
+    for i in range(7):
+        num = (num + _MLX_ERF_C[i]) * ym
+        den = (den + _MLX_ERF_D[i]) * ym
+    mid = (num + _MLX_ERF_C[7]) / (den + _MLX_ERF_D[7]) * _mlx_erfc_tail_scale(ym)
+    # |x| > 4 (erfc)
+    yl = mx.maximum(y, 4.0)
+    inv = 1.0 / (yl * yl)
+    num = _MLX_ERF_P[5] * inv
+    den = inv
+    for i in range(4):
+        num = (num + _MLX_ERF_P[i]) * inv
+        den = (den + _MLX_ERF_Q[i]) * inv
+    tail = inv * (num + _MLX_ERF_P[4]) / (den + _MLX_ERF_Q[4])
+    large = (_MLX_INV_SQRT_PI - tail) / yl * _mlx_erfc_tail_scale(mx.minimum(yl, 27.0))
+    large = mx.where(yl >= 27.0, mx.zeros_like(large), large)
+    erfc_abs = mx.where(y <= 4.0, mid, large)
+    signed = mx.where(x < 0, erfc_abs - 1.0, 1.0 - erfc_abs)
+    return mx.where(y <= 0.46875, small, signed)
+
+
+@_mlx_custom_function
+def _mlx_erf64(x):
+    return _mlx_erf64_value(mx.stop_gradient(x))
+
+
+@_mlx_erf64.vjp
+def _mlx_erf64_vjp(primals, cotangent, output):
+    x = _mlx_first(primals)
+    return (cotangent * (2.0 * _MLX_INV_SQRT_PI) * _mlx_exp(-x * x),)
+
+
+def _mlx_erf(x: mx.array) -> mx.array:
+    return _mlx_erf64(x) if _mlx_is_f64(x) else mx.erf(x)
+
+
+def _mlx_det3(m: mx.array) -> mx.array:
+    """Determinant of (..., 3, 3) matrices by cofactor expansion (differentiable)."""
+    return (
+        m[..., 0, 0] * (m[..., 1, 1] * m[..., 2, 2] - m[..., 1, 2] * m[..., 2, 1])
+        - m[..., 0, 1] * (m[..., 1, 0] * m[..., 2, 2] - m[..., 1, 2] * m[..., 2, 0])
+        + m[..., 0, 2] * (m[..., 1, 0] * m[..., 2, 1] - m[..., 1, 1] * m[..., 2, 0])
+    )
+
+
+def _mlx_inv3(m: mx.array) -> mx.array:
+    """Inverse of (..., 3, 3) matrices via the adjugate (differentiable)."""
+    a, b, c = m[..., 0, 0], m[..., 0, 1], m[..., 0, 2]
+    d, e, f = m[..., 1, 0], m[..., 1, 1], m[..., 1, 2]
+    g, h, i = m[..., 2, 0], m[..., 2, 1], m[..., 2, 2]
+    rows = [
+        mx.stack([e * i - f * h, c * h - b * i, b * f - c * e], axis=-1),
+        mx.stack([f * g - d * i, a * i - c * g, c * d - a * f], axis=-1),
+        mx.stack([d * h - e * g, b * g - a * h, a * e - b * d], axis=-1),
+    ]
+    adj = mx.stack(rows, axis=-2)
+    return adj / _mlx_det3(m)[..., None, None]
+
+
+# --------------------------------------------------------------------------
+# MLX engine: differentiable dense linear algebra for QEq and polarization.
+#
+# Differentiable dense linear algebra for the QEq and polarization solvers.
+#
+# MLX factorizations run on the CPU stream and carry no VJP, so the SPD
+# solve is a custom function whose VJP is again an SPD solve (implicit
+# differentiation). That keeps first, second and third derivatives exact,
+# which force and stress training need. The smallest eigenvalue follows the
+# Torch reference: eigh in float64 on the CPU, then a Rayleigh quotient that
+# supplies the gradient.
+# --------------------------------------------------------------------------
+
+def _mlx_cpu_cast(x: mx.array, dtype) -> mx.array:
+    if x.dtype == dtype:
+        return x
+    return mx.astype(x, dtype, stream=mx.cpu)
+
+
+def _mlx_cholesky_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
+    lower = mx.linalg.cholesky(matrix, upper=False, stream=mx.cpu)
+    column = mx.expand_dims(rhs, -1)
+    middle = mx.linalg.solve_triangular(lower, column, upper=False, stream=mx.cpu)
+    upper = mx.swapaxes(lower, -1, -2)
+    return mx.squeeze(mx.linalg.solve_triangular(upper, middle, upper=True, stream=mx.cpu), -1)
+
+
+@_mlx_custom_function
+def _mlx_spd_solve(matrix: mx.array, rhs: mx.array) -> mx.array:
+    """Solve matrix @ x = rhs for symmetric positive-definite (batched) matrices."""
+    return _mlx_cholesky_solve(mx.stop_gradient(matrix), mx.stop_gradient(rhs))
+
+
+@_mlx_spd_solve.vjp
+def _mlx_spd_solve_vjp(primals, cotangent, output):
+    matrix, rhs = primals
+    solution = _mlx_spd_solve(matrix, rhs)
+    grad_rhs = _mlx_spd_solve(matrix, cotangent)
+    grad_matrix = -mx.expand_dims(grad_rhs, -1) * mx.expand_dims(solution, -2)
+    return grad_matrix, grad_rhs
+
+
+def _mlx_symmetric_min_eigenvalue(symmetric: mx.array) -> mx.array:
+    """Smallest eigenvalue with Torch's eigh + Rayleigh-gradient construction."""
+    work = _mlx_cpu_cast(mx.stop_gradient(symmetric), mx.float64)
+    values, vectors = mx.linalg.eigh(work, stream=mx.cpu)
+    # Slice on the CPU stream: float64 arrays cannot touch the GPU stream.
+    eigenvalue = _mlx_cpu_cast(mx.take(values, 0, axis=-1, stream=mx.cpu), symmetric.dtype)
+    eigenvector = _mlx_cpu_cast(mx.take(vectors, 0, axis=-1, stream=mx.cpu), symmetric.dtype)
+    eigenvalue = mx.stop_gradient(eigenvalue)
+    eigenvector = mx.stop_gradient(eigenvector)
+    rayleigh = mx.sum(eigenvector * mx.squeeze(symmetric @ mx.expand_dims(eigenvector, -1), -1), axis=-1)
+    return eigenvalue + rayleigh - mx.stop_gradient(rayleigh)
+
+
+def _mlx_gershgorin_upper(symmetric: mx.array) -> mx.array:
+    """Upper bound of the spectrum, used to park padded diagonal entries."""
+    absolute = mx.abs(symmetric)
+    diagonal = mx.diagonal(symmetric, axis1=-2, axis2=-1)
+    radius = mx.sum(absolute, axis=-1) - mx.abs(diagonal)
+    return mx.max(diagonal + radius, axis=-1)
+
+
+def _mlx_inverse_no_grad(matrix: mx.array) -> mx.array:
+    work = _mlx_cpu_cast(mx.stop_gradient(matrix), mx.float64 if matrix.dtype == mx.float64 else mx.float32)
+    return _mlx_cpu_cast(mx.linalg.inv(work, stream=mx.cpu), matrix.dtype)
+
+
+# --------------------------------------------------------------------------
+# MLX engine: batch conversion and graph inputs.
+#
+# Host-side conversion of a PyG/AtomicData batch into MLX engine inputs.
+#
+# The data pipeline is shared with the Torch engine: the engine consumes the
+# exact batch object the frontends already build. Index bookkeeping (edge
+# sorting, CSR pointers, dense per-graph layouts, label activities) is done
+# once on the host in numpy, so the device graph contains only arithmetic.
+# --------------------------------------------------------------------------
+
+_MLX_LABEL_GROUPS = ("electric", "polarization", "dispersion", "spin")
+
+
+def _mlx_numpy_of(value: Any) -> np.ndarray:
+    if value is None:
+        return None
+    detach = getattr(value, "detach", None)
+    if callable(detach):
+        value = detach()
+        cpu = getattr(value, "cpu", None)
+        if callable(cpu):
+            value = cpu()
+        return value.numpy()
+    return np.asarray(value)
+
+
+def _mlx_array_from_numpy(values: np.ndarray, dtype) -> mx.array:
+    return mx.array(np.ascontiguousarray(values), dtype=dtype)
+
+
+def _mlx_segments(owner: np.ndarray, n: int, dtype) -> _MLXSegments:
+    owner = owner.astype(np.int64, copy=False)
+    counts = np.bincount(owner, minlength=n).astype(np.int64) if owner.size else np.zeros((n,), np.int64)
+    ptr = np.zeros((n + 1,), dtype=np.int32)
+    np.cumsum(counts, out=ptr[1:])
+    return _MLXSegments(
+        mx.array(ptr, dtype=mx.int32),
+        mx.array(owner.astype(np.int32), dtype=mx.int32),
+        mx.array(np.maximum(counts, 1).astype(np.float64), dtype=dtype),
+        n,
+    )
+
+
+@dataclass
+class _MLXDenseLayout:
+    """Padded per-graph layout for the QEq and polarization solvers."""
+
+    nmax: int
+    index: mx.array   # (B, nmax) int32 into an (N + 1)-row padded atom array
+    mask: mx.array    # (B, nmax) float
+    flat: mx.array      # (N,) int32 position of each atom inside (B * nmax)
+    counts: np.ndarray  # (B,) host atom counts
+    counts_mx: mx.array      # (B,) float
+    helmert: mx.array   # (B, nmax, nmax - 1)
+    reduced_mask: mx.array   # (B, nmax - 1) float
+    pair_mask: mx.array      # (B, nmax, nmax) float, real off-diagonal pairs
+    graph_any_pbc: np.ndarray
+    pol_floor: mx.array      # (B,) polarization floor max(5e-2, 32 * 3n * eps)
+
+
+def _mlx_helmert(n: int) -> np.ndarray:
+    if n <= 1:
+        return np.zeros((n, 0), dtype=np.float64)
+    columns = np.arange(1, n, dtype=np.float64)
+    rows = np.arange(n, dtype=np.float64)[:, None]
+    raw = (rows < columns).astype(np.float64) - (rows == columns).astype(np.float64) * columns[None, :]
+    return raw / np.sqrt(columns * (columns + 1.0))[None, :]
+
+
+def _mlx_torch_helmert(n: int, dtype_name: str) -> np.ndarray:
+    """Helmert basis computed with Torch arithmetic in the working dtype."""
+    try:
+        tdtype = torch.float64 if dtype_name == "float64" else torch.float32
+        if n <= 1:
+            return np.zeros((n, 0), dtype=np.float64)
+        columns = torch.arange(1, n, dtype=tdtype)
+        rows = torch.arange(n, dtype=tdtype).unsqueeze(1)
+        raw = (rows < columns).to(tdtype) - (rows == columns).to(tdtype) * columns.unsqueeze(0)
+        norm = torch.sqrt(columns * (columns + 1.0))
+        return (raw / norm.unsqueeze(0)).numpy().astype(np.float64)
+    except Exception:
+        return _mlx_helmert(n)
+
+
+@dataclass
+class _MLXGraphInputs:
+    dtype: Any
+    n_atoms: int
+    n_edges: int
+    n_graphs: int
+    pos: mx.array
+    shifts: mx.array
+    src: mx.array
+    dst: mx.array
+    edge_seg: _MLXSegments
+    graph_seg: _MLXSegments
+    batch: mx.array
+    edge_graph: mx.array
+    atom_types: Optional[mx.array]
+    node_attrs: Optional[mx.array]
+    atomic_numbers: Optional[mx.array]
+    cells: mx.array
+    pbc: mx.array
+    volumes: mx.array
+    eligible: mx.array
+    field: mx.array
+    total_charge: mx.array
+    spins: Optional[mx.array]
+    reference_spins: Optional[mx.array]
+    any_pbc: bool
+    graph_any_pbc: np.ndarray
+    graph_all_pbc: np.ndarray
+    pbc_np: np.ndarray
+    cells_np: np.ndarray
+    counts_np: np.ndarray
+    batch_np: np.ndarray
+    edge_perm: Optional[np.ndarray]
+    src_np: np.ndarray
+    dst_np: np.ndarray
+    atomic_numbers_np: Optional[np.ndarray]
+    gpbc: Optional[mx.array] = None   # (B,) bool: graph has a periodic axis
+    activities: Dict[str, mx.array] = field(default_factory=dict)
+    activities_np: Dict[str, np.ndarray] = field(default_factory=dict)
+    film_condition: Optional[mx.array] = None
+    film_activity: Optional[mx.array] = None
+    spin_candidates: Optional[Tuple[mx.array, mx.array, mx.array, mx.array, np.ndarray]] = None
+    dense: Optional[_MLXDenseLayout] = None
+    # Integer minimum-image shifts taken with the Torch reference arithmetic
+    # (round has zero gradient, so they are exact constants for all orders).
+    pair_image: Optional[mx.array] = None     # (B, nmax, nmax, 3)
+    center_image: Optional[mx.array] = None   # (N, 3)
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+
+def _mlx_build_inputs(
+    batch: Any,
+    *,
+    backend: Any,
+    dtype,
+    field_scale: float,
+    label_aware: bool,
+    need_dense: bool,
+    need_spin_pairs: bool,
+    torch_dtype: Any = None,
+) -> _MLXGraphInputs:
+    """Translate the frontend batch.  ``backend`` is the module that defines the
+    Torch model, so field/charge/label semantics come from the same helpers."""
+    np_dtype = np.float64 if dtype == mx.float64 else np.float32
+    positions_t = batch.positions
+    pos_np = _mlx_numpy_of(positions_t).astype(np.float64)
+    n_atoms = int(pos_np.shape[0])
+    edge_index = _mlx_numpy_of(batch.edge_index).astype(np.int64)
+    src_np = edge_index[0]
+    dst_np = edge_index[1]
+    n_edges = int(src_np.shape[0])
+    shifts_t = getattr(batch, "shifts", None)
+    shifts_np = np.zeros((n_edges, 3), dtype=np.float64) if shifts_t is None else _mlx_numpy_of(shifts_t).astype(np.float64)
+    if n_edges and (src_np.min() < 0 or dst_np.min() < 0 or src_np.max() >= n_atoms or dst_np.max() >= n_atoms):
+        raise IndexError("edge_index refers to atoms outside the batch")
+    edge_perm = None
+    if n_edges > 1 and np.any(np.diff(src_np) < 0):
+        edge_perm = np.argsort(src_np, kind="stable")
+        src_np = src_np[edge_perm]
+        dst_np = dst_np[edge_perm]
+        shifts_np = shifts_np[edge_perm]
+
+    if hasattr(batch, "ptr") and getattr(batch, "ptr") is not None:
+        n_graphs = int(_mlx_numpy_of(batch.ptr).shape[0] - 1)
+    else:
+        n_graphs = int(getattr(batch, "num_graphs", 1))
+    batch_vec = getattr(batch, "batch", None)
+    batch_np = np.zeros((n_atoms,), dtype=np.int64) if batch_vec is None else _mlx_numpy_of(batch_vec).astype(np.int64)
+    if n_atoms and np.any(np.diff(batch_np) < 0):
+        raise ValueError("The MLX engine expects atoms grouped by graph (PyG batch order)")
+    counts_np = np.bincount(batch_np, minlength=n_graphs).astype(np.int64) if n_atoms else np.zeros((n_graphs,), np.int64)
+
+    cells_t = backend._reshape_batched_cell(batch.cell, n_graphs)
+    cells_np = _mlx_numpy_of(cells_t).astype(np.float64)
+    pbc_value = getattr(batch, "pbc", None)
+    if pbc_value is None:
+        pbc_np = np.zeros((n_graphs, 3), dtype=bool)
+    else:
+        pbc_np = _mlx_numpy_of(pbc_value).astype(bool).reshape(-1, 3)
+        if pbc_np.shape[0] == 1 and n_graphs > 1:
+            pbc_np = np.repeat(pbc_np, n_graphs, axis=0)
+
+    # volumes / eligibility follow _prepare_differentiable_geometry in the
+    # working dtype (Torch computes det in the model dtype).
+    tdt = torch_dtype if torch_dtype is not None else (torch.float64 if np_dtype == np.float64 else torch.float32)
+    cells_work = torch.as_tensor(cells_np, dtype=tdt)
+    volumes_t = torch.abs(torch.linalg.det(cells_work))
+    eligible_t = torch.all(torch.as_tensor(pbc_np), dim=1) & torch.isfinite(volumes_t) & (volumes_t > 1e-10)
+    declared = getattr(batch, "stress_eligible", None)
+    if declared is not None:
+        declared_mask = torch.as_tensor(_mlx_numpy_of(declared), dtype=torch.bool).reshape(-1)
+        if declared_mask.numel() == 1 and n_graphs > 1:
+            declared_mask = declared_mask.expand(n_graphs)
+        if declared_mask.numel() != n_graphs:
+            raise ValueError("stress_eligible must contain one value per graph")
+        eligible_t = eligible_t & declared_mask
+    volumes_np = volumes_t.numpy().astype(np.float64)
+    eligible_np = eligible_t.numpy().astype(np.float64)
+
+    field_t = backend._batch_field(batch, n_graphs)
+    field_np = _mlx_numpy_of(field_t).astype(np.float64).reshape(n_graphs, 3)
+    field_np = (torch.as_tensor(field_np, dtype=tdt) * float(field_scale)).numpy().astype(np.float64)
+    total_charge_np = _mlx_numpy_of(backend._batch_total_charge(batch, n_graphs, tdt)).astype(np.float64).reshape(n_graphs)
+
+    atom_types = getattr(batch, "atom_types", None)
+    atom_types_np = None if atom_types is None else _mlx_numpy_of(atom_types).astype(np.int64).reshape(-1)
+    node_attrs = getattr(batch, "node_attrs", None)
+    node_attrs_np = None if node_attrs is None or atom_types_np is not None else _mlx_numpy_of(node_attrs).astype(np.float64)
+    atomic_numbers_np = None
+    for name in ("atomic_numbers", "z"):
+        value = getattr(batch, name, None)
+        if value is not None:
+            atomic_numbers_np = _mlx_numpy_of(value).astype(np.int64).reshape(-1)
+            break
+
+    spins_value = getattr(batch, "spins", None)
+    spins_np = None if spins_value is None else _mlx_numpy_of(spins_value).astype(np.float64).reshape(n_atoms, 3)
+    ref_value = getattr(batch, "reference_spins", None)
+    ref_np = None if ref_value is None else _mlx_numpy_of(ref_value).astype(np.float64).reshape(n_atoms, 3)
+
+    graph_any_pbc = np.any(pbc_np, axis=1)
+    inputs = _MLXGraphInputs(
+        gpbc=mx.array(graph_any_pbc.astype(bool)),
+        dtype=dtype,
+        n_atoms=n_atoms,
+        n_edges=n_edges,
+        n_graphs=n_graphs,
+        pos=_mlx_array_from_numpy(pos_np.astype(np_dtype), dtype),
+        shifts=_mlx_array_from_numpy(shifts_np.astype(np_dtype), dtype),
+        src=mx.array(src_np.astype(np.int32), dtype=mx.int32),
+        dst=mx.array(dst_np.astype(np.int32), dtype=mx.int32),
+        edge_seg=_mlx_segments(src_np, n_atoms, dtype),
+        graph_seg=_mlx_segments(batch_np, n_graphs, dtype),
+        batch=mx.array(batch_np.astype(np.int32), dtype=mx.int32),
+        edge_graph=mx.array(batch_np[src_np].astype(np.int32) if n_edges else np.zeros((0,), np.int32), dtype=mx.int32),
+        atom_types=None if atom_types_np is None else mx.array(atom_types_np.astype(np.int32), dtype=mx.int32),
+        node_attrs=None if node_attrs_np is None else _mlx_array_from_numpy(node_attrs_np.astype(np_dtype), dtype),
+        atomic_numbers=None if atomic_numbers_np is None else mx.array(atomic_numbers_np.astype(np.int32), dtype=mx.int32),
+        cells=_mlx_array_from_numpy(cells_np.astype(np_dtype), dtype),
+        pbc=_mlx_array_from_numpy(pbc_np.astype(np_dtype), dtype),
+        volumes=_mlx_array_from_numpy(volumes_np.astype(np_dtype), dtype),
+        eligible=_mlx_array_from_numpy(eligible_np.astype(np_dtype), dtype),
+        field=_mlx_array_from_numpy(field_np.astype(np_dtype), dtype),
+        total_charge=_mlx_array_from_numpy(total_charge_np.astype(np_dtype), dtype),
+        spins=None if spins_np is None else _mlx_array_from_numpy(spins_np.astype(np_dtype), dtype),
+        reference_spins=None if ref_np is None else _mlx_array_from_numpy(ref_np.astype(np_dtype), dtype),
+        any_pbc=bool(np.any(pbc_np)),
+        graph_any_pbc=graph_any_pbc,
+        graph_all_pbc=np.all(pbc_np, axis=1),
+        pbc_np=pbc_np,
+        cells_np=cells_np,
+        counts_np=counts_np,
+        batch_np=batch_np,
+        edge_perm=edge_perm,
+        src_np=src_np,
+        dst_np=dst_np,
+        atomic_numbers_np=atomic_numbers_np,
+    )
+
+    film_condition = getattr(batch, "film_condition", None)
+    if film_condition is not None:
+        inputs.film_condition = _mlx_array_from_numpy(_mlx_numpy_of(film_condition).astype(np_dtype).reshape(n_atoms, 4), dtype)
+    film_activity = getattr(batch, "film_activity", None)
+    if film_activity is not None:
+        inputs.film_activity = _mlx_array_from_numpy(_mlx_numpy_of(film_activity).astype(np_dtype).reshape(n_atoms, 1), dtype)
+
+    if label_aware:
+        groups = {
+            "electric": backend.ELECTRIC_COUPLING_LABELS,
+            "polarization": backend.POLARIZATION_COUPLING_LABELS,
+            "dispersion": backend.DISPERSION_COUPLING_LABELS,
+            "spin": backend.SPIN_COUPLING_LABELS,
+        }
+        for key, names in groups.items():
+            activity = _mlx_numpy_of(backend._graph_label_activity(batch, names, dtype=tdt)).astype(np.float64)
+            inputs.activities_np[key] = activity
+            inputs.activities[key] = _mlx_array_from_numpy(activity.astype(np_dtype), dtype)
+    magneto = getattr(batch, "magnetoelastic_stress_weight", None)
+    if magneto is not None or ref_np is not None:
+        activity = _mlx_numpy_of(backend._graph_label_activity(batch, ("magnetoelastic_stress",), dtype=tdt)).astype(np.float64)
+        inputs.activities_np["magnetoelastic"] = activity
+        inputs.activities["magnetoelastic"] = _mlx_array_from_numpy(activity.astype(np_dtype), dtype)
+
+    if need_spin_pairs:
+        raise ValueError("spin pairs need the model spin cutoff; call build_spin_candidates")
+    if need_dense:
+        inputs.dense = _mlx_build_dense_layout(counts_np, graph_any_pbc, dtype, "float64" if np_dtype == np.float64 else "float32")
+    if inputs.any_pbc:
+        centers = _mlx_torch_center_images(backend, pos_np, batch_np, cells_np, pbc_np, n_graphs, tdt)
+        inputs.center_image = _mlx_array_from_numpy(centers.astype(np_dtype), dtype)
+        if need_dense:
+            pairs = _mlx_torch_pair_images(pos_np, counts_np, cells_np, pbc_np, inputs.dense.nmax, tdt)
+            inputs.pair_image = _mlx_array_from_numpy(pairs.astype(np_dtype), dtype)
+    return inputs
+
+
+def _mlx_build_spin_candidates(batch: Any, X: _MLXGraphInputs, cutoff: float) -> None:
+    """Spin pairs src < dst within the hard spin cutoff, decided as Torch does.
+
+    The Torch spin layer keeps a pair when ``norm(pos[dst] + shift - pos[src]) <=
+    cutoff`` and drops it otherwise, with no smooth envelope.  The decision is a
+    constant of the geometry, so it is taken once on the host with the same Torch
+    expression and dtype; pairs beyond the cutoff are removed before the device
+    computes anything for them."""
+    with torch.no_grad():
+        edge_index = batch.edge_index.detach().cpu()
+        src_all, dst_all = edge_index[0], edge_index[1]
+        positions = batch.positions.detach().cpu()
+        shifts = getattr(batch, "shifts", None)
+        if shifts is None:
+            shifts = torch.zeros((src_all.numel(), 3), dtype=positions.dtype)
+        else:
+            shifts = shifts.detach().cpu()
+        edge_vec = positions[dst_all] + shifts - positions[src_all]
+        edge_r = torch.linalg.norm(edge_vec, dim=-1)
+        mask = ((src_all < dst_all) & (edge_r <= cutoff)).numpy()
+    if X.edge_perm is not None:
+        mask = mask[X.edge_perm]
+    cand = np.nonzero(mask)[0]
+    X.spin_candidates = (
+        mx.array(cand.astype(np.int32), dtype=mx.int32),
+        mx.array(X.src_np[cand].astype(np.int32), dtype=mx.int32),
+        mx.array(X.dst_np[cand].astype(np.int32), dtype=mx.int32),
+        mx.array(X.batch_np[X.src_np[cand]].astype(np.int32) if cand.size else np.zeros((0,), np.int32), dtype=mx.int32),
+        cand,
+    )
+
+
+def _mlx_attach_pair_images(X: _MLXGraphInputs, torch_dtype: Any = None) -> None:
+    """Attach Torch-exact pair image shifts once the dense layout exists."""
+    if not X.any_pbc or X.dense is None:
+        return
+    np_dtype = np.float64 if X.dtype == mx.float64 else np.float32
+    tdt = torch_dtype if torch_dtype is not None else (torch.float64 if np_dtype == np.float64 else torch.float32)
+    pos_np = np.array(X.pos).astype(np.float64)
+    pairs = _mlx_torch_pair_images(pos_np, X.counts_np, X.cells_np, X.pbc_np, X.dense.nmax, tdt)
+    X.pair_image = _mlx_array_from_numpy(pairs.astype(np_dtype), X.dtype)
+
+
+def _mlx_torch_center_images(backend, pos_np, batch_np, cells_np, pbc_np, n_graphs, tdt) -> np.ndarray:
+    """round(frac) of minimal_image_relative_positions, in Torch arithmetic."""
+    positions = torch.as_tensor(pos_np, dtype=tdt)
+    batch = torch.as_tensor(batch_np, dtype=torch.long)
+    center = backend.scatter_mean(positions, batch, dim_size=n_graphs)
+    rel = positions - center[batch]
+    pbc_b = torch.as_tensor(pbc_np, dtype=torch.bool)
+    cells = torch.as_tensor(cells_np, dtype=tdt)
+    safe = torch.where(pbc_b.any(dim=1)[:, None, None], cells, torch.eye(3, dtype=tdt).expand_as(cells))
+    inv_cell = torch.linalg.inv(safe)
+    frac = torch.einsum("ni,nij->nj", rel, inv_cell[batch])
+    return (torch.round(frac) * pbc_b[batch].to(tdt)).numpy().astype(np.float64)
+
+
+def _mlx_torch_pair_images(pos_np, counts_np, cells_np, pbc_np, nmax, tdt) -> np.ndarray:
+    """round(frac) of _minimum_image_pair_matrix per graph, in Torch arithmetic."""
+    out = np.zeros((int(counts_np.shape[0]), nmax, nmax, 3), dtype=np.float64)
+    start = 0
+    for g, count in enumerate(counts_np.tolist()):
+        count = int(count)
+        if count and bool(np.any(pbc_np[g])):
+            pos = torch.as_tensor(pos_np[start:start + count], dtype=tdt)
+            cell = torch.as_tensor(cells_np[g], dtype=tdt)
+            dr = pos[:, None, :] - pos[None, :, :]
+            frac = torch.einsum("ijc,cd->ijd", dr, torch.linalg.inv(cell))
+            periodic = torch.as_tensor(pbc_np[g], dtype=tdt).view(1, 1, 3)
+            out[g, :count, :count] = (torch.round(frac) * periodic).numpy()
+        start += count
+    return out
+
+
+_MLX_HELMERT_CACHE: Dict[Tuple[int, str], np.ndarray] = {}
+
+
+def _mlx_build_dense_layout(counts: np.ndarray, graph_any_pbc: np.ndarray, dtype, dtype_name: str) -> _MLXDenseLayout:
+    n_graphs = int(counts.shape[0])
+    n_atoms = int(counts.sum())
+    nmax = max(2, int(counts.max()) if n_graphs else 2)
+    starts = np.zeros((n_graphs,), dtype=np.int64)
+    if n_graphs > 1:
+        np.cumsum(counts[:-1], out=starts[1:])
+    local = np.arange(nmax)[None, :]
+    valid = local < counts[:, None]
+    index = np.where(valid, starts[:, None] + local, n_atoms).astype(np.int32)
+    flat = np.zeros((n_atoms,), dtype=np.int32)
+    for g in range(n_graphs):
+        c = int(counts[g])
+        flat[starts[g]:starts[g] + c] = g * nmax + np.arange(c)
+    helmert = np.zeros((n_graphs, nmax, nmax - 1), dtype=np.float64)
+    reduced_mask = np.zeros((n_graphs, nmax - 1), dtype=np.float64)
+    for g in range(n_graphs):
+        c = int(counts[g])
+        key = (c, dtype_name)
+        basis = _MLX_HELMERT_CACHE.get(key)
+        if basis is None:
+            basis = _mlx_torch_helmert(c, dtype_name)
+            _MLX_HELMERT_CACHE[key] = basis
+        if c > 1:
+            helmert[g, :c, :c - 1] = basis
+            reduced_mask[g, :c - 1] = 1.0
+    pair = valid[:, :, None] & valid[:, None, :] & (~np.eye(nmax, dtype=bool))[None]
+    np_dtype = np.float64 if dtype == mx.float64 else np.float32
+    eps = float(np.finfo(np_dtype).eps)
+    floor = np.asarray([max(5e-2, 32.0 * float(3 * int(c)) * eps) for c in counts], dtype=np.float64)
+    return _MLXDenseLayout(
+        nmax=nmax,
+        index=mx.array(index, dtype=mx.int32),
+        mask=mx.array(valid.astype(np_dtype), dtype=dtype),
+        flat=mx.array(flat, dtype=mx.int32),
+        counts=counts.copy(),
+        counts_mx=mx.array(counts.astype(np_dtype), dtype=dtype),
+        helmert=mx.array(helmert.astype(np_dtype), dtype=dtype),
+        reduced_mask=mx.array(reduced_mask.astype(np_dtype), dtype=dtype),
+        pair_mask=mx.array(pair.astype(np_dtype), dtype=dtype),
+        graph_any_pbc=graph_any_pbc.copy(),
+        pol_floor=mx.array(floor.astype(np_dtype), dtype=dtype),
+    )
+
+
+def _mlx_to_dense(values: mx.array, layout: _MLXDenseLayout, fill: float = 0.0) -> mx.array:
+    pad_shape = (1,) + tuple(values.shape[1:])
+    padded = mx.concatenate([values, mx.full(pad_shape, fill, dtype=values.dtype)], axis=0)
+    return mx.take(padded, layout.index.reshape(-1), axis=0).reshape(
+        (int(layout.index.shape[0]), layout.nmax) + tuple(values.shape[1:])
+    )
+
+
+def _mlx_from_dense(values: mx.array, layout: _MLXDenseLayout) -> mx.array:
+    flat = values.reshape((-1,) + tuple(values.shape[2:]))
+    return mx.take(flat, layout.flat, axis=0)
+
+
+# --------------------------------------------------------------------------
+# MLX engine: the E3-miu-GNN model family in MLX.
+#
+# MLX mirror of the E3-miu-GNN Torch model family.
+#
+# Every function here ports one Torch module or method line by line.
+# Parameters and buffers are read by their Torch
+# ``state_dict``/``named_buffers`` names from a flat dict ``P``, so
+# checkpoints map one to one and values (including non-persistent buffers
+# such as ``st_basis``) are bit-identical to the Torch module the frontend
+# loaded.
+#
+# Batched per-graph solvers (QEq, polarization) use a padded dense layout;
+# padded rows are parked on a large diagonal so they never mix with real
+# atoms, which reproduces the per-graph Torch loops exactly while running as
+# one batch.
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# MLX engine: nn.
+# --------------------------------------------------------------------------
+def _mlx_linear(P: Dict[str, mx.array], name: str, x: mx.array) -> mx.array:
+    weight = P[name + ".weight"]
+    bias = P.get(name + ".bias")
+    if bias is None:
+        return x @ weight.T
+    if x.ndim == 2:
+        return mx.addmm(bias, x, weight.T)
+    return x @ weight.T + bias
+
+
+def _mlx_mlp(P, name: str, x: mx.array) -> mx.array:
+    """Sequential(Linear, SiLU, Linear) as used by every head in the model."""
+    return _mlx_linear(P, name + ".2", _mlx_silu(_mlx_linear(P, name + ".0", x)))
+
+
+def _mlx_layer_norm(P, name: str, x: mx.array, eps: float = 1e-5) -> mx.array:
+    return _mlx_fast_layer_norm(x, P[name + ".weight"], P[name + ".bias"], eps)
+
+
+def _mlx_channel_linear(P, name: str, v: mx.array) -> mx.array:
+    """Linear over the channel axis of (N, H, 3): Torch's permute-linear-permute."""
+    return P[name + ".weight"] @ v
+
+
+# --------------------------------------------------------------------------
+# MLX engine: structure.
+# --------------------------------------------------------------------------
+@dataclass
+class _MLXCoreSpec:
+    prefix: str
+    o3: bool
+    use_l3: bool
+    num_layers: int
+    hidden: int
+    r_max: float
+    rbf_kind: str  # gaussian | trainable | bessel
+    enable_film: bool
+    element_encoder: Optional[Dict[str, Any]] = None
+    n_chunks: int = 10
+
+
+@dataclass
+class _MLXModelSpec:
+    mixed: bool
+    hidden: int
+    ground: _MLXCoreSpec
+    response: _MLXCoreSpec
+    has_wavefunction: bool
+    waloss_dim: int
+    alpha_factor: float
+    field_scale: float
+    qeq_hardness_min: float
+    enable_film: bool
+    enable_qeq: bool
+    enable_pme: bool
+    enable_deq: bool
+    enable_d4: bool
+    enable_spin: bool
+    enable_dmi: bool
+    coupling_iterations: int
+    coupling_tol: float
+    qeq: Optional[Dict[str, float]] = None
+    deq: Optional[Dict[str, float]] = None
+    spin: Optional[Dict[str, float]] = None
+    d4_functional: str = "pbe"
+
+
+def _mlx_core_spec(core: Any, prefix: str) -> _MLXCoreSpec:
+    name = type(core).__name__
+    o3 = name.endswith("O3") or hasattr(core, "use_l3")
+    use_l3 = bool(getattr(core, "use_l3", False))
+    rbf_name = type(core.rbf).__name__
+    rbf_kind = {"GaussianRBF": "gaussian", "TrainableGaussianRBF": "trainable", "BesselRBF": "bessel"}.get(rbf_name)
+    if rbf_kind is None:
+        raise NotImplementedError(f"MLX engine does not support radial basis {rbf_name}")
+    encoder = getattr(core, "element_encoder", None)
+    encoder_spec = None
+    if encoder is not None:
+        encoder_spec = dict(
+            max_z=int(encoder.max_z), aug_prob=float(encoder.aug_prob),
+            aug_noise_std=float(encoder.aug_noise_std), aug_mix_max=float(encoder.aug_mix_max),
+        )
+    return _MLXCoreSpec(
+        prefix=prefix,
+        o3=bool(o3),
+        use_l3=use_l3,
+        num_layers=len(core.layers),
+        hidden=int(core.hidden),
+        r_max=float(core.r_max),
+        rbf_kind=rbf_kind,
+        enable_film=bool(getattr(core, "enable_film", False)) and len(getattr(core, "film_layers", [])) > 0,
+        element_encoder=encoder_spec,
+        n_chunks=(18 if use_l3 else 12) if o3 else 10,
+    )
+
+
+def _mlx_spec_from_torch(model: Any) -> _MLXModelSpec:
+    cfg = model.cfg
+    mixed = type(model).__name__ == "MixedGranularityE3GNN" or hasattr(model, "spin_layer")
+    unit = str(getattr(cfg, "polarizability_unit", "angstrom3")).lower()
+    spec = _MLXModelSpec(
+        mixed=bool(mixed),
+        hidden=int(cfg.num_channels),
+        ground=_mlx_core_spec(model.ground.core, "ground.core"),
+        response=_mlx_core_spec(model.response.core, "response.core"),
+        has_wavefunction=getattr(model, "wavefunction_head", None) is not None,
+        waloss_dim=int(getattr(cfg, "waloss_dim", 0) or 0),
+        alpha_factor=ALPHA_VOLUME_TO_EV_PER_FIELD2 if unit == "angstrom3" else 1.0,
+        field_scale=float(cfg.field_scale),
+        qeq_hardness_min=float(getattr(cfg, "qeq_hardness_min", 0.25)),
+        enable_film=bool(getattr(cfg, "enable_film", False)),
+        enable_qeq=bool(getattr(cfg, "enable_qeq", False)),
+        enable_pme=bool(getattr(cfg, "enable_pme", False)),
+        enable_deq=bool(getattr(cfg, "enable_deq", False)),
+        enable_d4=bool(getattr(cfg, "enable_d4", False)),
+        enable_spin=bool(getattr(cfg, "enable_spin", False)),
+        enable_dmi=bool(getattr(cfg, "enable_dmi", False)),
+        coupling_iterations=int(getattr(cfg, "coupling_iterations", 2)),
+        coupling_tol=float(getattr(cfg, "coupling_tol", 1e-5)),
+        d4_functional=str(getattr(cfg, "d4_functional", "pbe")),
+    )
+    if mixed and getattr(model, "qeq", None) is not None:
+        q = model.qeq
+        spec.qeq = dict(
+            smearing=float(q.smearing), use_pme=bool(q.use_pme), pme_smearing=float(q.pme_smearing),
+            pme_lr_wavelength=float(q.pme_lr_wavelength), stability_floor=float(q.stability_floor),
+        )
+    if mixed and getattr(model, "polarization_solver", None) is not None:
+        d = model.polarization_solver
+        spec.deq = dict(damping=float(d.damping), alpha_max=float(d.alpha_max), smearing=float(d.smearing))
+    if mixed and getattr(model, "spin_layer", None) is not None:
+        s = model.spin_layer
+        spec.spin = dict(hidden=int(s.hidden), spin_cutoff=float(s.spin_cutoff), enable_dmi=bool(s.enable_dmi))
+    return spec
+
+
+# --------------------------------------------------------------------------
+# MLX engine: forward state.
+# --------------------------------------------------------------------------
+@dataclass
+class _MLXCtx:
+    P: Dict[str, mx.array]
+    X: _MLXGraphInputs
+    spec: _MLXModelSpec
+    dtype: Any
+    st_basis: mx.array
+    st3_basis: Optional[mx.array]
+    aug_provider: Optional[Callable[[str, int, int], Dict[str, mx.array]]] = None
+    aug_cursor: Dict[str, int] = field(default_factory=dict)
+    d4_bridge: Any = None
+    allow_host_sync: bool = True
+    stats: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _MLXGeometry:
+    pos: mx.array
+    cells: mx.array
+    shifts: mx.array
+    edge_vec: mx.array
+    r: mx.array
+    u: mx.array
+    bu: mx.array   # (E, 5, 3)  sum_d B[k,c,d] u_d
+    uu: mx.array   # (E, 5)
+    cutoff: Dict[float, mx.array]
+    l3: Optional[Dict[str, mx.array]] = None
+
+
+def _mlx_make_geometry(ctx: _MLXCtx, pos: mx.array, cells: mx.array, shifts: mx.array) -> _MLXGeometry:
+    X = ctx.X
+    edge_vec = mx.take(pos, X.dst, axis=0) + shifts - mx.take(pos, X.src, axis=0)
+    r = _mlx_clamp(mx.sqrt(mx.sum(edge_vec * edge_vec, axis=-1)), lo=1e-12)
+    u = edge_vec / (r[:, None] + 1e-12)
+    basis = ctx.st_basis
+    bu = mx.einsum("kcd,ed->ekc", basis, u)
+    uu = mx.sum(bu * u[:, None, :], axis=-1)
+    geo = _MLXGeometry(pos=pos, cells=cells, shifts=shifts, edge_vec=edge_vec, r=r, u=u, bu=bu, uu=uu, cutoff=dict())
+    if ctx.st3_basis is not None and (ctx.spec.ground.use_l3 or ctx.spec.response.use_l3):
+        b3 = ctx.st3_basis
+        b3u = mx.einsum("mabc,ec->emab", b3, u)        # (E,7,3,3)
+        b3uu = mx.einsum("emab,eb->ema", b3u, u)       # (E,7,3)
+        uuu = mx.sum(b3uu * u[:, None, :], axis=-1)    # (E,7)
+        c_mk = mx.einsum("emab,kab->emk", b3u, basis)         # (E,7,5)
+        geo.l3 = dict(b3uu=b3uu, uuu=uuu, c_mk=c_mk)
+    return geo
+
+
+def _mlx_cosine_cutoff(geo: _MLXGeometry, r_max: float) -> mx.array:
+    key = float(r_max)
+    cached = geo.cutoff.get(key)
+    if cached is None:
+        x = geo.r / max(1e-12, key)
+        out = 0.5 * (_mlx_cos(math.pi * x) + 1.0)
+        cached = out * (x < 1.0).astype(out.dtype)
+        geo.cutoff[key] = cached
+    return cached
+
+
+def _mlx_radial_basis(P, prefix: str, kind: str, r: mx.array, r_max: float) -> mx.array:
+    if kind == "gaussian":
+        diff = r[:, None] - P[prefix + ".centers"][None, :]
+        return _mlx_exp(-P[prefix + ".gamma"] * diff * diff)
+    if kind == "trainable":
+        centers = _mlx_clamp(P[prefix + ".centers"], 0.0, float(r_max))
+        gamma = _mlx_clamp(_mlx_softplus(P[prefix + "._gamma_unconstrained"]), lo=1e-12)
+        diff = r[:, None] - centers[None, :]
+        return _mlx_exp(-gamma[None, :] * diff * diff)
+    rr = _mlx_clamp(r, lo=1e-12)
+    x = rr[:, None] * P[prefix + ".freq"][None, :]
+    return P[prefix + ".norm"] * _mlx_sin(x) / rr[:, None]
+
+
+# --------------------------------------------------------------------------
+# MLX engine: blocks.
+# --------------------------------------------------------------------------
+def _mlx_gate(x: mx.array) -> mx.array:
+    return _mlx_smooth_scalar_bound(x)[..., None]
+
+
+def _mlx_block_so3(ctx: _MLXCtx, prefix: str, s, v, t, geo: _MLXGeometry, rbf, cutoff):
+    P, X = ctx.P, ctx.X
+    seg = X.edge_seg
+    src_dst = X.dst
+    s_j = mx.take(s, src_dst, axis=0)
+    v_j = mx.take(v, src_dst, axis=0)
+    t_j = mx.take(t, src_dst, axis=0)
+    w = _mlx_mlp(P, prefix + ".filter", rbf) * cutoff[:, None]
+    w_ss, w_sd, w_sq, w_vv, w_vs, w_vc, w_vt, w_tt, w_tu, w_tv = mx.split(w, 10, axis=-1)
+    u = geo.u
+    u_b = u[:, None, :]
+    dot_vu = mx.sum(v_j * u_b, axis=-1)
+    quad_t = mx.sum(t_j * geo.uu[:, None, :], axis=-1)
+    msg_s = w_ss * s_j + w_sd * dot_vu + w_sq * quad_t
+    cross_vu = _mlx_xcross(v_j, u_b)
+    t_u = t_j @ geo.bu
+    msg_v = w_vv[..., None] * v_j + (w_vs * s_j)[..., None] * u_b + w_vc[..., None] * cross_vu + w_vt[..., None] * t_u
+    vu_l2 = v_j @ mx.swapaxes(geo.bu, 1, 2)
+    msg_t = w_tt[..., None] * t_j + (w_tu * s_j)[..., None] * geo.uu[:, None, :] + w_tv[..., None] * vu_l2
+    agg_s = seg.mean(msg_s)
+    agg_v = seg.mean(msg_v)
+    agg_t = seg.mean(msg_t)
+    x = mx.concatenate([s, agg_s, mx.sum(v * v, axis=-1), mx.sum(t * t, axis=-1)], axis=-1)
+    ds, gate_v, gate_t, gate_self = mx.split(_mlx_mlp(P, prefix + ".update", x), 4, axis=-1)
+    s_new = _mlx_layer_norm(P, prefix + ".norm", s + ds)
+    self_vec = _mlx_xcross(_mlx_channel_linear(P, prefix + ".self_v_a", v), _mlx_channel_linear(P, prefix + ".self_v_b", v))
+    v_new = _mlx_smooth_equivariant_bound(v + _mlx_gate(gate_v) * agg_v + _mlx_gate(gate_self) * self_vec)
+    t_new = _mlx_smooth_equivariant_bound(t + _mlx_gate(gate_t) * agg_t)
+    t_norm = mx.sqrt(mx.sum(t_new * t_new, axis=-1) + 1e-12)
+    t_gate = _mlx_smooth_scalar_bound(_mlx_silu(_mlx_linear(P, prefix + ".t_act_s", s_new) + _mlx_linear(P, prefix + ".t_act_norm", t_norm)))
+    t_new = _mlx_smooth_equivariant_bound(t_new * t_gate[..., None])
+    return s_new, v_new, t_new
+
+
+def _mlx_block_o3(ctx: _MLXCtx, prefix: str, use_l3: bool, s, v, a, t2, t3, geo: _MLXGeometry, rbf, cutoff):
+    P, X = ctx.P, ctx.X
+    seg = X.edge_seg
+    dst = X.dst
+    s_j = mx.take(s, dst, axis=0)
+    v_j = mx.take(v, dst, axis=0)
+    a_j = mx.take(a, dst, axis=0)
+    t2_j = mx.take(t2, dst, axis=0)
+    n_chunks = 18 if use_l3 else 12
+    w = _mlx_mlp(P, prefix + ".filter", rbf) * cutoff[:, None]
+    chunks = mx.split(w, n_chunks, axis=-1)
+    w_ss, w_sd, w_sq2 = chunks[0], chunks[1], chunks[2]
+    off = 3
+    w_sq3 = None
+    if use_l3:
+        w_sq3 = chunks[3]
+        off = 4
+    w_vv, w_vs, w_vt, w_va = chunks[off], chunks[off + 1], chunks[off + 2], chunks[off + 3]
+    off2 = off + 4
+    w_v3 = None
+    if use_l3:
+        w_v3 = chunks[off2]
+        off2 += 1
+    w_aa, w_av = chunks[off2], chunks[off2 + 1]
+    off3 = off2 + 2
+    w_t2t, w_t2u, w_t2v = chunks[off3], chunks[off3 + 1], chunks[off3 + 2]
+    off4 = off3 + 3
+    w_t2_3u = w_t3t = w_t3u3 = w_t3t2u = None
+    if use_l3:
+        w_t2_3u = chunks[off4]
+        off4 += 1
+        w_t3t, w_t3u3, w_t3t2u = chunks[off4], chunks[off4 + 1], chunks[off4 + 2]
+
+    u = geo.u
+    u_b = u[:, None, :]
+    dot_vu = mx.sum(v_j * u_b, axis=-1)
+    quad_t2 = mx.sum(t2_j * geo.uu[:, None, :], axis=-1)
+    msg_s = w_ss * s_j + w_sd * dot_vu + w_sq2 * quad_t2
+    t3_j = None
+    if use_l3:
+        t3_j = mx.take(t3, dst, axis=0)
+        quad_t3 = mx.sum(t3_j * geo.l3["uuu"][:, None, :], axis=-1)
+        msg_s = msg_s + w_sq3 * quad_t3
+
+    t2_u = t2_j @ geo.bu
+    cross_au = _mlx_xcross(a_j, u_b)
+    msg_v = (
+        w_vv[..., None] * v_j
+        + (w_vs * s_j)[..., None] * u_b
+        + w_vt[..., None] * t2_u
+        + w_va[..., None] * cross_au
+    )
+    if use_l3:
+        msg_v = msg_v + w_v3[..., None] * (t3_j @ geo.l3["b3uu"])
+
+    cross_vu = _mlx_xcross(v_j, u_b)
+    msg_a = w_aa[..., None] * a_j + w_av[..., None] * cross_vu
+
+    vu_l2 = v_j @ mx.swapaxes(geo.bu, 1, 2)
+    msg_t2 = (
+        w_t2t[..., None] * t2_j
+        + (w_t2u * s_j)[..., None] * geo.uu[:, None, :]
+        + w_t2v[..., None] * vu_l2
+    )
+    msg_t3 = None
+    if use_l3:
+        msg_t2 = msg_t2 + w_t2_3u[..., None] * (t3_j @ geo.l3["c_mk"])
+        t2u_l3 = t2_j @ mx.swapaxes(geo.l3["c_mk"], 1, 2)
+        msg_t3 = (
+            w_t3t[..., None] * t3_j
+            + (w_t3u3 * s_j)[..., None] * geo.l3["uuu"][:, None, :]
+            + w_t3t2u[..., None] * t2u_l3
+        )
+
+    agg_s = seg.mean(msg_s)
+    agg_v = seg.mean(msg_v)
+    agg_a = seg.mean(msg_a)
+    agg_t2 = seg.mean(msg_t2)
+    v2 = mx.sum(v * v, axis=-1)
+    a2 = mx.sum(a * a, axis=-1)
+    t2n = mx.sum(t2 * t2, axis=-1)
+    if use_l3:
+        agg_t3 = seg.mean(msg_t3)
+        t3n = mx.sum(t3 * t3, axis=-1)
+        x = mx.concatenate([s, agg_s, v2, a2, t2n, t3n], axis=-1)
+        ds, gate_v, gate_a, gate_t2, gate_self_a, gate_t3 = mx.split(_mlx_mlp(P, prefix + ".update", x), 6, axis=-1)
+    else:
+        x = mx.concatenate([s, agg_s, v2, a2, t2n], axis=-1)
+        ds, gate_v, gate_a, gate_t2, gate_self_a = mx.split(_mlx_mlp(P, prefix + ".update", x), 5, axis=-1)
+
+    s_new = _mlx_layer_norm(P, prefix + ".norm", s + ds)
+    self_ax = _mlx_xcross(_mlx_channel_linear(P, prefix + ".self_v_a", v), _mlx_channel_linear(P, prefix + ".self_v_b", v))
+    v_new = _mlx_smooth_equivariant_bound(v + _mlx_gate(gate_v) * agg_v)
+    a_new = _mlx_smooth_equivariant_bound(a + _mlx_gate(gate_a) * agg_a + _mlx_gate(gate_self_a) * self_ax)
+    t2_new = _mlx_smooth_equivariant_bound(t2 + _mlx_gate(gate_t2) * agg_t2)
+    t2_norm = mx.sqrt(mx.sum(t2_new * t2_new, axis=-1) + 1e-12)
+    t2_gate = _mlx_smooth_scalar_bound(_mlx_silu(_mlx_linear(P, prefix + ".t2_act_s", s_new) + _mlx_linear(P, prefix + ".t2_act_norm", t2_norm)))
+    t2_new = _mlx_smooth_equivariant_bound(t2_new * t2_gate[..., None])
+    t3_new = None
+    if use_l3:
+        t3_new = _mlx_smooth_equivariant_bound(t3 + _mlx_gate(gate_t3) * agg_t3)
+        t3_norm = mx.sqrt(mx.sum(t3_new * t3_new, axis=-1) + 1e-12)
+        t3_gate = _mlx_smooth_scalar_bound(_mlx_silu(_mlx_linear(P, prefix + ".t3_act_s", s_new) + _mlx_linear(P, prefix + ".t3_act_norm", t3_norm)))
+        t3_new = _mlx_smooth_equivariant_bound(t3_new * t3_gate[..., None])
+    return s_new, v_new, a_new, t2_new, t3_new
+
+
+# --------------------------------------------------------------------------
+# MLX engine: cores.
+# --------------------------------------------------------------------------
+def _mlx_element_encoder(ctx: _MLXCtx, prefix: str, spec: Dict[str, Any], z: mx.array) -> mx.array:
+    P = ctx.P
+    max_z = int(spec["max_z"])
+    idx = mx.clip(z, 1, max_z) - 1
+    table = P[prefix + ".prop_matrix"]
+    phys = mx.take(table, idx, axis=0)
+    if ctx.aug_provider is not None and spec["aug_prob"] > 0.0:
+        draw = ctx.aug_provider(prefix, int(phys.shape[0]), max_z)
+        if draw is not None:
+            mask = draw["mask"]
+            if spec["aug_mix_max"] > 0.0:
+                phys2 = mx.take(table, draw["idx2"], axis=0)
+                lam = draw["lam"]
+                keep = draw["one_minus_lam"] if "one_minus_lam" in draw else 1.0 - lam
+                phys = mx.where(mask, keep * phys + lam * phys2, phys)
+            if spec["aug_noise_std"] > 0.0:
+                phys = mx.where(mask, phys + draw["noise"], phys)
+    hidden = _mlx_mlp(P, prefix + ".encoder", phys.astype(table.dtype))
+    return _mlx_layer_norm(P, prefix + ".encoder.3", hidden)
+
+
+def _mlx_core_embedding(ctx: _MLXCtx, spec: _MLXCoreSpec) -> mx.array:
+    P, X = ctx.P, ctx.X
+    if spec.element_encoder is not None:
+        if X.atomic_numbers is not None:
+            z = X.atomic_numbers
+        else:
+            zs = P[spec.prefix + ".type_zs"]
+            if X.atom_types is not None:
+                idx = mx.clip(X.atom_types, 0, int(zs.shape[0]) - 1)
+            else:
+                idx = mx.clip(mx.argmax(X.node_attrs, axis=-1).astype(mx.int32), 0, int(zs.shape[0]) - 1)
+            z = mx.take(zs, idx, axis=0).astype(mx.int32)
+        return _mlx_element_encoder(ctx, spec.prefix + ".element_encoder", spec.element_encoder, z)
+    weight = P[spec.prefix + ".embed.weight"]
+    if X.atom_types is not None:
+        return mx.take(weight.T, X.atom_types, axis=0)
+    if X.node_attrs is not None:
+        return X.node_attrs @ weight.T
+    raise ValueError("The core requires atom_types, node_attrs, or atomic_numbers")
+
+
+def _mlx_run_core(ctx: _MLXCtx, spec: _MLXCoreSpec, geo: _MLXGeometry, film_condition=None, film_activity=None):
+    P = ctx.P
+    n = ctx.X.n_atoms
+    H = spec.hidden
+    dtype = ctx.dtype
+    rbf = _mlx_radial_basis(P, spec.prefix + ".rbf", spec.rbf_kind if spec.o3 else "gaussian", geo.r, spec.r_max)
+    cutoff = _mlx_cosine_cutoff(geo, spec.r_max)
+    s = _mlx_core_embedding(ctx, spec)
+    v = mx.zeros((n, H, 3), dtype=dtype)
+    if not spec.o3:
+        t = mx.zeros((n, H, 5), dtype=dtype)
+        for layer in range(spec.num_layers):
+            s, v, t = _mlx_block_so3(ctx, f"{spec.prefix}.layers.{layer}", s, v, t, geo, rbf, cutoff)
+        return dict(s=s, v=v, a=None, t2=t, t3=None)
+    a = mx.zeros((n, H, 3), dtype=dtype)
+    t2 = mx.zeros((n, H, 5), dtype=dtype)
+    t3 = mx.zeros((n, H, 7), dtype=dtype) if spec.use_l3 else None
+    for layer in range(spec.num_layers):
+        if spec.enable_film and film_condition is not None:
+            film_values = _mlx_linear(P, f"{spec.prefix}.film_layers.{layer}", film_condition)
+            if film_activity is not None:
+                film_values = film_values * film_activity
+            gamma_s, beta_s, gamma_tensor = mx.split(film_values, 3, axis=-1)
+            gamma_s = 0.25 * mx.tanh(gamma_s)
+            beta_s = _mlx_smooth_scalar_bound(beta_s, max_abs=5.0)
+            gamma_tensor = 0.25 * mx.tanh(gamma_tensor)
+            s = s * (1.0 + gamma_s) + beta_s
+            gate = (1.0 + gamma_tensor)[..., None]
+            v = v * gate
+            a = a * gate
+            t2 = t2 * gate
+            if t3 is not None:
+                t3 = t3 * gate
+        s, v, a, t2, t3 = _mlx_block_o3(ctx, f"{spec.prefix}.layers.{layer}", spec.use_l3, s, v, a, t2, t3, geo, rbf, cutoff)
+    return dict(s=s, v=v, a=a, t2=t2, t3=t3)
+
+
+# --------------------------------------------------------------------------
+# MLX engine: ground/response.
+# --------------------------------------------------------------------------
+def _mlx_ground_forward(ctx: _MLXCtx, geo: _MLXGeometry, film_condition=None, film_activity=None):
+    P, X = ctx.P, ctx.X
+    feats = _mlx_run_core(ctx, ctx.spec.ground, geo, film_condition, film_activity)
+    e_atom = _mlx_mlp(P, "ground.energy_head", feats["s"])[:, 0]
+    e_atom = e_atom + mx.take(P["ground.atomic_energies"], X.atom_types, axis=0)
+    return X.graph_seg.sum(e_atom), e_atom
+
+
+def _mlx_response_components(ctx: _MLXCtx, geo: _MLXGeometry, film_condition=None, film_activity=None):
+    P, X = ctx.P, ctx.X
+    spec = ctx.spec
+    feats = _mlx_run_core(ctx, spec.response, geo, film_condition, film_activity)
+    s, v, t = feats["s"], feats["v"], feats["t2"]
+    q = _mlx_mlp(P, "response.q_head", s)[:, 0]
+    w_mu = mx.tanh(_mlx_mlp(P, "response.mu_gate", s))
+    atomic_dipoles = mx.sum(w_mu[..., None] * v, axis=1)
+    alpha_raw = _mlx_mlp(P, "response.alpha_iso_head", s)[:, 0]
+    alpha_iso = _mlx_softplus(alpha_raw)
+    w_a = _mlx_mlp(P, "response.alpha_aniso_gate", s)
+    alpha_l2 = mx.sum(w_a[..., None] * t, axis=1)
+    basis = P.get("response.st_basis", ctx.st_basis)
+    alpha_aniso = (alpha_l2 @ basis.reshape(5, 9)).reshape(-1, 3, 3)
+    eye = mx.eye(3, dtype=ctx.dtype)
+    atomic_alpha = alpha_iso[:, None, None] * eye[None] + alpha_aniso
+    atomic_alpha = 0.5 * (atomic_alpha + mx.swapaxes(atomic_alpha, -1, -2))
+    alpha = X.graph_seg.sum(atomic_alpha)
+    hardness = _mlx_softplus(_mlx_mlp(P, "response.hardness_head", s)[:, 0]) + spec.qeq_hardness_min
+    axial = feats["a"] if feats["a"] is not None else mx.zeros_like(v)
+    return dict(
+        raw_charges=q,
+        atomic_dipoles=atomic_dipoles,
+        atomic_polarizability=atomic_alpha,
+        polarizability=alpha,
+        chi=_mlx_mlp(P, "response.chi_head", s)[:, 0],
+        hardness=hardness,
+        c6_scale=_mlx_softplus(_mlx_mlp(P, "response.c6_scale_head", s)[:, 0]),
+        scalar_features=s,
+        polar_features=v,
+        tensor_features=t,
+        axial_features=axial,
+    )
+
+
+def _mlx_wavefunction_forward(ctx: _MLXCtx, scalar_features: mx.array) -> mx.array:
+    P, X = ctx.P, ctx.X
+    pooled = X.graph_seg.mean(scalar_features)
+    packed = _mlx_mlp(P, "wavefunction_head.readout", pooled)
+    basis = P["wavefunction_head.symmetric_basis"].astype(packed.dtype)
+    k = int(basis.shape[-1])
+    return (packed @ basis.reshape(int(basis.shape[0]), k * k)).reshape(-1, k, k)
+
+
+def _mlx_minimal_image_rel(ctx: _MLXCtx, pos: mx.array, cells: mx.array, center: mx.array) -> mx.array:
+    X = ctx.X
+    rel = pos - mx.take(center, X.batch, axis=0)
+    if not X.any_pbc:
+        return rel
+    if X.center_image is not None:
+        return rel - mx.einsum("ni,nij->nj", X.center_image, mx.take(cells, X.batch, axis=0))
+    eye = mx.eye(3, dtype=ctx.dtype)
+    safe = mx.where(X.gpbc[:, None, None], cells, eye[None])
+    inv = mx.stop_gradient(_mlx_inv3(safe))
+    inv_a = mx.take(inv, X.batch, axis=0)
+    frac = mx.einsum("ni,nij->nj", rel, inv_a)
+    pbc_a = mx.take(X.pbc, X.batch, axis=0)
+    shift = mx.stop_gradient(mx.round(frac) * pbc_a)
+    return rel - mx.einsum("ni,nij->nj", shift, mx.take(cells, X.batch, axis=0))
+
+
+# --------------------------------------------------------------------------
+# MLX engine: QEq / PME.
+# --------------------------------------------------------------------------
+def _mlx_dense_pair_vectors(ctx: _MLXCtx, pos_d: mx.array, cells: mx.array) -> mx.array:
+    X = ctx.X
+    dr = pos_d[:, :, None, :] - pos_d[:, None, :, :]
+    if not X.any_pbc:
+        return dr
+    if X.pair_image is not None:
+        return dr - mx.einsum("bijd,bde->bije", X.pair_image, cells)
+    eye = mx.eye(3, dtype=ctx.dtype)
+    any_pbc = X.gpbc
+    safe = mx.where(any_pbc[:, None, None], cells, eye[None])
+    inv = mx.stop_gradient(_mlx_inv3(safe))
+    frac = mx.einsum("bijc,bcd->bijd", dr, inv)
+    shift = mx.stop_gradient(mx.round(frac) * X.pbc[:, None, None, :])
+    return dr - mx.einsum("bijd,bde->bije", shift, cells)
+
+
+def _mlx_ewald_tables(ctx: _MLXCtx, lr_wavelength: float):
+    """Host k-grid metadata matching torchpme.EwaldCalculator for each graph."""
+    key = "ewald:%r" % float(lr_wavelength)
+    cached = ctx.X.extras.get(key)
+    if cached is not None:
+        return cached
+    X = ctx.X
+    tdt = torch.float64 if ctx.dtype == mx.float64 else torch.float32
+    k_cutoff = 2 * torch.pi / float(lr_wavelength)
+    per_graph = []
+    for g in range(X.n_graphs):
+        if not X.graph_any_pbc[g]:
+            per_graph.append(None)
+            continue
+        cell = torch.as_tensor(X.cells_np[g], dtype=tdt)
+        basis_norms = torch.linalg.norm(cell, dim=1)
+        ns = torch.ceil(k_cutoff * basis_norms / 2 / torch.pi).long()
+        fx = torch.fft.fftfreq(int(ns[0]), dtype=tdt)
+        fy = torch.fft.fftfreq(int(ns[1]), dtype=tdt)
+        fz = torch.fft.fftfreq(int(ns[2]), dtype=tdt)
+        gx, gy, gz = torch.meshgrid(fx, fy, fz, indexing="ij")
+        per_graph.append((ns.to(tdt).numpy(), gx.reshape(-1).numpy(), gy.reshape(-1).numpy(), gz.reshape(-1).numpy()))
+    kmax = max([1] + [len(item[1]) for item in per_graph if item is not None])
+    np_dtype = np.float64 if ctx.dtype == mx.float64 else np.float32
+    ns_all = np.ones((X.n_graphs, 3), dtype=np_dtype)
+    f_all = np.zeros((3, X.n_graphs, kmax), dtype=np_dtype)
+    for g, item in enumerate(per_graph):
+        if item is None:
+            continue
+        ns_all[g] = item[0]
+        for axis in range(3):
+            f_all[axis, g, : len(item[axis + 1])] = item[axis + 1]
+    periodic_count = X.pbc_np.sum(axis=1)
+    slab_axis = np.zeros((X.n_graphs,), dtype=np.int32)
+    for g in range(X.n_graphs):
+        if periodic_count[g] == 2:
+            slab_axis[g] = int(np.argmax((~X.pbc_np[g]).astype(np.int64)))
+    tables = dict(
+        ns=mx.array(ns_all, dtype=ctx.dtype),
+        fx=mx.array(f_all[0], dtype=ctx.dtype),
+        fy=mx.array(f_all[1], dtype=ctx.dtype),
+        fz=mx.array(f_all[2], dtype=ctx.dtype),
+        is_2d=mx.array(periodic_count == 2),
+        slab_axis=mx.array(slab_axis, dtype=mx.int32),
+        any_2d=bool(np.any(periodic_count == 2)),
+    )
+    X.extras[key] = tables
+    return tables
+
+
+def _mlx_ewald_kernel(ctx: _MLXCtx, pos_d, cells, dr, mask, pair_mask, smearing: float, lr_wavelength: float) -> mx.array:
+    """Unit-charge response matrix of torchpme.EwaldCalculator(CoulombPotential)."""
+    X = ctx.X
+    dtype = ctx.dtype
+    prefactor = COULOMB_EV_ANGSTROM
+    sigma = float(smearing)
+    eye3 = mx.eye(3, dtype=dtype)
+    any_pbc = X.gpbc
+    safe_cells = mx.where(any_pbc[:, None, None], cells, eye3[None])
+    n = int(pos_d.shape[1])
+    # real space, half neighbor list i < j with distances clamped at 1e-10
+    upper = mx.array(np.triu(np.ones((n, n), dtype=bool), k=1))
+    listed = mx.logical_and(upper[None], pair_mask > 0)
+    # Only listed (i < j, real) pairs enter the norm, as in torchpme's half list;
+    # the dummy value 1 keeps sqrt differentiable on the diagonal and padding.
+    r2_listed = mx.where(listed, mx.sum(dr * dr, axis=-1), mx.ones_like(pair_mask))
+    dist = _mlx_clamp(mx.sqrt(r2_listed), lo=1e-10)
+    bare = prefactor * (1.0 / _mlx_clamp(dist, lo=1e-15)) - prefactor * (
+        _mlx_erf(dist / sigma / 2.0 ** 0.5) / _mlx_clamp(dist, lo=1e-12)
+    )
+    half = mx.where(listed, bare, mx.zeros_like(bare))
+    rspace = 0.5 * (half + mx.swapaxes(half, 1, 2))
+    # reciprocal space
+    tables = _mlx_ewald_tables(ctx, lr_wavelength)
+    reciprocal = 2 * math.pi * mx.swapaxes(_mlx_inv3(safe_cells), 1, 2)
+    ns = tables["ns"]
+    bx = reciprocal[:, 0, :] * ns[:, 0:1]
+    by = reciprocal[:, 1, :] * ns[:, 1:2]
+    bz = reciprocal[:, 2, :] * ns[:, 2:3]
+    kvec = (
+        tables["fx"][..., None] * bx[:, None, :]
+        + tables["fy"][..., None] * by[:, None, :]
+        + tables["fz"][..., None] * bz[:, None, :]
+    )
+    k_sq = mx.sum(kvec * kvec, axis=-1)
+    zero_k = k_sq == 0
+    masked = mx.where(zero_k, mx.ones_like(k_sq), k_sq)
+    green = prefactor * mx.where(zero_k, mx.zeros_like(k_sq), 4 * math.pi * _mlx_exp(-0.5 * sigma ** 2 * masked) / masked)
+    trig = kvec @ mx.swapaxes(pos_d, 1, 2)
+    cos_t = _mlx_cos(trig)
+    sin_t = _mlx_sin(trig)
+    energy = mx.swapaxes(cos_t, 1, 2) @ (green[..., None] * cos_t) + mx.swapaxes(sin_t, 1, 2) @ (green[..., None] * sin_t)
+    volume = mx.abs(_mlx_det3(safe_cells))
+    energy = energy / volume[:, None, None]
+    self_term = prefactor * (2 / math.pi) ** 0.5 / sigma
+    energy = energy - self_term * mx.eye(n, dtype=dtype)[None]
+    background = prefactor * math.pi * sigma ** 2
+    energy = energy - (2 * background * (1.0 / volume))[:, None, None]
+    if tables["any_2d"]:
+        axis = tables["slab_axis"]
+        onehot = (mx.arange(3)[None, :] == axis[:, None]).astype(dtype)
+        z = mx.sum(pos_d * onehot[:, None, :], axis=-1)
+        basis_len = mx.sum(mx.sqrt(mx.sum(safe_cells * safe_cells, axis=-1)) * onehot, axis=-1)
+        slab = (4.0 * math.pi / volume)[:, None, None] * (
+            z[:, :, None] * z[:, None, :]
+            - 0.5 * (z[:, None, :] ** 2 + z[:, :, None] ** 2)
+            - (basis_len ** 2 / 12.0)[:, None, None]
+        )
+        energy = energy + prefactor * mx.where(tables["is_2d"][:, None, None], slab, mx.zeros_like(slab))
+    energy = energy / 2
+    both = mask[:, :, None] * mask[:, None, :]
+    kernel = (rspace + energy) * both
+    return 0.5 * (kernel + mx.swapaxes(kernel, 1, 2))
+
+
+def _mlx_qeq_forward(ctx: _MLXCtx, chi, hardness, pos, cells, field_g, total_charge):
+    X = ctx.X
+    cfg = ctx.spec.qeq
+    L = X.dense
+    dtype = ctx.dtype
+    n = L.nmax
+    mask = L.mask
+    pair_mask = L.pair_mask
+    pos_d = _mlx_to_dense(pos, L)
+    chi_d = _mlx_to_dense(chi, L)
+    hard_d = _mlx_to_dense(hardness, L)
+    dr = _mlx_dense_pair_vectors(ctx, pos_d, cells)
+    r2 = mx.sum(dr * dr, axis=-1)
+    sigma = float(cfg["smearing"])
+    direct = COULOMB_EV_ANGSTROM / mx.sqrt(r2 + sigma * sigma)
+    kernel = direct * pair_mask
+    if cfg["use_pme"] and X.any_pbc:
+        pme = _mlx_ewald_kernel(ctx, pos_d, cells, dr, mask, pair_mask, cfg["pme_smearing"], cfg["pme_lr_wavelength"])
+        kernel = mx.where(X.gpbc[:, None, None], pme, kernel)
+    counts = L.counts_mx
+    center = mx.sum(pos_d * mask[..., None], axis=1) / mx.maximum(counts, 1.0)[:, None]
+    rel_pbc = dr[:, :, 0, :]
+    rel_free = pos_d - center[:, None, :]
+    rel = mx.where(X.gpbc[:, None, None], rel_pbc, rel_free) if X.any_pbc else rel_free
+    phi_ext = -mx.sum(rel * field_g[:, None, :], axis=-1) * mask
+    eye_n = mx.eye(n, dtype=dtype)
+    basis = L.helmert
+    basis_t = mx.swapaxes(basis, 1, 2)
+    red_mask = L.reduced_mask
+    pad_diag = mx.eye(n - 1, dtype=dtype)[None] * (1.0 - red_mask)[:, :, None]
+    floor = float(cfg["stability_floor"])
+
+    base = kernel + eye_n[None] * hard_d[:, None, :]
+    projected = basis_t @ base @ basis
+    projected = 0.5 * (projected + mx.swapaxes(projected, 1, 2))
+    park = mx.stop_gradient(_mlx_gershgorin_upper(projected)) + abs(floor) + 1.0
+    lam = _mlx_symmetric_min_eigenvalue(projected + park[:, None, None] * pad_diag)
+    multi = (counts > 1.0).astype(dtype)
+    shift = _mlx_relu(floor - lam) * multi
+    eff_h = (hard_d + shift[:, None]) * mask
+    hessian = kernel + eye_n[None] * eff_h[:, None, :]
+    linear_term = (chi_d + phi_ext) * mask
+    q_ref = (total_charge / mx.maximum(counts, 1.0))[:, None] * mask
+    reduced = basis_t @ hessian @ basis
+    reduced = 0.5 * (reduced + mx.swapaxes(reduced, 1, 2))
+    jitter = max(1e-10, 10.0 * float(np.finfo(np.float64 if dtype == mx.float64 else np.float32).eps))
+    reduced = reduced + jitter * mx.eye(n - 1, dtype=dtype)[None] * red_mask[:, :, None]
+    park_r = mx.stop_gradient(_mlx_gershgorin_upper(reduced)) + 1.0
+    reduced = reduced + park_r[:, None, None] * pad_diag
+    hq_ref = mx.squeeze(hessian @ q_ref[..., None], -1)
+    rhs = -mx.squeeze(basis_t @ (hq_ref + linear_term)[..., None], -1)
+    y = _mlx_spd_solve(reduced, rhs)
+    q_d = q_ref + mx.squeeze(basis @ y[..., None], -1)
+    hq = mx.squeeze(hessian @ q_d[..., None], -1)
+    grad_term = (hq + linear_term) * mask
+    lagrange = -mx.sum(grad_term, axis=1) / mx.maximum(counts, 1.0)
+    potential_d = mx.squeeze(kernel @ q_d[..., None], -1)
+    e_local = mx.sum((chi_d * q_d + 0.5 * eff_h * q_d * q_d + phi_ext * q_d) * mask, axis=1)
+    e_coulomb = 0.5 * mx.sum(q_d * potential_d, axis=1)
+    stationarity = mx.abs(hq + linear_term + lagrange[:, None]) * mask
+    charge_error = mx.abs(mx.sum(q_d * mask, axis=1) - total_charge)
+    residual = mx.maximum(mx.max(stationarity, axis=1), charge_error)
+    return dict(
+        charges=_mlx_from_dense(q_d, L),
+        potential=_mlx_from_dense(potential_d, L),
+        energy_local=e_local,
+        energy_coulomb=e_coulomb,
+        residual=residual,
+        stability_shift=shift,
+    )
+
+
+# --------------------------------------------------------------------------
+# MLX engine: polarization.
+# --------------------------------------------------------------------------
+def _mlx_polarization_forward(ctx: _MLXCtx, atomic_alpha, charges, permanent_dipoles, pos, cells, field_g):
+    X = ctx.X
+    cfg = ctx.spec.deq
+    L = X.dense
+    dtype = ctx.dtype
+    n = L.nmax
+    mask = L.mask
+    pair_mask = L.pair_mask
+    k = COULOMB_EV_ANGSTROM
+    alpha_max = float(cfg["alpha_max"])
+    alpha_volume = mx.mean(mx.diagonal(atomic_alpha, axis1=-2, axis2=-1), axis=-1)
+    alpha = _mlx_clamp(alpha_volume * ALPHA_VOLUME_TO_EV_PER_FIELD2, 1e-8, alpha_max * ALPHA_VOLUME_TO_EV_PER_FIELD2)
+    av_d = _mlx_to_dense(_mlx_clamp(alpha_volume, 1e-8, alpha_max), L, fill=1.0)
+    alpha_d = _mlx_to_dense(alpha, L, fill=1.0)
+    q_d = _mlx_to_dense(charges, L)
+    p0_d = _mlx_to_dense(permanent_dipoles, L)
+    pos_d = _mlx_to_dense(pos, L)
+    dr = _mlx_dense_pair_vectors(ctx, pos_d, cells)
+    r2 = mx.sum(dr * dr, axis=-1)
+    r2c = _mlx_clamp(r2, lo=1e-12)
+    r = mx.sqrt(r2c)
+    raw_inv_r3 = mx.power(r2c, -1.5) * pair_mask
+    pair_scale = mx.power(_mlx_clamp(av_d[:, :, None] * av_d[:, None, :], lo=1e-16), 1.0 / 6.0)
+    damp = _mlx_clamp(float(cfg["damping"]) * mx.power(r / pair_scale, 3), 0.0, 50.0)
+    expo = _mlx_exp(-damp)
+    f3 = (1.0 - expo) * pair_mask
+    f5 = (1.0 - (1.0 + damp) * expo) * pair_mask
+    charge_inv_r3 = raw_inv_r3 * f3
+    rhat = dr / _mlx_clamp(r, lo=1e-12)[..., None]
+    eye3 = mx.eye(3, dtype=dtype)
+    tensor = k * raw_inv_r3[..., None, None] * (
+        3.0 * f5[..., None, None] * rhat[..., :, None] * rhat[..., None, :] - f3[..., None, None] * eye3
+    )
+    charge_field = k * mx.sum(q_d[:, None, :, None] * dr * charge_inv_r3[..., None], axis=2)
+    permanent_field = mx.einsum("bijxy,bjy->bix", tensor, p0_d)
+    driving = field_g[:, None, :] + charge_field + permanent_field
+    sqrt_alpha = mx.sqrt(alpha_d) * mask
+    scaled = sqrt_alpha[:, :, None, None, None] * tensor * sqrt_alpha[:, None, :, None, None]
+    size = 3 * n
+    matrix = mx.transpose(scaled, (0, 1, 3, 2, 4)).reshape(-1, size, size)
+    eye_m = mx.eye(size, dtype=dtype)
+    hessian = eye_m[None] - 0.5 * (matrix + mx.swapaxes(matrix, 1, 2))
+    mask3 = mx.repeat(mask, 3, axis=1)
+    pad_diag = eye_m[None] * (1.0 - mask3)[:, :, None]
+    floor = L.pol_floor
+    real_hessian = hessian - pad_diag
+    park = mx.stop_gradient(_mlx_gershgorin_upper(real_hessian)) + mx.abs(floor) + 1.0
+    parked = real_hessian + park[:, None, None] * pad_diag
+    lam = _mlx_symmetric_min_eigenvalue(parked)
+    shift = _mlx_relu(floor - lam)
+    stable = parked + shift[:, None, None] * eye_m[None]
+    rhs = (sqrt_alpha[..., None] * driving).reshape(-1, size)
+    x = _mlx_spd_solve(stable, rhs)
+    p_d = sqrt_alpha[..., None] * x.reshape(-1, n, 3)
+    hx = mx.squeeze(stable @ x[..., None], -1)
+    residual = mx.max(mx.abs(hx - rhs), axis=1)
+    energy = 0.5 * mx.sum(x * hx, axis=1) - mx.sum(x * rhs, axis=1)
+    return dict(
+        induced_dipoles=_mlx_from_dense(p_d, L),
+        energy=energy,
+        residual=residual,
+        iterations=mx.ones((X.n_graphs,), dtype=dtype),
+        stability_shift=shift,
+    )
+
+
+# --------------------------------------------------------------------------
+# MLX engine: spin.
+# --------------------------------------------------------------------------
+def _mlx_spin_forward(ctx: _MLXCtx, geo: _MLXGeometry, comps: Dict[str, mx.array], spins: mx.array):
+    P, X = ctx.P, ctx.X
+    cfg = ctx.spec.spin
+    H = int(cfg["hidden"])
+    s = comps["scalar_features"]
+    v = comps["polar_features"]
+    a = comps["axial_features"]
+    t = comps["tensor_features"]
+    di_w = _mlx_mlp(P, "spin_layer.di_gate", s)
+    di_l2 = mx.sum(di_w[..., None] * t, axis=1)
+    basis = P.get("spin_layer.st_basis", ctx.st_basis)
+    di = (di_l2 @ basis.reshape(5, 9)).reshape(-1, 3, 3)
+    di = 0.5 * (di + mx.swapaxes(di, -1, -2))
+    trace = (di[:, 0, 0] + di[:, 1, 1] + di[:, 2, 2]) / 3.0
+    eye3 = mx.eye(3, dtype=ctx.dtype)
+    di = di - trace[:, None, None] * eye3[None]
+    moment = _mlx_softplus(_mlx_mlp(P, "spin_layer.moment_head", s)[:, 0])
+    moments = moment[:, None] * spins
+    atom_energy = mx.sum(spins * mx.squeeze(di @ spins[..., None], -1), axis=-1)
+    energy = X.graph_seg.sum(atom_energy)
+    cand, c_src, c_dst, c_graph, cand_np = X.spin_candidates
+    result = dict(Di=di, magnetic_moments=moments)
+    if cand_np.size == 0:
+        result.update(energy=energy, pair_valid=None, Jij=None, DMIij=None)
+        return result
+    edge_vec = mx.take(geo.edge_vec, cand, axis=0)
+    edge_r = mx.sqrt(mx.sum(edge_vec * edge_vec, axis=-1))
+    # Candidates are pre-filtered on the host with the Torch cutoff test.
+    valid = mx.ones(edge_r.shape, dtype=ctx.dtype)
+    r = _mlx_clamp(edge_r, lo=1e-10)
+    s_i = mx.take(s, c_src, axis=0)
+    s_j = mx.take(s, c_dst, axis=0)
+    rbf = _mlx_radial_basis(P, "spin_layer.rbf", "gaussian", r, float(cfg["spin_cutoff"]))
+    pair_scalar = mx.concatenate([s_i + s_j, mx.abs(s_i - s_j), rbf], axis=-1)
+    jij = _mlx_mlp(P, "spin_layer.j_head", pair_scalar)[:, 0]
+    gate = _mlx_mlp(P, "spin_layer.dmi_gate", pair_scalar)
+    axial_pair = mx.sum(gate[..., None] * (mx.take(a, c_src, axis=0) + mx.take(a, c_dst, axis=0)), axis=1)
+    p_a = _mlx_channel_linear(P, "spin_layer.polar_a", mx.take(v, c_src, axis=0))
+    p_b = _mlx_channel_linear(P, "spin_layer.polar_b", mx.take(v, c_dst, axis=0))
+    axial_pair = axial_pair + mx.sum(_mlx_xcross(p_a, p_b), axis=1) / max(1, H)
+    dmi = axial_pair if bool(cfg["enable_dmi"]) else mx.zeros_like(axial_pair)
+    spin_i = mx.take(spins, c_src, axis=0)
+    spin_j = mx.take(spins, c_dst, axis=0)
+    spin_dot = mx.sum(spin_i * spin_j, axis=-1)
+    spin_cross = _mlx_xcross(spin_i, spin_j)
+    pair_energy = (-jij * spin_dot + mx.sum(dmi * spin_cross, axis=-1)) * valid
+    pair_sum = mx.zeros((X.n_graphs,), dtype=ctx.dtype).at[c_graph].add(pair_energy)
+    result.update(energy=pair_sum + energy, pair_valid=valid, Jij=jij, DMIij=dmi, pair_graph=c_graph)
+    return result
+
+
+def _mlx_spin_condition(ctx: _MLXCtx, spins: mx.array) -> mx.array:
+    X = ctx.X
+    pair_dot = mx.sum(mx.take(spins, X.src, axis=0) * mx.take(spins, X.dst, axis=0), axis=-1)
+    return X.edge_seg.mean(pair_dot[:, None])[:, 0]
+
+
+# --------------------------------------------------------------------------
+# MLX engine: dual-layer forward.
+# --------------------------------------------------------------------------
+def _mlx_deform(ctx: _MLXCtx, pos0: mx.array, strain: Optional[mx.array]):
+    X = ctx.X
+    if strain is None:
+        return pos0, X.cells, X.shifts
+    symmetric = 0.5 * (strain + mx.swapaxes(strain, -1, -2))
+    eye3 = mx.eye(3, dtype=ctx.dtype)
+    deformation = eye3[None] + symmetric * X.eligible[:, None, None]
+    atom_def = mx.take(deformation, X.batch, axis=0)
+    pos = mx.einsum("ni,nji->nj", pos0, atom_def)
+    cells = X.cells @ mx.swapaxes(deformation, -1, -2)
+    edge_def = mx.take(deformation, X.edge_graph, axis=0)
+    shifts = mx.einsum("ei,eji->ej", X.shifts, edge_def)
+    return pos, cells, shifts
+
+
+def _mlx_dual_layer_terms(ctx: _MLXCtx, pos0, strain, use_response_terms: bool):
+    X, spec = ctx.X, ctx.spec
+    pos, cells, shifts = _mlx_deform(ctx, pos0, strain)
+    geo = _mlx_make_geometry(ctx, pos, cells, shifts)
+    film_c, film_a = X.film_condition, X.film_activity
+    e_pes, _ = _mlx_ground_forward(ctx, geo, film_c, film_a)
+    B, N = X.n_graphs, X.n_atoms
+    dtype = ctx.dtype
+    out = dict(energy_short=e_pes)
+    if use_response_terms:
+        comps = _mlx_response_components(ctx, geo, film_c, film_a)
+        if spec.has_wavefunction:
+            out["orbital_hamiltonian"] = _mlx_wavefunction_forward(ctx, comps["scalar_features"])
+        q = comps["raw_charges"]
+        counts = X.graph_seg.count.astype(dtype)
+        q_sum = X.graph_seg.sum(q)
+        q = q - mx.take((q_sum - X.total_charge) / mx.maximum(counts, 1.0), X.batch, axis=0)
+        mu_atomic = X.graph_seg.sum(comps["atomic_dipoles"])
+        center = X.graph_seg.mean(pos)
+        rel = _mlx_minimal_image_rel(ctx, pos, cells, center)
+        mu_charge = X.graph_seg.sum(rel * q[:, None])
+        mu_permanent = mu_atomic + mu_charge
+        alpha = comps["polarizability"]
+        af = spec.alpha_factor
+        mu_induced = af * mx.einsum("bij,bj->bi", alpha, X.field)
+        mu = mu_permanent + mu_induced
+        e_resp = -mx.sum(mu_permanent * X.field, axis=-1)
+        e_resp = e_resp - 0.5 * af * mx.einsum("bi,bij,bj->b", X.field, alpha, X.field)
+        out.update(
+            dipole=mu, polarizability=alpha, charges=q,
+            atomic_dipoles=comps["atomic_dipoles"], atomic_polarizability=comps["atomic_polarizability"],
+        )
+    else:
+        e_resp = mx.zeros_like(e_pes)
+        out.update(
+            dipole=mx.zeros((B, 3), dtype=dtype), polarizability=mx.zeros((B, 3, 3), dtype=dtype),
+            charges=mx.zeros((N,), dtype=dtype), atomic_dipoles=mx.zeros((N, 3), dtype=dtype),
+            atomic_polarizability=mx.zeros((N, 3, 3), dtype=dtype),
+        )
+    out["energy_response"] = e_resp
+    out["energy"] = e_pes + e_resp
+    out["_stress_l2_energy"] = e_resp
+    return out
+
+
+# --------------------------------------------------------------------------
+# MLX engine: mixed-granularity path.
+# --------------------------------------------------------------------------
+@dataclass
+class _MLXMixedFlags:
+    use_response_terms: bool
+    use_domain: bool
+    use_polarization: bool
+    use_dispersion: bool
+    use_spin: bool
+    label_aware: bool
+    fixed_coupling_steps: Optional[int] = None
+
+
+def _mlx_domain_and_spin(ctx, geo, comps, pos, cells, spins, flags: _MLXMixedFlags, act_d, act_s):
+    X, spec = ctx.X, ctx.spec
+    B = X.n_graphs
+    dtype = ctx.dtype
+    zero_graph = mx.zeros((B,), dtype=dtype)
+    if flags.use_domain and spec.qeq is not None:
+        domain = _mlx_qeq_forward(ctx, comps["chi"], comps["hardness"], pos, cells, X.field, X.total_charge)
+    else:
+        raw = comps["raw_charges"]
+        counts = X.graph_seg.count.astype(dtype)
+        current = X.graph_seg.sum(raw)
+        q = raw - mx.take((current - X.total_charge) / mx.maximum(counts, 1.0), X.batch, axis=0)
+        domain = dict(
+            charges=q, potential=mx.zeros_like(q), energy_local=zero_graph, energy_coulomb=zero_graph,
+            residual=mx.abs(X.graph_seg.sum(q) - X.total_charge), stability_shift=zero_graph,
+        )
+    if flags.use_spin and spec.spin is not None:
+        spin = _mlx_spin_forward(ctx, geo, comps, spins)
+    else:
+        spin = dict(
+            energy=zero_graph, Jij=None, DMIij=None, pair_valid=None,
+            Di=mx.zeros((X.n_atoms, 3, 3), dtype=dtype), magnetic_moments=mx.zeros_like(spins),
+        )
+    domain_atom = mx.take(act_d, X.batch, axis=0)
+    spin_atom = mx.take(act_s, X.batch, axis=0)
+    domain["charges"] = domain["charges"] * domain_atom
+    domain["potential"] = domain["potential"] * domain_atom
+    for name in ("energy_local", "energy_coulomb", "residual", "stability_shift"):
+        domain[name] = domain[name] * act_d
+    spin["energy"] = spin["energy"] * act_s
+    spin["Di"] = spin["Di"] * spin_atom[:, None, None]
+    spin["magnetic_moments"] = spin["magnetic_moments"] * spin_atom[:, None]
+    if spin.get("Jij") is not None:
+        pair_activity = mx.take(act_s, spin["pair_graph"], axis=0)
+        spin["Jij"] = spin["Jij"] * pair_activity
+        spin["DMIij"] = spin["DMIij"] * pair_activity[:, None]
+    return domain, spin
+
+
+def _mlx_mixed_terms(ctx: _MLXCtx, pos0, strain, spins, flags: _MLXMixedFlags):
+    X, spec = ctx.X, ctx.spec
+    B, N = X.n_graphs, X.n_atoms
+    dtype = ctx.dtype
+    pos, cells, shifts = _mlx_deform(ctx, pos0, strain)
+    geo = _mlx_make_geometry(ctx, pos, cells, shifts)
+    one_graph = mx.ones((B,), dtype=dtype)
+    if flags.label_aware:
+        act_d = X.activities["electric"]
+        act_p = X.activities["polarization"]
+        act_x = X.activities["dispersion"]
+        act_s = X.activities["spin"]
+    else:
+        act_d = act_p = act_x = act_s = one_graph
+    film_condition = None
+    film_activity = None
+    if spec.enable_film:
+        film_condition = mx.zeros((N, 4), dtype=dtype)
+        film_activity = mx.take(mx.maximum(act_d, act_s), X.batch, axis=0)[:, None]
+    e_pes, _ = _mlx_ground_forward(ctx, geo, film_condition, film_activity)
+    comps = _mlx_response_components(ctx, geo, film_condition, film_activity)
+    domain, spin = _mlx_domain_and_spin(ctx, geo, comps, pos, cells, spins, flags, act_d, act_s)
+
+    coupling_residual = mx.zeros((B,), dtype=dtype)
+    electric_residual = mx.zeros_like(coupling_residual)
+    spin_residual = mx.zeros_like(coupling_residual)
+    steps_used = 0
+    if spec.enable_film and flags.use_response_terms and (flags.use_domain or flags.use_spin):
+        previous_q = domain["charges"]
+        previous_m = spin["magnetic_moments"]
+        domain_atom = mx.take(act_d, X.batch, axis=0)
+        spin_atom = mx.take(act_s, X.batch, axis=0)
+        n_steps = max(1, int(spec.coupling_iterations))
+        fixed = flags.fixed_coupling_steps
+        limit = n_steps if fixed is None else int(fixed)
+        done = None
+        for _ in range(limit):
+            q_cond = mx.tanh(previous_q) * domain_atom
+            potential_cond = mx.tanh(domain["potential"] / 10.0) * domain_atom
+            spin_norm2 = _mlx_smooth_scalar_bound(mx.sum(spins * spins, axis=-1), max_abs=4.0) * spin_atom
+            spin_pair = _mlx_smooth_scalar_bound(_mlx_spin_condition(ctx, spins), max_abs=4.0) * spin_atom
+            film_condition = mx.stack([q_cond, potential_cond, spin_norm2, spin_pair], axis=-1)
+            new_e_pes, _ = _mlx_ground_forward(ctx, geo, film_condition, film_activity)
+            new_comps = _mlx_response_components(ctx, geo, film_condition, film_activity)
+            new_domain, new_spin = _mlx_domain_and_spin(ctx, geo, new_comps, pos, cells, spins, flags, act_d, act_s)
+            q_delta = mx.abs(new_domain["charges"] - previous_q) * domain_atom
+            m_delta = mx.sqrt(mx.sum(mx.square(new_spin["magnetic_moments"] - previous_m), axis=-1)) * spin_atom
+            new_electric = X.graph_seg.mean(q_delta)
+            new_spin_res = X.graph_seg.mean(m_delta)
+            new_coupling = mx.maximum(new_electric, new_spin_res)
+            new_previous_q = 0.5 * previous_q + 0.5 * new_domain["charges"]
+            new_previous_m = 0.5 * previous_m + 0.5 * new_spin["magnetic_moments"]
+            if done is None:
+                e_pes, comps, domain, spin = new_e_pes, new_comps, new_domain, new_spin
+                electric_residual, spin_residual, coupling_residual = new_electric, new_spin_res, new_coupling
+                previous_q, previous_m = new_previous_q, new_previous_m
+            else:
+                keep = done
+                e_pes = mx.where(keep, e_pes, new_e_pes)
+                comps = _mlx_select_tree(keep, comps, new_comps)
+                domain = _mlx_select_tree(keep, domain, new_domain)
+                spin = _mlx_select_tree(keep, spin, new_spin)
+                electric_residual = mx.where(keep, electric_residual, new_electric)
+                spin_residual = mx.where(keep, spin_residual, new_spin_res)
+                coupling_residual = mx.where(keep, coupling_residual, new_coupling)
+                previous_q = mx.where(keep, previous_q, new_previous_q)
+                previous_m = mx.where(keep, previous_m, new_previous_m)
+            steps_used += 1
+            # A comparison has no Torch graph; MLX would pass a zero cotangent through
+            # it into sqrt(|dm|^2) at dm = 0 (0 * inf = nan) in the masked form.
+            converged = mx.stop_gradient(mx.max(coupling_residual)) <= float(spec.coupling_tol)
+            if fixed is not None:
+                continue
+            if ctx.allow_host_sync:
+                if bool(converged.item()):
+                    break
+            else:
+                done = converged if done is None else mx.logical_or(done, converged)
+        ctx.stats["coupling_steps"] = steps_used if ctx.allow_host_sync or fixed is not None else None
+        if done is not None:
+            ctx.stats["coupling_done"] = done
+
+    if spec.has_wavefunction and flags.use_response_terms:
+        orbital = _mlx_wavefunction_forward(ctx, comps["scalar_features"])
+    else:
+        orbital = mx.zeros((B, spec.waloss_dim, spec.waloss_dim), dtype=dtype)
+    charges = domain["charges"]
+    atomic_dipoles = comps["atomic_dipoles"]
+    atomic_alpha = comps["atomic_polarizability"]
+    alpha = comps["polarizability"]
+    zero_graph = mx.zeros((B,), dtype=dtype)
+    af = spec.alpha_factor
+    pol_atom = mx.take(act_p, X.batch, axis=0)
+    if flags.use_polarization and spec.deq is not None:
+        pol = _mlx_polarization_forward(ctx, atomic_alpha, charges, atomic_dipoles, pos, cells, X.field)
+        pol["induced_dipoles"] = pol["induced_dipoles"] * pol_atom[:, None]
+        for name in ("energy", "residual", "iterations", "stability_shift"):
+            pol[name] = pol[name] * act_p
+    else:
+        direct = af * mx.einsum("nij,nj->ni", atomic_alpha, mx.take(X.field, X.batch, axis=0))
+        direct = direct * pol_atom[:, None] if flags.use_response_terms else mx.zeros_like(pos)
+        direct_energy = -0.5 * af * mx.einsum("bi,bij,bj->b", X.field, alpha, X.field)
+        direct_energy = direct_energy * act_p if flags.use_response_terms else zero_graph
+        pol = dict(induced_dipoles=direct, energy=direct_energy, residual=zero_graph,
+            iterations=zero_graph, stability_shift=zero_graph)
+    induced = pol["induced_dipoles"]
+    center = X.graph_seg.mean(pos)
+    rel = _mlx_minimal_image_rel(ctx, pos, cells, center)
+    mu_permanent = X.graph_seg.sum(atomic_dipoles)
+    mu_charge = X.graph_seg.sum(rel * charges[:, None])
+    mu_induced = X.graph_seg.sum(induced)
+    mu = mu_permanent + mu_charge + mu_induced
+
+    e_response = zero_graph
+    if flags.use_response_terms:
+        electric_activity = mx.maximum(act_d, act_p)
+        e_response = -mx.sum(mu_permanent * X.field, axis=-1) * electric_activity
+        if spec.qeq is None or not flags.use_domain:
+            e_response = e_response - mx.sum(mu_charge * X.field, axis=-1)
+        e_response = e_response + pol["energy"]
+
+    if flags.use_dispersion and ctx.d4_bridge is not None:
+        d4 = ctx.d4_bridge(ctx, pos, charges, comps["c6_scale"])
+        d4["energy"] = d4["energy"] * act_x
+        disp_atom = mx.take(act_x, X.batch, axis=0)
+        d4["atomic_c6"] = d4["atomic_c6"] * disp_atom
+        d4["atomic_polarizability"] = d4["atomic_polarizability"] * disp_atom
+    else:
+        d4 = dict(energy=zero_graph, atomic_c6=mx.zeros_like(charges), atomic_polarizability=mx.zeros_like(charges))
+
+    e_qeq = domain["energy_local"] if flags.use_domain else zero_graph
+    e_pme = domain["energy_coulomb"] if flags.use_domain else zero_graph
+    e_spin = spin["energy"] if flags.use_spin else zero_graph
+    e_total = e_pes + e_qeq + e_pme + d4["energy"] + e_spin + e_response
+    out = dict(
+        energy=e_total, energy_short=e_pes, energy_qeq=e_qeq, energy_pme=e_pme, energy_d4=d4["energy"],
+        energy_spin=e_spin, energy_response=e_response, charges=charges, dipole=mu, polarizability=alpha,
+        atomic_dipoles=atomic_dipoles, induced_dipoles=induced, atomic_polarizability=atomic_alpha,
+        c6=d4["atomic_c6"], orbital_hamiltonian=orbital, Di=spin["Di"],
+        magnetic_moments=spin["magnetic_moments"], qeq_residual=domain["residual"],
+        qeq_stability_shift=domain["stability_shift"], deq_residual=pol["residual"],
+        deq_iterations=pol["iterations"], deq_stability_shift=pol["stability_shift"],
+        coupling_residual=coupling_residual, coupling_residual_electric=electric_residual,
+        coupling_residual_spin=spin_residual, domain_activity=act_d, polarization_activity=act_p,
+        dispersion_activity=act_x, spin_activity=act_s,
+        _stress_l2_energy=e_qeq + e_pme + e_response,
+    )
+    if spin.get("Jij") is not None:
+        out["_Jij"] = spin["Jij"]
+        out["_DMIij"] = spin["DMIij"]
+        out["_pair_valid"] = spin["pair_valid"]
+        valid = spin["pair_valid"]
+        pair_graph = spin["pair_graph"]
+        count = mx.zeros((B,), dtype=dtype).at[pair_graph].add(valid)
+        count = mx.maximum(count, 1.0)
+        out["J_effective"] = mx.zeros((B,), dtype=dtype).at[pair_graph].add(spin["Jij"] * valid) / count
+        out["DMI_effective"] = mx.zeros((B, 3), dtype=dtype).at[pair_graph].add(spin["DMIij"] * valid[:, None]) / count[:, None]
+    else:
+        out["J_effective"] = zero_graph
+        out["DMI_effective"] = mx.zeros((B, 3), dtype=dtype)
+    out["Di_effective"] = X.graph_seg.mean(spin["Di"])
+    return out
+
+
+def _mlx_select_tree(keep, old, new):
+    out = dict()
+    for key, value in new.items():
+        previous = old.get(key)
+        if isinstance(value, mx.array) and isinstance(previous, mx.array):
+            out[key] = mx.where(keep, previous, value)
+        else:
+            out[key] = value
+    return out
+
+
+# --------------------------------------------------------------------------
+# MLX engine: execution, autograd bridge, and frontend binding.
+#
+# MLX execution engine attached transparently to a Torch E3-miu-GNN model.
+#
+# The frontend keeps its Torch model object (configuration, checkpoints,
+# optimizer, loss code). Once ``resolve_device('mlx')`` selects this engine,
+# ``model.forward`` dispatches here through ``_mlx_forward``, which binds an
+# engine on first use: weights are mirrored by name, the batch is converted
+# once, every observable is computed natively in MLX, and the result dict
+# carries the exact Torch schema (keys, order, shapes, dtypes).
+#
+# In training mode the outputs are tied back to the Torch parameters through
+# a ``torch.autograd.Function`` whose backward is an MLX vector-Jacobian
+# product. Torch losses, gradient clipping, optimizers, schedulers and
+# bad-sample handling therefore run unchanged; only the arithmetic moves to
+# MLX.
+# --------------------------------------------------------------------------
+
+_MLX_DUAL_KEYS: Tuple[str, ...] = (
+    "energy", "forces", "stress", "stress_l1", "stress_l2", "stress_l3",
+    "stress_dispersion", "magnetoelastic_stress", "dipole", "polarizability",
+    "charges", "atomic_dipoles", "atomic_polarizability", "bec", "piezoelectric",
+    "orbital_hamiltonian",
+)
+
+_MLX_MIXED_BASE_EXTRA_KEYS: Tuple[str, ...] = (
+    "energy_short", "energy_qeq", "energy_pme", "energy_d4", "energy_spin",
+    "energy_response", "induced_dipoles", "atomic_polarizability", "c6", "Jij", "Di",
+    "DMIij", "spin_pair_index", "J_effective", "Di_effective", "DMI_effective",
+    "magnetic_moments", "effective_field", "qeq_residual", "qeq_stability_shift",
+    "deq_residual", "deq_iterations", "deq_stability_shift", "coupling_residual",
+    "coupling_residual_electric", "coupling_residual_spin", "domain_activity",
+    "polarization_activity", "dispersion_activity", "spin_activity",
+)
+
+_MLX_MIXED_KEYS: Tuple[str, ...] = (
+    "energy", "forces", "stress", "stress_l1", "stress_l2", "stress_l3",
+    "stress_dispersion", "magnetoelastic_stress", "energy_short", "energy_qeq",
+    "energy_pme", "energy_d4", "energy_spin", "energy_response", "charges", "dipole",
+    "polarizability", "atomic_dipoles", "induced_dipoles", "atomic_polarizability", "c6",
+    "bec", "piezoelectric", "orbital_hamiltonian", "Jij", "Di", "DMIij",
+    "spin_pair_index", "J_effective", "Di_effective", "DMI_effective",
+    "magnetic_moments", "effective_field", "qeq_residual", "qeq_stability_shift",
+    "deq_residual", "deq_iterations", "deq_stability_shift", "coupling_residual",
+    "coupling_residual_electric", "coupling_residual_spin", "domain_activity",
+    "polarization_activity", "dispersion_activity", "spin_activity",
+)
+
+# Outputs that never carry parameter gradients in the Torch engine.
+_MLX_CONSTANT_OUTPUTS = frozenset({
+    "deq_iterations", "domain_activity", "polarization_activity",
+    "dispersion_activity", "spin_activity",
+})
+
+_MLX_DUAL_OPTIONS = frozenset({
+    "training", "compute_forces", "compute_stress", "compute_bec",
+    "compute_piezoelectric", "compute_stress_components", "compute_magnetoelastic",
+    "use_response_terms", "retain_graph", "use_response",
+})
+_MLX_MIXED_OPTIONS = _MLX_DUAL_OPTIONS | frozenset({
+    "use_domain_terms", "use_polarization_terms", "use_dispersion_terms",
+    "use_spin_terms", "label_aware_coupling",
+})
+
+
+@dataclass(frozen=True)
+class _MLXRequest:
+    training: bool
+    forces: bool
+    stress: bool
+    bec: bool
+    piezo: bool
+    components: bool
+    magneto: bool
+    strain: bool
+
+
+def _mlx_np_dtype(dtype) -> Any:
+    return np.float64 if dtype == mx.float64 else np.float32
+
+
+def _mlx_to_mx(tensor: torch.Tensor, dtype=None) -> mx.array:
+    value = tensor.detach()
+    if value.device.type != "cpu":
+        value = value.cpu()
+    if value.dtype == torch.bfloat16:
+        value = value.to(torch.float32)
+    array = value.numpy()
+    if dtype is not None:
+        return mx.array(np.ascontiguousarray(array), dtype=dtype)
+    if array.dtype == np.float64:
+        return mx.array(np.ascontiguousarray(array), dtype=mx.float64)
+    if array.dtype == np.int64:
+        return mx.array(np.ascontiguousarray(array.astype(np.int32)), dtype=mx.int32)
+    return mx.array(np.ascontiguousarray(array))
+
+
+def _mlx_to_torch(array: mx.array, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    values = np.array(array, copy=False) if array.dtype != mx.bfloat16 else np.array(array.astype(mx.float32))
+    out = torch.from_numpy(np.ascontiguousarray(values))
+    if out.is_floating_point() and out.dtype != dtype:
+        out = out.to(dtype)
+    if device.type != "cpu":
+        out = out.to(device)
+    return out
+
+
+# --------------------------------------------------------------------------
+# MLX engine: randomness.
+# --------------------------------------------------------------------------
+class _MLXAugmentationTape:
+    """Replays PeriodicTableEmbedder augmentation draws across MLX re-traces.
+
+    Draws are taken from Torch's own CPU generator in exactly the order the
+    Torch module would consume them, then reused by every MLX evaluation of the
+    same logical forward (observable jobs, backward recomputation).
+    """
+
+    def __init__(self, dtype, torch_dtype):
+        self.dtype = dtype
+        self.torch_dtype = torch_dtype
+        self.streams: Dict[str, List[Dict[str, mx.array]]] = dict()
+        self.cursor: Dict[str, int] = dict()
+        self.active = "main"
+
+    def begin(self, stream: str) -> None:
+        self.active = stream
+        self.cursor[stream] = 0
+
+    def __call__(self, prefix: str, n: int, max_z: int, spec: Dict[str, Any]):
+        tape = self.streams.setdefault(self.active, [])
+        index = self.cursor.get(self.active, 0)
+        self.cursor[self.active] = index + 1
+        if index < len(tape):
+            return tape[index]
+        draw: Dict[str, mx.array] = dict()
+        mask = (torch.rand((n,)) < float(spec["aug_prob"])).view(-1, 1)
+        draw["mask"] = mx.array(mask.numpy())
+        n_feat = int(spec["n_feat"])
+        if spec["aug_mix_max"] > 0.0:
+            idx2 = torch.randint(low=0, high=int(max_z), size=(n,))
+            lam = torch.rand((n, 1)) * float(min(1.0, spec["aug_mix_max"]))
+            draw["idx2"] = mx.array(idx2.numpy().astype(np.int32))
+            draw["lam"] = mx.array(lam.to(self.torch_dtype).numpy(), dtype=self.dtype)
+            # Torch forms (1 - lam) in lam's own (default) dtype before promotion.
+            draw["one_minus_lam"] = mx.array((1.0 - lam).to(self.torch_dtype).numpy(), dtype=self.dtype)
+        if spec["aug_noise_std"] > 0.0:
+            noise = float(spec["aug_noise_std"]) * torch.randn((n, n_feat), dtype=self.torch_dtype)
+            draw["noise"] = mx.array(noise.numpy(), dtype=self.dtype)
+        tape.append(draw)
+        return draw
+
+
+# --------------------------------------------------------------------------
+# MLX engine: D4 bridge.
+# --------------------------------------------------------------------------
+class _MLXD4Bridge:
+    """Molecular DFT-D4 through tad-dftd4 with MLX-differentiable wrappers.
+
+    Energy, gradient and Hessian-vector products come from Torch autograd on
+    the host, so forces and force-trained parameter gradients are exact.
+    """
+
+    BOHR = 0.529177210903
+    HARTREE = 27.211386245988
+
+    def __init__(self, torch_d4: Any, backend: Any):
+        self.module = torch_d4
+        self.backend = backend
+
+    def _numbers(self, X: _MLXGraphInputs) -> np.ndarray:
+        if X.atomic_numbers_np is not None:
+            return X.atomic_numbers_np
+        zs = self.module.type_zs.detach().cpu().numpy().astype(np.int64)
+        types = np.array(X.atom_types, copy=False).astype(np.int64)
+        return zs[types]
+
+    def __call__(self, ctx: Any, pos: mx.array, charges: mx.array, c6_scale: mx.array) -> Dict[str, mx.array]:
+        import tad_dftd4
+
+        X = ctx.X
+        tdt = torch.float64 if ctx.dtype == mx.float64 else torch.float32
+        numbers = torch.as_tensor(self._numbers(X), dtype=torch.long)
+        groups = [np.nonzero(X.batch_np == g)[0] for g in range(X.n_graphs) if not X.graph_any_pbc[g]]
+        graph_ids = [g for g in range(X.n_graphs) if not X.graph_any_pbc[g]]
+        params = self.module.params
+        n_graphs = X.n_graphs
+        bohr = self.BOHR
+        hartree = self.HARTREE
+        mxd = ctx.dtype
+
+        def energy_torch(pos_t: torch.Tensor, q_t: torch.Tensor) -> torch.Tensor:
+            rows = [torch.zeros((), dtype=tdt) for _ in range(n_graphs)]
+            for g, idx in zip(graph_ids, groups):
+                index = torch.as_tensor(idx, dtype=torch.long)
+                q_g = q_t[index]
+                e_atom = tad_dftd4.dftd4(numbers[index], pos_t[index] / bohr, torch.sum(q_g), params, q=q_g)
+                rows[g] = (torch.sum(e_atom) * hartree).to(tdt)
+            return torch.stack(rows)
+
+        def tt(array: mx.array) -> torch.Tensor:
+            return torch.from_numpy(np.array(array)).to(tdt)
+
+        def tm(tensor: Optional[torch.Tensor], like: mx.array) -> mx.array:
+            if tensor is None:
+                return mx.zeros_like(like)
+            return mx.array(tensor.detach().numpy(), dtype=mxd)
+
+        @mx.custom_function
+        def d4_grad(pos_a, q_a, cot_a):
+            with torch.enable_grad():
+                p = tt(pos_a).requires_grad_(True)
+                q = tt(q_a).requires_grad_(True)
+                energy = energy_torch(p, q)
+                gp, gq = torch.autograd.grad(energy, [p, q], grad_outputs=tt(cot_a), allow_unused=True)
+            return tm(gp, pos_a), tm(gq, q_a)
+
+        @d4_grad.vjp
+        def _d4_grad_vjp(primals, cotangents, outputs):
+            pos_a, q_a, cot_a = primals
+            c_pos, c_q = cotangents
+            with torch.enable_grad():
+                p = tt(pos_a).requires_grad_(True)
+                q = tt(q_a).requires_grad_(True)
+                c = tt(cot_a).requires_grad_(True)
+                energy = energy_torch(p, q)
+                gp, gq = torch.autograd.grad(energy, [p, q], grad_outputs=c, create_graph=True, allow_unused=True)
+                total = torch.zeros((), dtype=tdt)
+                if gp is not None:
+                    total = total + torch.sum(gp * tt(c_pos))
+                if gq is not None:
+                    total = total + torch.sum(gq * tt(c_q))
+                if total.requires_grad:
+                    hp, hq, hc = torch.autograd.grad(total, [p, q, c], allow_unused=True)
+                else:
+                    hp = hq = hc = None
+            return tm(hp, pos_a), tm(hq, q_a), tm(hc, cot_a)
+
+        @mx.custom_function
+        def d4_energy(pos_a, q_a):
+            with torch.no_grad():
+                return mx.array(energy_torch(tt(pos_a), tt(q_a)).numpy(), dtype=mxd)
+
+        @d4_energy.vjp
+        def _d4_energy_vjp(primals, cotangent, output):
+            pos_a, q_a = primals
+            cot = cotangent[0] if isinstance(cotangent, (list, tuple)) else cotangent
+            return d4_grad(pos_a, q_a, cot)
+
+        energy = d4_energy(pos, charges)
+        c6_const = np.zeros((X.n_atoms,), dtype=np.float64)
+        alpha_const = np.zeros((X.n_atoms,), dtype=np.float64)
+        pos_host = np.array(mx.stop_gradient(pos)).astype(np.float64)
+        q_host = np.array(mx.stop_gradient(charges)).astype(np.float64)
+        for idx in groups:
+            try:
+                index = torch.as_tensor(idx, dtype=torch.long)
+                p_g = torch.as_tensor(pos_host[idx], dtype=tdt) / bohr
+                q_sum = torch.as_tensor(q_host[idx].sum(), dtype=tdt)
+                _cn, _qref, c6, alpha = tad_dftd4.get_properties(numbers[index], p_g, q_sum)
+                diag = torch.diagonal(c6, dim1=-2, dim2=-1) * hartree * bohr ** 6
+                c6_const[idx] = diag.to(tdt).detach().numpy()
+                alpha_const[idx] = (alpha.to(tdt) * bohr ** 3).detach().numpy()
+            except Exception:
+                pass
+        np_dt = _mlx_np_dtype(mxd)
+        return dict(
+            energy=energy,
+            atomic_c6=mx.array(c6_const.astype(np_dt), dtype=mxd) * c6_scale,
+            atomic_polarizability=mx.array(alpha_const.astype(np_dt), dtype=mxd),
+        )
+
+
+# --------------------------------------------------------------------------
+# MLX engine: core compute.
+# --------------------------------------------------------------------------
+def _mlx_tree_arrays(tree: Any) -> List[mx.array]:
+    found: List[mx.array] = []
+    stack = [tree]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, mx.array):
+            found.append(value)
+        elif isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+    return found
+
+
+def _mlx_stress_from_gradient(gradient: mx.array, X: _MLXGraphInputs) -> mx.array:
+    stress = gradient / _mlx_clamp(X.volumes, lo=1e-10)[:, None, None]
+    stress = 0.5 * (stress + mx.swapaxes(stress, -1, -2))
+    return stress * X.eligible[:, None, None]
+
+
+class _MLXEvaluation:
+    """All MLX work for one frontend call, independent of the Torch model."""
+
+    def __init__(self, engine: "MLXEngine", X: _MLXGraphInputs, kind: str, flags: _MLXMixedFlags, req: _MLXRequest,
+                        aug: Optional[_MLXAugmentationTape], d4: Optional[_MLXD4Bridge], allow_host_sync: bool):
+        self.engine = engine
+        self.spec = engine.spec
+        self.X = X
+        self.kind = kind
+        self.flags = flags
+        self.req = req
+        self.aug = aug
+        self.d4 = d4
+        self.allow_host_sync = allow_host_sync
+        self.steps: Dict[str, Optional[int]] = dict()
+        self.fixed_steps: Optional[Dict[str, Optional[int]]] = None
+        self.last_raw: Optional[Dict[str, Dict[str, Any]]] = None
+
+    # One logical Torch forward (stream "main" or the magnetoelastic "ref").
+    def _terms(self, P, X, stream: str, pos0, strain, spins):
+        spec = self.spec
+        if self.aug is not None:
+            self.aug.begin(stream)
+        ctx = _MLXCtx(
+            P=P, X=X, spec=spec, dtype=X.dtype,
+            st_basis=P[self.engine.st_basis_name],
+            st3_basis=P.get(self.engine.st3_basis_name) if self.engine.st3_basis_name else None,
+            aug_provider=self._aug_hook if self.aug is not None else None,
+            d4_bridge=self.d4,
+            allow_host_sync=self.allow_host_sync,
+        )
+        if self.kind == "mixed":
+            flags = self.flags
+            if self.fixed_steps is not None and self.fixed_steps.get(stream) is not None:
+                flags = dataclasses.replace(flags, fixed_coupling_steps=int(self.fixed_steps[stream]))
+            out = _mlx_mixed_terms(ctx, pos0, strain, spins, flags)
+            if stream not in self.steps:
+                self.steps[stream] = ctx.stats.get("coupling_steps")
+            return out
+        return _mlx_dual_layer_terms(ctx, pos0, strain, self.flags.use_response_terms)
+
+    def _aug_hook(self, prefix: str, n: int, max_z: int):
+        spec = self.engine.encoder_specs.get(prefix)
+        if spec is None or not self.engine.encoder_training.get(prefix, False):
+            return None
+        return self.aug(prefix, n, max_z, spec)
+
+    # Observable jobs.  Each job is one logical Torch autograd pass (energy,
+    # one dipole row, one stress component, ...).  Jobs never share a nested
+    # transform: under an outer parameter grad, MLX drops outer-tracer graphs
+    # that are host-evaluated after an earlier nested grad has finished, so the
+    # training backward differentiates one job at a time (see _MLXTrainingCall).
+    def jobs(self) -> List[str]:
+        req, flags = self.req, self.flags
+        mixed_full = self.kind == "mixed"
+        names = ["base"]
+        if (req.bec or req.piezo) and flags.use_response_terms:
+            names += ["dipole0", "dipole1", "dipole2"]
+        use_spin_field = mixed_full and flags.use_spin
+        if req.components:
+            names += ["stress_l1", "stress_l2"]
+            if mixed_full:
+                names += ["stress_l3", "stress_dispersion"]
+        if use_spin_field and not req.components:
+            names.append("spin_field")
+        if self._magneto_active():
+            names.append("magneto_ref")
+            if not req.stress:
+                names.append("magneto_main")
+        return names
+
+    def _magneto_active(self) -> bool:
+        return (self.kind == "mixed" and self.req.magneto and self.flags.use_spin
+            and self.spec.spin is not None)
+
+    def _magneto_activity(self, X: _MLXGraphInputs) -> mx.array:
+        activity = X.activities.get("magnetoelastic")
+        return mx.zeros((X.n_graphs,), dtype=X.dtype) if activity is None else activity
+
+    def run_job(self, job: str, P: Dict[str, mx.array], X: _MLXGraphInputs) -> Dict[str, Any]:
+        req, flags = self.req, self.flags
+        dtype = X.dtype
+        B, N = X.n_graphs, X.n_atoms
+        pos0 = X.pos
+        strain0 = mx.zeros((B, 3, 3), dtype=dtype)
+        spins0 = X.spins if X.spins is not None else mx.zeros((N, 3), dtype=dtype)
+        use_strain = req.strain
+
+        def main(p, s, sp):
+            return self._terms(P, X, "main", p, s if use_strain else None, sp)
+
+        def ref(p, s):
+            return self._terms(P, X, "ref", p, s if use_strain else None, X.reference_spins)
+
+        raw: Dict[str, Any] = dict()
+        if job == "base":
+            wrt = ([0] if req.forces else []) + ([1] if req.stress else [])
+            if wrt:
+                # The output dict is captured through a side channel: MLX detaches
+                # value_and_grad auxiliaries, but training needs them differentiable.
+                captured: Dict[str, Any] = dict()
+
+                def energy_fn(p, s, sp):
+                    out_ = main(p, s, sp)
+                    captured["out"] = out_
+                    return mx.sum(out_["energy"])
+
+                _, grads = mx.value_and_grad(energy_fn, argnums=wrt)(pos0, strain0, spins0)
+                grads = list(grads) if isinstance(grads, (list, tuple)) else [grads]
+                raw["_out"] = captured["out"]
+                if req.forces:
+                    raw["forces"] = -grads[0]
+                if req.stress:
+                    raw["stress"] = _mlx_stress_from_gradient(grads[-1], X)
+                    if self._magneto_active():
+                        raw["~me_main"] = raw["stress"] * self._magneto_activity(X)[:, None, None]
+            else:
+                raw["_out"] = main(pos0, strain0, spins0)
+            return raw
+        if job.startswith("dipole"):
+            component = int(job[-1])
+            want_bec, want_piezo = req.bec, req.piezo
+            argnums = ([0] if want_bec else []) + ([1] if want_piezo else [])
+
+            def dipole_fn(p, s, sp):
+                return mx.sum(main(p, s, sp)["dipole"][:, component])
+
+            grads = mx.grad(dipole_fn, argnums=argnums)(pos0, strain0, spins0)
+            grads = list(grads) if isinstance(grads, (list, tuple)) else [grads]
+            if want_bec:
+                raw["~bec_row%d" % component] = grads[0]
+            if want_piezo:
+                raw["~piezo_row%d" % component] = grads[-1]
+            return raw
+        if job.startswith("stress_"):
+            key = dict(stress_l1="energy_short", stress_l2="_stress_l2_energy", stress_l3="energy_spin",
+                stress_dispersion="energy_d4")[job]
+            if job == "stress_l3" and self.kind == "mixed" and flags.use_spin:
+                def spin_fn(p, s, sp):
+                    return mx.sum(main(p, s, sp)["energy_spin"])
+
+                g_s, g_sp = mx.grad(spin_fn, argnums=[1, 2])(pos0, strain0, spins0)
+                raw[job] = _mlx_stress_from_gradient(g_s, X)
+                raw["effective_field"] = -g_sp
+                return raw
+
+            def part_fn(p, s, sp):
+                return mx.sum(main(p, s, sp)[key])
+
+            raw[job] = _mlx_stress_from_gradient(mx.grad(part_fn, argnums=1)(pos0, strain0, spins0), X)
+            return raw
+        if job == "spin_field":
+            def spin_only(p, s, sp):
+                return mx.sum(main(p, s, sp)["energy_spin"])
+
+            raw["effective_field"] = -mx.grad(spin_only, argnums=2)(pos0, strain0, spins0)
+            return raw
+        if job in ("magneto_ref", "magneto_main"):
+            if X.reference_spins is None:
+                raise ValueError("Magnetoelastic response requires same-geometry reference_spins")
+            activity = self._magneto_activity(X)
+            if job == "magneto_ref":
+                def ref_fn(p, s):
+                    return mx.sum(ref(p, s)["energy"] * activity)
+
+                raw["~me_ref"] = _mlx_stress_from_gradient(mx.grad(ref_fn, argnums=1)(pos0, strain0), X)
+                return raw
+
+            def act_fn(p, s, sp):
+                return mx.sum(main(p, s, sp)["energy"] * activity)
+
+            raw["~me_main"] = _mlx_stress_from_gradient(mx.grad(act_fn, argnums=1)(pos0, strain0, spins0), X)
+            return raw
+        raise KeyError(job)
+
+    def finalize(self, raw: Dict[str, Dict[str, Any]], X: _MLXGraphInputs) -> Dict[str, mx.array]:
+        """Combine job outputs; every combination is a plain function of them."""
+        results: Dict[str, Any] = dict()
+        combined: Dict[str, mx.array] = dict()
+        for values in raw.values():
+            for key, value in values.items():
+                if key.startswith("~"):
+                    combined[key] = value
+                else:
+                    results[key] = value
+        if "~bec_row0" in combined:
+            results["bec"] = mx.stack([combined["~bec_row%d" % c] for c in range(3)], axis=1)
+        if "~piezo_row0" in combined:
+            tensor = mx.stack([combined["~piezo_row%d" % c] for c in range(3)], axis=1)
+            tensor = 0.5 * (tensor + mx.swapaxes(tensor, -1, -2))
+            tensor = tensor / _mlx_clamp(X.volumes, lo=1e-10)[:, None, None, None]
+            tensor = tensor * E_PER_ANGSTROM2_TO_C_PER_M2
+            results["piezoelectric"] = tensor * X.eligible[:, None, None, None]
+        if "~me_ref" in combined:
+            results["magnetoelastic_stress"] = combined["~me_main"] - combined["~me_ref"]
+        return results
+
+    @staticmethod
+    def job_outputs(raw_job: Dict[str, Any]) -> List[str]:
+        """Flat output names that depend on one job's raw values."""
+        names: List[str] = []
+        for key, value in raw_job.items():
+            if key == "_out":
+                names += [k for k, v in value.items() if isinstance(v, mx.array)]
+            elif key.startswith("~bec"):
+                names.append("bec")
+            elif key.startswith("~piezo"):
+                names.append("piezoelectric")
+            elif key.startswith("~me"):
+                names.append("magnetoelastic_stress")
+            else:
+                names.append(key)
+        return names
+
+    def compute(self, P: Dict[str, mx.array], X: Optional[_MLXGraphInputs] = None, eager: bool = False,
+            fused: int = 0) -> Dict[str, mx.array]:
+        """All jobs.  ``eager`` evaluates job by job, which frees each job's
+        graph before the next one is built (lower peak memory).  ``fused`` shares
+        one forward between the main-stream jobs (inference only, see below)."""
+        X = self.X if X is None else X
+        raw: Dict[str, Dict[str, Any]] = dict()
+        rows = self.fused_rows(int(fused)) if fused else None
+        if rows is not None:
+            raw.update(self._run_fused(rows, P, X))
+        for job in self.jobs():
+            if job in raw:
+                continue
+            raw[job] = self.run_job(job, P, X)
+            if eager:
+                mx.eval(_mlx_tree_arrays(raw[job]))
+        self.last_raw = raw
+        return self.finalize(raw, X)
+
+    # Fused inference.  Torch runs one forward and one autograd pass per
+    # observable; the job loop above re-runs the forward for every job.  Here the
+    # main-stream jobs share one forward: each job is a row of cotangents and one
+    # vmapped VJP returns every row.  The coupling loop then runs its masked
+    # form (identical values: converged graphs are frozen with ``where``).
+    _FUSABLE = ("base", "dipole0", "dipole1", "dipole2", "stress_l1", "stress_l2", "stress_l3",
+        "stress_dispersion", "spin_field", "magneto_main")
+    _ENERGY_KEYS = dict(stress_l1="energy_short", stress_l2="_stress_l2_energy", stress_l3="energy_spin",
+        stress_dispersion="energy_d4", spin_field="energy_spin", magneto_main="energy")
+
+    def fused_rows(self, min_rows: int = 2) -> Optional[List[Tuple[str, str, int]]]:
+        """(job, output key, dipole component or -1) rows, or None if not fusable."""
+        if self.aug is not None or self.d4 is not None:
+            return None
+        rows: List[Tuple[str, str, int]] = []
+        for job in self.jobs():
+            if job not in self._FUSABLE:
+                continue
+            if job == "base":
+                if self.req.forces or self.req.stress:
+                    rows.append((job, "energy", -1))
+            elif job.startswith("dipole"):
+                rows.append((job, "dipole", int(job[-1])))
+            else:
+                rows.append((job, self._ENERGY_KEYS[job], -1))
+        return rows if len(rows) >= max(2, int(min_rows)) else None
+
+    def _run_fused(self, rows: List[Tuple[str, str, int]], P: Dict[str, mx.array], X: _MLXGraphInputs
+        ) -> Dict[str, Dict[str, Any]]:
+        req = self.req
+        dtype = X.dtype
+        B, N = X.n_graphs, X.n_atoms
+        use_strain = req.strain
+        keys = list(dict.fromkeys(key for _job, key, _c in rows))
+        activity = self._magneto_activity(X)
+        cotangents = []
+        for key in keys:
+            width = (B, 3) if key == "dipole" else (B,)
+            stack = []
+            for job, row_key, component in rows:
+                if row_key != key:
+                    stack.append(mx.zeros(width, dtype=dtype))
+                elif key == "dipole":
+                    stack.append(mx.zeros(width, dtype=dtype) + (mx.arange(3) == component).astype(dtype)[None])
+                elif job == "magneto_main":
+                    stack.append(activity.astype(dtype))
+                else:
+                    stack.append(mx.ones(width, dtype=dtype))
+            cotangents.append(mx.stack(stack))
+        primals = [X.pos, mx.zeros((B, 3, 3), dtype=dtype),
+            X.spins if X.spins is not None else mx.zeros((N, 3), dtype=dtype)]
+        names: List[str] = []
+        statics: Dict[str, Any] = dict()
+
+        def row(*cts):
+            captured: Dict[str, Any] = dict()
+
+            def main(p, s, sp):
+                out = self._terms(P, X, "main", p, s if use_strain else None, sp)
+                captured["out"] = out
+                return [out[key] for key in keys]
+
+            _, grads = mx.vjp(main, primals, list(cts))
+            out = captured["out"]
+            if not names:
+                names.extend(k for k, v in out.items() if isinstance(v, mx.array))
+                statics.update({k: v for k, v in out.items() if not isinstance(v, mx.array)})
+            return list(grads) + [out[k] for k in names]
+
+        previous = self.allow_host_sync
+        self.allow_host_sync = False
+        try:
+            results = mx.vmap(row)(*cotangents)
+        finally:
+            self.allow_host_sync = previous
+        mx.eval(results)
+        g_pos, g_strain, g_spin = results[:3]
+        out = dict(statics)
+        out.update({name: value[0] for name, value in zip(names, results[3:])})
+        raw: Dict[str, Dict[str, Any]] = dict()
+        for r, (job, key, component) in enumerate(rows):
+            if job == "base":
+                item: Dict[str, Any] = dict(_out=out)
+                if req.forces:
+                    item["forces"] = -g_pos[r]
+                if req.stress:
+                    item["stress"] = _mlx_stress_from_gradient(g_strain[r], X)
+                    if self._magneto_active():
+                        item["~me_main"] = item["stress"] * activity[:, None, None]
+                raw[job] = item
+            elif job.startswith("dipole"):
+                item = dict()
+                if req.bec:
+                    item["~bec_row%d" % component] = g_pos[r]
+                if req.piezo:
+                    item["~piezo_row%d" % component] = g_strain[r]
+                raw[job] = item
+            elif job == "spin_field":
+                raw[job] = {"effective_field": -g_spin[r]}
+            elif job == "magneto_main":
+                raw[job] = {"~me_main": _mlx_stress_from_gradient(g_strain[r], X)}
+            else:
+                item = {job: _mlx_stress_from_gradient(g_strain[r], X)}
+                if job == "stress_l3" and self.kind == "mixed" and self.flags.use_spin:
+                    item["effective_field"] = -g_spin[r]
+                raw[job] = item
+        if "base" not in raw:
+            raw["base"] = dict(_out=out)
+        return raw
+
+
+# --------------------------------------------------------------------------
+# MLX engine: training bridge.
+# --------------------------------------------------------------------------
+class _MLXBridgeFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, call, *params):
+        ctx.set_materialize_grads(False)
+        ctx.call = call
+        outputs = call.forward_tensors()
+        return tuple(outputs)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        grads = ctx.call.backward_tensors(grad_outputs)
+        ctx.call = None
+        return (None,) + tuple(grads)
+
+
+class _MLXTrainingCall:
+    def __init__(self, engine: "MLXEngine", evaluation: _MLXEvaluation, names: List[str], params: List[torch.Tensor],
+                        const: Dict[str, mx.array], torch_dtype, device):
+        self.engine = engine
+        self.evaluation = evaluation
+        self.param_names = names
+        self.params = params
+        self.const = const
+        self.torch_dtype = torch_dtype
+        self.device = device
+        self.output_names: List[str] = []
+        self.forward_values: Dict[str, mx.array] = dict()
+        self.frozen: Dict[str, Dict[str, Any]] = dict()
+
+    def _P(self, values: Sequence[mx.array]) -> Dict[str, mx.array]:
+        P = dict(self.const)
+        P.update(zip(self.param_names, values))
+        return P
+
+    def _trainable_values(self) -> List[mx.array]:
+        return [self.engine.weights[name] for name in self.param_names]
+
+    def forward_tensors(self) -> List[torch.Tensor]:
+        values = self._trainable_values()
+        flat = self.engine._flatten(self.evaluation, self.evaluation.compute(self._P(values), eager=True))
+        names = [name for name, value in flat.items() if name not in _MLX_CONSTANT_OUTPUTS and value is not None]
+        arrays = [flat[name] for name in names]
+        mx.eval(arrays)
+        self.output_names = names
+        self.forward_values = dict(flat)
+        self.frozen = self.evaluation.last_raw
+        # Coupling iterations and augmentation draws are frozen for backward.
+        self.evaluation.fixed_steps = dict(self.evaluation.steps)
+        return [_mlx_to_torch(a, self.torch_dtype, self.device) for a in arrays]
+
+    def backward_tensors(self, grad_outputs) -> List[Optional[torch.Tensor]]:
+        selected = [i for i, g in enumerate(grad_outputs) if g is not None]
+        if not selected:
+            return [None] * len(self.params)
+        evaluation = self.evaluation
+        X = evaluation.X
+        dtype = X.dtype
+        cotangent = {self.output_names[i]: _mlx_to_mx(grad_outputs[i], dtype) for i in selected}
+        frozen = self.frozen
+        total: Optional[List[mx.array]] = None
+        # One outer grad per job: d/dθ F(raw_1(θ), ..., raw_k(θ)) is the sum of
+        # the per-job partials with every other job frozen at its forward value.
+        for job, raw_job in frozen.items():
+            names = [n for n in _MLXEvaluation.job_outputs(raw_job) if n in cotangent]
+            if not names:
+                continue
+
+            def objective(values, job=job, names=names):
+                raw = dict(frozen)
+                raw[job] = evaluation.run_job(job, self._P(values), X)
+                flat = self.engine._flatten(evaluation, evaluation.finalize(raw, X))
+                acc = None
+                for name in names:
+                    term = mx.sum(flat[name] * cotangent[name])
+                    acc = term if acc is None else acc + term
+                return acc
+
+            with self.engine._device_scope(dtype):
+                grads = mx.grad(objective)(self._trainable_values())
+                total = grads if total is None else [a + b for a, b in zip(total, grads)]
+                mx.eval(total)
+            self.engine.stats["backward_jobs"] = self.engine.stats.get("backward_jobs", 0) + 1
+        if total is None:
+            return [None] * len(self.params)
+        out: List[Optional[torch.Tensor]] = []
+        for tensor, grad in zip(self.params, total):
+            out.append(_mlx_to_torch(grad, tensor.dtype, tensor.device))
+        self.engine.stats["backward_calls"] += 1
+        return out
+
+
+# --------------------------------------------------------------------------
+# MLX engine: engine.
+# --------------------------------------------------------------------------
+def _mlx_unbound_engine() -> None:
+    return None
+
+
+class _MLXFrontend:
+    """Attribute view of this file's globals: the Torch helpers the engine reuses.
+
+    ``sys.modules[type(model).__module__]`` is not this file when it runs under
+    a launcher such as cProfile or runpy (``__main__`` is the launcher there),
+    whereas ``globals()`` always is.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+class MLXEngine:
+    """Native MLX execution of a bound Torch E3-miu-GNN model."""
+
+    def __init__(self, model: torch.nn.Module):
+        _mlx_require()
+        self.backend = _MLXFrontend()
+        self.spec = _mlx_spec_from_torch(model)
+        self.model_class = type(model).__name__
+        self._weight_keys: Dict[str, Tuple[Any, ...]] = dict()
+        self.weights: Dict[str, mx.array] = dict()
+        self._lock = threading.RLock()
+        self.stats: Dict[str, Any] = dict(forward_calls=0, backward_calls=0, weight_uploads=0)
+        names = [name for name, _ in model.named_buffers()]
+        ground = self.spec.ground.prefix
+        self.st_basis_name = next(
+            (n for n in names if n.startswith(ground + ".layers.") and n.endswith(".st_basis")),
+            "response.st_basis",
+        )
+        self.st3_basis_name = next(
+            (n for n in names if n.startswith(ground + ".layers.") and n.endswith(".st3_basis")),
+            None,
+        )
+        if not (self.spec.ground.use_l3 or self.spec.response.use_l3):
+            self.st3_basis_name = None
+        self.encoder_specs: Dict[str, Dict[str, Any]] = dict()
+        self.encoder_training: Dict[str, bool] = dict()
+        for core_name in ("ground.core", "response.core"):
+            encoder = model.get_submodule(core_name).element_encoder if hasattr(model.get_submodule(core_name), "element_encoder") else None
+            if encoder is not None:
+                self.encoder_specs[core_name + ".element_encoder"] = dict(
+                    aug_prob=float(encoder.aug_prob), aug_noise_std=float(encoder.aug_noise_std),
+                    aug_mix_max=float(encoder.aug_mix_max), n_feat=int(encoder.prop_matrix.shape[1]),
+                )
+        self.d4 = _MLXD4Bridge(model.d4, self.backend) if getattr(model, "d4", None) is not None else None
+        self.fingerprint = mlx_model_fingerprint(model)
+        _mlx_configure_memory()
+        self.kernel_message = _mlx_kernel_self_check()
+        self.matmul_error = _mlx_matmul_precision()
+        if self.matmul_error > 1e-5 and os.environ.get("E3MU_MLX_TF32") is None:
+            import warnings
+
+            warnings.warn(
+                "MLX float32 GPU matmuls run as TF32 in this process (relative error %.1e): another "
+                "library used the GPU before the MLX engine was first loaded. Float32 results will not "
+                "match Torch; export MLX_ENABLE_TF32=0 before starting Python." % self.matmul_error,
+                RuntimeWarning,
+            )
+
+    # ----------------------------------------------------------------------
+    # Copies: a copied or pickled model starts unbound and rebinds lazily.
+    # ----------------------------------------------------------------------
+    def __deepcopy__(self, memo):
+        return None
+
+    def __reduce__(self):
+        return (_mlx_unbound_engine, ())
+
+    # ----------------------------------------------------------------------
+    # Weights.
+    # ----------------------------------------------------------------------
+    def sync_weights(self, model: torch.nn.Module) -> Dict[str, mx.array]:
+        seen = set()
+        for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+            seen.add(name)
+            key = (tensor._version, tensor.data_ptr(), tensor.dtype, tuple(tensor.shape), tensor.device.type)
+            if self._weight_keys.get(name) != key:
+                self.weights[name] = _mlx_to_mx(tensor)
+                self._weight_keys[name] = key
+                self.stats["weight_uploads"] += 1
+        for name in list(self.weights):
+            if name not in seen:
+                self.weights.pop(name, None)
+                self._weight_keys.pop(name, None)
+        for prefix in self.encoder_specs:
+            self.encoder_training[prefix] = bool(model.get_submodule(prefix).training)
+        return self.weights
+
+    # ----------------------------------------------------------------------
+    # Device policy.
+    # ----------------------------------------------------------------------
+    def device_for(self, dtype) -> Any:
+        forced = str(os.environ.get("E3MU_MLX_DEVICE", "")).strip().lower()
+        if dtype == mx.float64 or forced == "cpu" or not _mlx_caps().gpu_available:
+            return mx.cpu
+        return mx.gpu
+
+    class _Scope:
+        def __init__(self, device):
+            self.device = device
+            self.previous = None
+
+        def __enter__(self):
+            self.previous = mx.default_device()
+            mx.set_default_device(self.device)
+            return self
+
+        def __exit__(self, *exc):
+            mx.set_default_device(self.previous)
+            return False
+
+    def _device_scope(self, dtype):
+        return MLXEngine._Scope(self.device_for(dtype))
+
+    def fusion_enabled(self, dtype) -> int:
+        """Minimum fused rows for shared-forward inference, 0 = off (E3MU_MLX_FUSED=auto|1|0).
+        
+        The vmapped VJP holds every row's backward at once.  Measured on an M5 Max
+        (float32 GPU, 16 structures): 2 rows ran 44% slower, 5 and 8 rows 13% and
+        18% faster, at 3-4x the peak memory.  ``auto`` therefore fuses >= 4 rows
+        of float32 GPU work on machines with >= 64 GB; float64 (MLX CPU stream)
+        and smaller machines keep the leaner job loop."""
+        mode = str(os.environ.get("E3MU_MLX_FUSED", "auto")).strip().lower()
+        if mode in ("0", "off", "false", "no"):
+            return 0
+        if mode in ("1", "on", "true", "yes"):
+            return 2
+        if dtype == mx.float32 and self.device_for(dtype) == mx.gpu and int(_mlx_caps().memory_bytes or 0) >= (64 << 30):
+            return 4
+        return 0
+
+    # ----------------------------------------------------------------------
+    # Options.
+    # ----------------------------------------------------------------------
+    def _options(self, model, kwargs: Dict[str, Any]):
+        allowed = _MLX_MIXED_OPTIONS if self.spec.mixed else _MLX_DUAL_OPTIONS
+        unknown = set(kwargs) - allowed
+        if unknown:
+            raise TypeError(f"forward() got an unexpected keyword argument {sorted(unknown)[0]!r}")
+        opts = dict(
+            training=None, compute_forces=True, compute_stress=False, compute_bec=False,
+            compute_piezoelectric=False, compute_stress_components=False,
+            compute_magnetoelastic=False, use_response_terms=True, retain_graph=False,
+            use_response=None, use_domain_terms=None, use_polarization_terms=None,
+            use_dispersion_terms=None, use_spin_terms=None, label_aware_coupling=False,
+        )
+        opts.update(kwargs)
+        if opts["training"] is None:
+            opts["training"] = bool(model.training)
+        if opts["use_response"] is not None:
+            opts["use_response_terms"] = bool(opts["use_response"])
+        return opts
+
+    def _plan(self, opts: Dict[str, Any], X: _MLXGraphInputs):
+        spec = self.spec
+        response = bool(opts["use_response_terms"])
+        training = bool(opts["training"])
+        if not spec.mixed:
+            req = _MLXRequest(training, bool(opts["compute_forces"]), bool(opts["compute_stress"]),
+            bool(opts["compute_bec"]), bool(opts["compute_piezoelectric"]),
+            bool(opts["compute_stress_components"]), False,
+            bool(opts["compute_stress"] or opts["compute_piezoelectric"] or opts["compute_stress_components"]))
+            flags = _MLXMixedFlags(response, False, False, False, False, False)
+            return "dual", flags, req
+        if not response:
+            req = _MLXRequest(training, bool(opts["compute_forces"]), bool(opts["compute_stress"]), False, False,
+            bool(opts["compute_stress_components"]), False,
+            bool(opts["compute_stress"] or opts["compute_stress_components"]))
+            flags = _MLXMixedFlags(False, False, False, False, False, False)
+            return "mixed_base", flags, req
+        use_domain = bool(spec.enable_qeq or spec.enable_pme)
+        use_pol = bool(spec.enable_deq)
+        use_disp = bool(spec.enable_d4)
+        use_spin = bool(spec.enable_spin)
+        if opts["use_domain_terms"] is not None:
+            use_domain = use_domain and bool(opts["use_domain_terms"])
+        if opts["use_polarization_terms"] is not None:
+            use_pol = use_pol and bool(opts["use_polarization_terms"])
+        if opts["use_dispersion_terms"] is not None:
+            use_disp = use_disp and bool(opts["use_dispersion_terms"])
+        if opts["use_spin_terms"] is not None:
+            use_spin = use_spin and bool(opts["use_spin_terms"])
+        label_aware = bool(opts["label_aware_coupling"])
+        if label_aware:
+            acts = X.activities_np
+            use_domain = use_domain and bool(np.any(acts["electric"] > 0.0))
+            use_pol = use_pol and bool(np.any(acts["polarization"] > 0.0))
+            use_disp = use_disp and bool(np.any(acts["dispersion"] > 0.0))
+            use_spin = use_spin and bool(np.any(acts["spin"] > 0.0))
+        req = _MLXRequest(training, bool(opts["compute_forces"]), bool(opts["compute_stress"]),
+        bool(opts["compute_bec"]), bool(opts["compute_piezoelectric"]),
+        bool(opts["compute_stress_components"]), bool(opts["compute_magnetoelastic"]),
+        bool(opts["compute_stress"] or opts["compute_piezoelectric"]
+                    or opts["compute_stress_components"] or opts["compute_magnetoelastic"]))
+        flags = _MLXMixedFlags(True, use_domain, use_pol, use_disp, use_spin, label_aware)
+        return "mixed", flags, req
+
+    def _prepare_inputs(self, batch, opts, dtype, torch_dtype) -> Tuple[_MLXGraphInputs, str, _MLXMixedFlags, _MLXRequest]:
+        spec = self.spec
+        label_aware = bool(spec.mixed and opts["use_response_terms"] and opts["label_aware_coupling"])
+        X = _mlx_build_inputs(
+            batch, backend=self.backend, dtype=dtype, field_scale=spec.field_scale,
+            label_aware=label_aware, need_dense=False, need_spin_pairs=False, torch_dtype=torch_dtype,
+        )
+        kind, flags, req = self._plan(opts, X)
+        if kind == "mixed":
+            if (flags.use_domain and spec.qeq is not None) or (flags.use_polarization and spec.deq is not None):
+                X.dense = _mlx_build_dense_layout(X.counts_np, X.graph_any_pbc, dtype,
+                    "float64" if dtype == mx.float64 else "float32")
+                _mlx_attach_pair_images(X, torch_dtype)
+                if flags.use_domain and spec.qeq is not None and spec.qeq["use_pme"] and X.any_pbc:
+                    ctx = _MLXCtx(P=dict(), X=X, spec=spec, dtype=dtype, st_basis=None, st3_basis=None)
+                    _mlx_ewald_tables(ctx, spec.qeq["pme_lr_wavelength"])
+            if flags.use_spin and spec.spin is not None:
+                _mlx_build_spin_candidates(batch, X, float(spec.spin["spin_cutoff"]))
+            if X.spins is None:
+                X.spins = mx.zeros((X.n_atoms, 3), dtype=dtype)
+            if not label_aware:
+                ones = mx.ones((X.n_graphs,), dtype=dtype)
+                for key in ("electric", "polarization", "dispersion", "spin"):
+                    X.activities.setdefault(key, ones)
+        if kind == "mixed" and not label_aware:
+            X.activities.update(electric=mx.ones((X.n_graphs,), dtype=dtype))
+        return X, kind, flags, req
+
+    # ----------------------------------------------------------------------
+    # Flattening of computed values into the frontend schema (MLX side).
+    # ----------------------------------------------------------------------
+    def _flatten(self, evaluation: _MLXEvaluation, results: Dict[str, mx.array]) -> Dict[str, Optional[mx.array]]:
+        out = results["_out"]
+        flat: Dict[str, Optional[mx.array]] = dict()
+        for key, value in out.items():
+            if isinstance(value, mx.array):
+                flat[key] = value
+        for key, value in results.items():
+            if key != "_out" and isinstance(value, mx.array):
+                flat[key] = value
+        return flat
+
+    # ----------------------------------------------------------------------
+    # Main entry.
+    # ----------------------------------------------------------------------
+    def forward(self, model: torch.nn.Module, batch: Any, **kwargs) -> Dict[str, torch.Tensor]:
+        with self._lock:
+            return self._forward(model, batch, kwargs)
+
+    def _forward(self, model, batch, kwargs):
+        opts = self._options(model, kwargs)
+        parameter = next(model.parameters())
+        torch_dtype = parameter.dtype
+        dtype = mx.float64 if torch_dtype == torch.float64 else mx.float32
+        positions = batch.positions
+        if (opts["compute_forces"] or (opts["compute_bec"] and (self.spec.mixed is False or opts["use_response_terms"]))) \
+                and isinstance(positions, torch.Tensor) and not positions.requires_grad and positions.is_leaf:
+            try:
+                positions.requires_grad_(True)
+            except RuntimeError:
+                pass
+        out_device = positions.device if isinstance(positions, torch.Tensor) else torch.device("cpu")
+        self.stats["forward_calls"] += 1
+        with self._device_scope(dtype):
+            weights = self.sync_weights(model)
+            X, kind, flags, req = self._prepare_inputs(batch, opts, dtype, torch_dtype)
+            aug = None
+            if any(self.encoder_training.get(k, False) and v["aug_prob"] > 0.0 for k, v in self.encoder_specs.items()):
+                aug = _MLXAugmentationTape(dtype, torch_dtype)
+            d4 = self.d4 if (kind == "mixed" and flags.use_dispersion) else None
+            evaluation = _MLXEvaluation(self, X, kind, flags, req, aug, d4, allow_host_sync=True)
+            differentiable = bool(req.training and torch.is_grad_enabled())
+            trainable = [(name, p) for name, p in model.named_parameters() if p.requires_grad] if differentiable else []
+            if trainable:
+                names = [name for name, _ in trainable]
+                params = [p for _, p in trainable]
+                const = {k: v for k, v in weights.items() if k not in set(names)}
+                call = _MLXTrainingCall(self, evaluation, names, params, const, torch_dtype, out_device)
+                tensors = _MLXBridgeFunction.apply(call, *params)
+                values = dict(zip(call.output_names, tensors))
+                host = call.forward_values
+            else:
+                flat = self._flatten(evaluation, evaluation.compute(weights, eager=True, fused=self.fusion_enabled(dtype)))
+                arrays = {k: v for k, v in flat.items() if v is not None}
+                mx.eval(list(arrays.values()))
+                values = {k: _mlx_to_torch(v, torch_dtype, out_device) for k, v in arrays.items()}
+                host = arrays
+        return self._assemble(kind, flags, req, X, values, host, torch_dtype, out_device)
+
+    # ----------------------------------------------------------------------
+    # Frontend schema (Torch side).
+    # ----------------------------------------------------------------------
+    def _assemble(self, kind, flags, req, X: _MLXGraphInputs, values: Dict[str, torch.Tensor],
+                                host: Dict[str, mx.array], torch_dtype, device) -> Dict[str, torch.Tensor]:
+        B, N = X.n_graphs, X.n_atoms
+        spec = self.spec
+
+        def zeros(*shape):
+            return torch.zeros(shape, dtype=torch_dtype, device=device)
+
+        def get(name, *shape):
+            value = values.get(name)
+            return value if value is not None else zeros(*shape)
+
+        zero_stress = zeros(B, 3, 3)
+        k = spec.waloss_dim
+        if kind in ("dual", "mixed_base"):
+            result = dict(
+                energy=values["energy"],
+                forces=get("forces", N, 3),
+                stress=get("stress", B, 3, 3),
+                stress_l1=get("stress_l1", B, 3, 3),
+                stress_l2=get("stress_l2", B, 3, 3),
+                stress_l3=zero_stress,
+                stress_dispersion=zero_stress,
+                magnetoelastic_stress=zero_stress,
+                dipole=values["dipole"],
+                polarizability=values["polarizability"],
+                charges=values["charges"],
+                atomic_dipoles=values["atomic_dipoles"],
+                atomic_polarizability=values["atomic_polarizability"],
+                bec=get("bec", N, 3, 3),
+                piezoelectric=get("piezoelectric", B, 3, 3, 3),
+                orbital_hamiltonian=get("orbital_hamiltonian", B, k, k),
+            )
+            if kind == "dual":
+                return result
+            zero_graph = zeros(B)
+            zero_atom_vector = zeros(N, 3)
+            zero_atom_tensor = zeros(N, 3, 3)
+            result.update({
+                "energy_short": result["energy"],
+                "energy_qeq": zero_graph, "energy_pme": zero_graph, "energy_d4": zero_graph,
+                "energy_spin": zero_graph, "energy_response": zero_graph,
+                "induced_dipoles": zero_atom_vector, "atomic_polarizability": zero_atom_tensor,
+                "c6": zeros(N), "Jij": zeros(0), "Di": zero_atom_tensor, "DMIij": zeros(0, 3),
+                "spin_pair_index": torch.zeros((2, 0), dtype=torch.long, device=device),
+                "J_effective": zero_graph, "Di_effective": zeros(B, 3, 3), "DMI_effective": zeros(B, 3),
+                "magnetic_moments": zero_atom_vector, "effective_field": zero_atom_vector,
+                "qeq_residual": zero_graph, "qeq_stability_shift": zero_graph,
+                "deq_residual": zero_graph, "deq_iterations": zero_graph, "deq_stability_shift": zero_graph,
+                "coupling_residual": zero_graph, "coupling_residual_electric": zero_graph,
+                "coupling_residual_spin": zero_graph, "domain_activity": zero_graph,
+                "polarization_activity": zero_graph, "dispersion_activity": zero_graph,
+                "spin_activity": zero_graph,
+            })
+            return result
+
+        # Spin pairs: keep the valid candidates in original edge order.
+        if "_Jij" in host and X.spin_candidates is not None:
+            valid = np.array(host["_pair_valid"]) > 0.5
+            cand = X.spin_candidates[4]
+            original = cand if X.edge_perm is None else X.edge_perm[cand]
+            chosen = np.nonzero(valid)[0]
+            order = chosen[np.argsort(original[chosen], kind="stable")]
+            index = torch.as_tensor(order, dtype=torch.long, device=device)
+            jij = values["_Jij"].index_select(0, index)
+            dmi = values["_DMIij"].index_select(0, index)
+            src = X.src_np[cand[order]]
+            dst = X.dst_np[cand[order]]
+            pair_index = torch.as_tensor(np.stack([src, dst], axis=0).astype(np.int64), device=device)
+        else:
+            jij = zeros(0)
+            dmi = zeros(0, 3)
+            pair_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        def const(name):
+            return _mlx_to_torch(host[name], torch_dtype, device)
+
+        result = {
+            "energy": values["energy"],
+            "forces": get("forces", N, 3),
+            "stress": get("stress", B, 3, 3),
+            "stress_l1": get("stress_l1", B, 3, 3),
+            "stress_l2": get("stress_l2", B, 3, 3),
+            "stress_l3": get("stress_l3", B, 3, 3),
+            "stress_dispersion": get("stress_dispersion", B, 3, 3),
+            "magnetoelastic_stress": get("magnetoelastic_stress", B, 3, 3),
+            "energy_short": values["energy_short"],
+            "energy_qeq": values["energy_qeq"],
+            "energy_pme": values["energy_pme"],
+            "energy_d4": values["energy_d4"],
+            "energy_spin": values["energy_spin"],
+            "energy_response": values["energy_response"],
+            "charges": values["charges"],
+            "dipole": values["dipole"],
+            "polarizability": values["polarizability"],
+            "atomic_dipoles": values["atomic_dipoles"],
+            "induced_dipoles": values["induced_dipoles"],
+            "atomic_polarizability": values["atomic_polarizability"],
+            "c6": values["c6"],
+            "bec": get("bec", N, 3, 3),
+            "piezoelectric": get("piezoelectric", B, 3, 3, 3),
+            "orbital_hamiltonian": get("orbital_hamiltonian", B, k, k),
+            "Jij": jij,
+            "Di": values["Di"],
+            "DMIij": dmi,
+            "spin_pair_index": pair_index,
+            "J_effective": values["J_effective"],
+            "Di_effective": values["Di_effective"],
+            "DMI_effective": values["DMI_effective"],
+            "magnetic_moments": values["magnetic_moments"],
+            "effective_field": get("effective_field", N, 3),
+            "qeq_residual": values["qeq_residual"],
+            "qeq_stability_shift": values["qeq_stability_shift"],
+            "deq_residual": values["deq_residual"],
+            "deq_iterations": const("deq_iterations"),
+            "deq_stability_shift": values["deq_stability_shift"],
+            "coupling_residual": values["coupling_residual"],
+            "coupling_residual_electric": values["coupling_residual_electric"],
+            "coupling_residual_spin": values["coupling_residual_spin"],
+            "domain_activity": const("domain_activity"),
+            "polarization_activity": const("polarization_activity"),
+            "dispersion_activity": const("dispersion_activity"),
+            "spin_activity": const("spin_activity"),
+        }
+        return result
+
+
+# --------------------------------------------------------------------------
+# MLX engine: binding.
+# --------------------------------------------------------------------------
+def mlx_model_fingerprint(model: torch.nn.Module) -> Tuple[Any, ...]:
+    """Structure an engine was built for; a change asks the frontend to rebind."""
+    parts: List[Any] = [type(model).__name__, repr(getattr(model, "cfg", None))]
+    for core_name in ("ground.core", "response.core"):
+        try:
+            encoder = getattr(model.get_submodule(core_name), "element_encoder", None)
+        except AttributeError:
+            encoder = None
+        if encoder is not None:
+            parts.append((float(encoder.aug_prob), float(encoder.aug_noise_std), float(encoder.aug_mix_max)))
+    parts.append(getattr(model, "d4", None) is not None)
+    return tuple(parts)
+
+
+def mlx_bind_engine(model: torch.nn.Module) -> MLXEngine:
+    """Attach an MLX engine to ``model``; its forward then runs on MLX."""
+    engine = MLXEngine(model)
+    object.__setattr__(model, "_e3mu_engine", engine)
+    return engine
+
+
+def mlx_unbind_engine(model: torch.nn.Module) -> None:
+    if "_e3mu_engine" in model.__dict__:
+        object.__delattr__(model, "_e3mu_engine")
+
+
+def mlx_engine_of(model: Any) -> Optional[MLXEngine]:
+    return getattr(model, "__dict__", dict()).get("_e3mu_engine")
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # SECTION: TorchScript Export
@@ -15462,7 +19103,7 @@ def train_dual_layer(cfg: TrainConfig, log: Callable, progress: Optional[Callabl
         np.random.seed(cfg.seed)
         set_default_dtype(runtime_dtype)
 
-    log(f"[{_now()}] Device: {device}, dtype={runtime_dtype}")
+    log(f"[{_now()}] Device: {device}, dtype={runtime_dtype}{_engine_note()}")
     log(
         f"[{_now()}] CPU threads: requested={thread_runtime['requested']} "
         f"effective={thread_runtime['effective']}/{thread_runtime['available']} "
@@ -20893,7 +24534,7 @@ class App(tk.Tk):
                 ("Force Huber delta", self.var_force_huber_delta, "entry", None),
                 ("Stress loss", self.var_stress_loss, "combo", ["mse", "huber"]),
                 ("Stress Huber delta", self.var_stress_huber_delta, "entry", None),
-                ("Device", self.var_device, "combo", ["auto", "cpu", "mps", "cuda"]),
+                ("Device", self.var_device, "combo", ["auto", "cpu", "mps", "cuda", "mlx"]),
                 (
                     "CPU threads",
                     self.var_cpu_threads,
@@ -21253,7 +24894,7 @@ class App(tk.Tk):
                      ).grid(row=0, column=7, sticky="ew", pady=4)
         ttk.Label(hp, text="Device", style="Card.TLabel").grid(row=1, column=6, sticky="w", padx=(0, 5))
         ttk.Combobox(hp, textvariable=self.var_device,
-                     values=["auto", "cpu", "mps", "cuda"], state="readonly", width=8
+                     values=["auto", "cpu", "mps", "cuda", "mlx"], state="readonly", width=8
                      ).grid(row=1, column=7, sticky="ew", pady=4)
         add(1, 0, "r_max",        self.var_rmax)
         add(1, 2, "Channels",     self.var_channels)
@@ -24318,7 +27959,7 @@ class ModernE3MUGui(QtWidgets.QMainWindow):
                 ("force_huber_delta", "Force Huber delta", None),
                 ("stress_loss", "Stress loss", ("mse", "huber")),
                 ("stress_huber_delta", "Stress Huber delta", None),
-                ("device", "Device", ("auto", "cpu", "mps", "cuda")),
+                ("device", "Device", ("auto", "cpu", "mps", "cuda", "mlx")),
                 (
                     "cpu_threads",
                     "CPU threads",
