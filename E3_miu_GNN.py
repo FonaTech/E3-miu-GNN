@@ -13412,6 +13412,11 @@ def _mlx_to_mx(tensor: torch.Tensor, dtype=None) -> mx.array:
     return mx.array(np.ascontiguousarray(array))
 
 
+# Outputs that Torch leaves attached to the live energy graph in eval mode
+# (grad enabled, ``positions.requires_grad``).  Those actually produced for
+# a given model config are tethered dynamically by _MLXEngine._forward.
+
+
 def _mlx_to_torch(array: mx.array, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     values = np.array(array, copy=False) if array.dtype != mx.bfloat16 else np.array(array.astype(mx.float32))
     out = torch.from_numpy(np.ascontiguousarray(values))
@@ -14304,6 +14309,36 @@ class MLXEngine:
     # ----------------------------------------------------------------------
     # Main entry.
     # ----------------------------------------------------------------------
+    def _eval_grad_keys(self, kind: str, flags: "_MLXMixedFlags") -> Tuple[str, ...]:
+        """Public keys Torch returns as graph-attached in eval mode for this plan.
+
+        Matches the branches in ``DualLayerFieldModel.forward`` and
+        ``MixedGranularityE3GNN.forward``: unused physics terms are returned as
+        fresh ``torch.zeros(...)`` (leaves), and only computed observables carry
+        ``requires_grad``.
+        """
+        base = (
+            "energy", "energy_short", "energy_response",
+            "charges", "dipole", "polarizability",
+            "atomic_dipoles", "induced_dipoles", "atomic_polarizability",
+        )
+        if kind in ("dual", "mixed_base"):
+            return base
+        extra = []
+        if flags.use_domain:
+            extra += ["energy_qeq", "energy_pme", "qeq_residual", "qeq_stability_shift",
+                "coupling_residual", "coupling_residual_electric"]
+        if flags.use_polarization:
+            extra += ["deq_residual", "deq_stability_shift"]
+        if flags.use_spin:
+            extra += ["energy_spin", "Jij", "Di", "J_effective", "Di_effective",
+                "magnetic_moments", "coupling_residual_spin"]
+            if self.spec.enable_dmi:
+                extra += ["DMIij", "DMI_effective"]
+        if flags.use_domain or flags.use_spin:
+            extra += ["coupling_residual"]
+        return base + tuple(extra)
+
     def forward(self, model: torch.nn.Module, batch: Any, **kwargs) -> Dict[str, torch.Tensor]:
         with self._lock:
             return self._forward(model, batch, kwargs)
@@ -14346,7 +14381,19 @@ class MLXEngine:
                 mx.eval(list(arrays.values()))
                 values = {k: _mlx_to_torch(v, torch_dtype, out_device) for k, v in arrays.items()}
                 host = arrays
-        return self._assemble(kind, flags, req, X, values, host, torch_dtype, out_device)
+        result = self._assemble(kind, flags, req, X, values, host, torch_dtype, out_device)
+        # Mirror Torch's eval-path grad flag.  Torch keeps every observable it
+        # actually derives from ``positions`` attached to the live energy graph;
+        # the keys Torch returns as fresh ``torch.zeros(...)`` stubs (unused
+        # physics terms) stay leaves.  _MLXEngine._eval_grad_keys chooses which
+        # names to tether for this ``kind`` and ``flags``.
+        if torch.is_grad_enabled() and isinstance(positions, torch.Tensor) and positions.requires_grad:
+            tether = positions.sum() * 0
+            for key in self._eval_grad_keys(kind, flags):
+                v = result.get(key)
+                if torch.is_tensor(v) and v.is_floating_point() and not v.requires_grad:
+                    result[key] = v + tether.to(v.dtype)
+        return result
 
     # ----------------------------------------------------------------------
     # Frontend schema (Torch side).
